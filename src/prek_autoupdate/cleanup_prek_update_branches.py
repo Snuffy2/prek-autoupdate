@@ -1,7 +1,5 @@
 """Clean up stale prek autoupdate pull requests and branches."""
 
-# ruff: noqa: TC003,TRY003,EM102,PLR2004,PLR0913,PLR0911,EM101,TRY400
-
 from __future__ import annotations
 
 import argparse
@@ -9,14 +7,19 @@ import json
 import logging
 import os
 import sys
-from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
 GITHUB_API_URL = "https://api.github.com"
+HTTP_NO_CONTENT = 204
+HTTP_NOT_FOUND = 404
+HTTP_UNPROCESSABLE_CONTENT = 422
 LOGGER = logging.getLogger(__name__)
 
 
@@ -34,10 +37,10 @@ class CleanupResult:
     deleted_branches: list[str] = field(default_factory=list)
 
 
-class GithubCleanupClient(Protocol):
-    """Protocol for GitHub operations needed by the cleanup routine."""
+class CleanupClient(Protocol):
+    """GitHub operations needed by the cleanup routine."""
 
-    def list_pulls(self, *, state: str, max_pages: int | None = None) -> list[dict[str, object]]:
+    def list_pulls(self, *, state: str) -> list[dict[str, object]]:
         """List pull requests by state."""
 
     def list_branches(self, *, ref_prefix: str) -> list[str]:
@@ -64,19 +67,17 @@ class GithubClient:
         self.repository = repository
         self.token = token
 
-    def list_pulls(self, *, state: str, max_pages: int | None = None) -> list[dict[str, object]]:
+    def list_pulls(self, *, state: str) -> list[dict[str, object]]:
         """List pull requests by state.
 
         Args:
             state: Pull request state to request.
-            max_pages: Optional pagination cap.
 
         Returns:
             Pull request objects from GitHub.
 
         """
         pulls: list[dict[str, object]] = []
-        pages_read = 0
         url: str | None = (
             f"{GITHUB_API_URL}/repos/{self.repository}/pulls?state={state}&per_page=100"
         )
@@ -85,17 +86,7 @@ class GithubClient:
             if not isinstance(payload, list):
                 raise TypeError(f"Expected pull request list from {url}")
             pulls.extend(pull for pull in payload if isinstance(pull, dict))
-            pages_read += 1
-            next_url = _next_link(link_header)
-            if max_pages is not None and pages_read >= max_pages:
-                if next_url is not None:
-                    LOGGER.info(
-                        "Stopped listing %s pull requests after %s pages.",
-                        state,
-                        max_pages,
-                    )
-                break
-            url = next_url
+            url = _next_link(link_header)
         return pulls
 
     def list_branches(self, *, ref_prefix: str) -> list[str]:
@@ -117,7 +108,7 @@ class GithubClient:
             try:
                 payload, link_header = self._request("GET", url)
             except HTTPError as err:
-                if err.code == 404:
+                if err.code == HTTP_NOT_FOUND:
                     return refs
                 raise
             if not isinstance(payload, list):
@@ -153,7 +144,9 @@ class GithubClient:
         try:
             self._request("DELETE", url)
         except HTTPError as err:
-            if err.code == 404 or (err.code == 422 and _is_missing_ref_error(err)):
+            if err.code == HTTP_NOT_FOUND or (
+                err.code == HTTP_UNPROCESSABLE_CONTENT and _is_missing_ref_error(err)
+            ):
                 LOGGER.info("Ref %s was already deleted.", ref)
                 return
             raise
@@ -177,16 +170,16 @@ class GithubClient:
 
         """
         data = json.dumps(payload).encode() if payload is not None else None
-        request = Request(url, data=data, headers=_github_headers(self.token), method=method)  # noqa: S310
-        with urlopen(request, timeout=30) as response:  # noqa: S310
-            if response.status == 204:
+        request = Request(url, data=data, headers=_github_headers(self.token), method=method)
+        with urlopen(request, timeout=30) as response:
+            if response.status == HTTP_NO_CONTENT:
                 return {}, response.headers.get("Link")
             return json.load(response), response.headers.get("Link")
 
 
 def cleanup_update_branches(
     *,
-    client: GithubCleanupClient,
+    client: CleanupClient,
     repository: str,
     branch: str,
     branch_prefix: str,

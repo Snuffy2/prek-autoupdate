@@ -1,7 +1,5 @@
 """Tests for prek autoupdate branch cleanup."""
 
-# ruff: noqa: TC002,PLR0913,SLF001,TRY003,EM102,EM101
-
 from __future__ import annotations
 
 from email.message import Message
@@ -45,11 +43,9 @@ class FakeCleanupClient:
         self.fail_on_close = fail_on_close
         self.closed_prs: list[int] = []
         self.deleted_refs: list[str] = []
-        self.max_pages_by_state: dict[str, int | None] = {}
 
-    def list_pulls(self, *, state: str, max_pages: int | None = None) -> list[dict[str, object]]:
+    def list_pulls(self, *, state: str) -> list[dict[str, object]]:
         """Return fake pull requests by state."""
-        self.max_pages_by_state[state] = max_pages
         if state == "open":
             return self.open_pulls
         if state == "closed":
@@ -92,6 +88,31 @@ def _workflow_pull(
     }
 
 
+def _cleanup(
+    client: FakeCleanupClient,
+    *,
+    keep_pr_number: int | None = None,
+    keep_latest_open_pr: bool = False,
+    delete_stale_branches: bool = False,
+    delete_merged_branches: bool = True,
+) -> cleanup.CleanupResult:
+    """Run cleanup with workflow defaults."""
+    return cleanup.cleanup_update_branches(
+        client=client,
+        repository=REPOSITORY,
+        branch=WORKFLOW_BRANCH,
+        branch_prefix=WORKFLOW_BRANCH,
+        label_name=WORKFLOW_LABEL,
+        author_login=WORKFLOW_AUTHOR,
+        body_marker=WORKFLOW_BODY_MARKER,
+        keep_pr_number=keep_pr_number,
+        keep_latest_open_pr=keep_latest_open_pr,
+        close_stale_prs=True,
+        delete_stale_branches=delete_stale_branches,
+        delete_merged_branches=delete_merged_branches,
+    )
+
+
 def test_cleanup_script_closes_stale_prs_and_deletes_workflow_branches() -> None:
     """Cleanup script should close stale PRs and remove workflow-created branches."""
     client = FakeCleanupClient(
@@ -106,28 +127,13 @@ def test_cleanup_script_closes_stale_prs_and_deletes_workflow_branches() -> None
         ],
     )
 
-    result = cleanup.cleanup_update_branches(
-        client=client,
-        repository=REPOSITORY,
-        branch=WORKFLOW_BRANCH,
-        branch_prefix=WORKFLOW_BRANCH,
-        label_name=WORKFLOW_LABEL,
-        author_login=WORKFLOW_AUTHOR,
-        body_marker=WORKFLOW_BODY_MARKER,
-        keep_pr_number=None,
-        close_stale_prs=True,
-        delete_merged_branches=True,
-    )
+    result = _cleanup(client)
 
     assert client.closed_prs == [10, 9]
     assert client.deleted_refs == [
         f"heads/{WORKFLOW_BRANCH}",
         f"heads/{WORKFLOW_BRANCH}-old",
     ]
-    assert client.max_pages_by_state == {
-        "open": None,
-        "closed": None,
-    }
     assert result.closed_prs == [10, 9]
     assert result.deleted_branches == [WORKFLOW_BRANCH, f"{WORKFLOW_BRANCH}-old"]
 
@@ -147,18 +153,7 @@ def test_cleanup_script_keeps_active_update_branch() -> None:
         fail_on_close=True,
     )
 
-    result = cleanup.cleanup_update_branches(
-        client=client,
-        repository=REPOSITORY,
-        branch=WORKFLOW_BRANCH,
-        branch_prefix=WORKFLOW_BRANCH,
-        label_name=WORKFLOW_LABEL,
-        author_login=WORKFLOW_AUTHOR,
-        body_marker=WORKFLOW_BODY_MARKER,
-        keep_pr_number=12,
-        close_stale_prs=True,
-        delete_merged_branches=True,
-    )
+    result = _cleanup(client, keep_pr_number=12)
 
     assert client.deleted_refs == [f"heads/{WORKFLOW_BRANCH}-old"]
     assert result.closed_prs == []
@@ -179,19 +174,7 @@ def test_cleanup_script_can_keep_latest_open_workflow_pr() -> None:
         ],
     )
 
-    result = cleanup.cleanup_update_branches(
-        client=client,
-        repository=REPOSITORY,
-        branch=WORKFLOW_BRANCH,
-        branch_prefix=WORKFLOW_BRANCH,
-        label_name=WORKFLOW_LABEL,
-        author_login=WORKFLOW_AUTHOR,
-        body_marker=WORKFLOW_BODY_MARKER,
-        keep_pr_number=None,
-        keep_latest_open_pr=True,
-        close_stale_prs=True,
-        delete_merged_branches=True,
-    )
+    result = _cleanup(client, keep_latest_open_pr=True)
 
     assert client.closed_prs == [17]
     assert client.deleted_refs == [
@@ -215,20 +198,8 @@ def test_cleanup_script_checks_all_closed_pulls_for_merged_workflow_branches() -
         ],
     )
 
-    result = cleanup.cleanup_update_branches(
-        client=client,
-        repository=REPOSITORY,
-        branch=WORKFLOW_BRANCH,
-        branch_prefix=WORKFLOW_BRANCH,
-        label_name=WORKFLOW_LABEL,
-        author_login=WORKFLOW_AUTHOR,
-        body_marker=WORKFLOW_BODY_MARKER,
-        keep_pr_number=None,
-        close_stale_prs=True,
-        delete_merged_branches=True,
-    )
+    result = _cleanup(client)
 
-    assert client.max_pages_by_state == {"open": None, "closed": None}
     assert client.deleted_refs == [f"heads/{WORKFLOW_BRANCH}-old-merged"]
     assert result.deleted_branches == [f"{WORKFLOW_BRANCH}-old-merged"]
 
@@ -245,17 +216,9 @@ def test_cleanup_script_deletes_orphaned_update_branches() -> None:
         ],
     )
 
-    result = cleanup.cleanup_update_branches(
-        client=client,
-        repository=REPOSITORY,
-        branch=WORKFLOW_BRANCH,
-        branch_prefix=WORKFLOW_BRANCH,
-        label_name=WORKFLOW_LABEL,
-        author_login=WORKFLOW_AUTHOR,
-        body_marker=WORKFLOW_BODY_MARKER,
-        keep_pr_number=None,
+    result = _cleanup(
+        client,
         keep_latest_open_pr=True,
-        close_stale_prs=True,
         delete_stale_branches=True,
         delete_merged_branches=False,
     )
@@ -294,17 +257,9 @@ def test_cleanup_script_preserves_open_non_workflow_pr_branches() -> None:
         ],
     )
 
-    result = cleanup.cleanup_update_branches(
-        client=client,
-        repository=REPOSITORY,
-        branch=WORKFLOW_BRANCH,
-        branch_prefix=WORKFLOW_BRANCH,
-        label_name=WORKFLOW_LABEL,
-        author_login=WORKFLOW_AUTHOR,
-        body_marker=WORKFLOW_BODY_MARKER,
-        keep_pr_number=None,
+    result = _cleanup(
+        client,
         keep_latest_open_pr=True,
-        close_stale_prs=True,
         delete_stale_branches=True,
         delete_merged_branches=False,
     )
@@ -329,18 +284,7 @@ def test_cleanup_script_preserves_human_prs_with_matching_label_and_prefix() -> 
         ],
     )
 
-    result = cleanup.cleanup_update_branches(
-        client=client,
-        repository=REPOSITORY,
-        branch=WORKFLOW_BRANCH,
-        branch_prefix=WORKFLOW_BRANCH,
-        label_name=WORKFLOW_LABEL,
-        author_login=WORKFLOW_AUTHOR,
-        body_marker=WORKFLOW_BODY_MARKER,
-        keep_pr_number=None,
-        close_stale_prs=True,
-        delete_merged_branches=True,
-    )
+    result = _cleanup(client)
 
     assert client.closed_prs == []
     assert client.deleted_refs == []
@@ -368,18 +312,7 @@ def test_cleanup_script_preserves_bot_prs_without_workflow_body_marker() -> None
         ],
     )
 
-    result = cleanup.cleanup_update_branches(
-        client=client,
-        repository=REPOSITORY,
-        branch=WORKFLOW_BRANCH,
-        branch_prefix=WORKFLOW_BRANCH,
-        label_name=WORKFLOW_LABEL,
-        author_login=WORKFLOW_AUTHOR,
-        body_marker=WORKFLOW_BODY_MARKER,
-        keep_pr_number=None,
-        close_stale_prs=True,
-        delete_merged_branches=True,
-    )
+    result = _cleanup(client)
 
     assert client.closed_prs == []
     assert client.deleted_refs == []
@@ -410,7 +343,7 @@ def test_github_client_list_refs_treats_missing_prefix_as_empty(
         )
 
     monkeypatch.setattr(cleanup, "urlopen", fake_urlopen)
-    client = cleanup.GithubClient(repository=REPOSITORY, token="token")  # noqa: S106
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
 
     assert client.list_branches(ref_prefix="heads/missing") == []
 
