@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "prek-autoupdate"
+version = "0.1.0"
+description = "Reusable GitHub workflow helpers for prek autoupdate pull requests."
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+
+[project.scripts]
+prek-autoupdate-cleanup = "prek_autoupdate.cleanup_prek_update_branches:main"
+
+[dependency-groups]
+dev = [
+  "mypy>=1.17.0",
+  "pytest>=8.4.0",
+  "ruff>=0.12.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/prek_autoupdate"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = ["COM812", "D203", "D213"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+files = ["src", "tests"]
