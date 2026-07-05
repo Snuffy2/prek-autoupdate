@@ -73,14 +73,17 @@ jobs:
 
       - name: Run prek auto-update
         working-directory: target
+        env:
+          COOLDOWN_DAYS: ${{ inputs.cooldown-days }}
         run: |
           set -euo pipefail
           body_file="${GITHUB_WORKSPACE}/prek-autoupdate-body.md"
+          cooldown_days="${COOLDOWN_DAYS}"
           {
             echo "Automated update of \`prek\` hooks."
             echo
             echo '```text'
-            prek auto-update --cooldown-days "${{ inputs.cooldown-days }}" 2>&1
+            prek auto-update --cooldown-days "${cooldown_days}" 2>&1
             echo '```'
           } | tee "${body_file}"
 
@@ -112,12 +115,13 @@ jobs:
           DISPATCH_WORKFLOWS: ${{ inputs.dispatch-workflows }}
           GH_TOKEN: ${{ github.token }}
           UPDATE_BRANCH: ${{ inputs.update-branch }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
 
           while IFS= read -r workflow; do
             [[ -z "${workflow}" ]] && continue
-            gh workflow run "${workflow}" --ref "${UPDATE_BRANCH}"
+            gh workflow run "${workflow}" --repo "${REPOSITORY}" --ref "${UPDATE_BRANCH}"
           done <<< "${DISPATCH_WORKFLOWS}"
 
   cleanup:
@@ -150,14 +154,21 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           KEEP_PR_NUMBER: ${{ needs.update-hooks.outputs.pull-request-number }}
           REPOSITORY: ${{ github.repository }}
+          UPDATE_BRANCH: ${{ inputs.update-branch }}
+          BRANCH_PREFIX: ${{ inputs.branch-prefix }}
+          LABEL_NAME: ${{ inputs.label }}
         run: |
           set -euo pipefail
 
+          update_branch="${UPDATE_BRANCH}"
+          branch_prefix="${BRANCH_PREFIX}"
+          label_name="${LABEL_NAME}"
+
           args=(
             --repository "${REPOSITORY}"
-            --branch "${{ inputs.update-branch }}"
-            --branch-prefix "${{ inputs.branch-prefix }}"
-            --label-name "${{ inputs.label }}"
+            --branch "${update_branch}"
+            --branch-prefix "${branch_prefix}"
+            --label-name "${label_name}"
             --author-login 'github-actions[bot]'
             --body-marker "${BODY_MARKER}"
             --close-stale-prs

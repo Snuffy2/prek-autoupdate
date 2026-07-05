@@ -2,7 +2,7 @@ name: Update Version on Release
 
 on:
   release:
-    types: [published, edited]
+    types: [published]
 
 jobs:
   update-version:
@@ -32,10 +32,13 @@ jobs:
           commit_message: "Updating to version ${{ github.event.release.tag_name }} [skip ci]"
 
       - name: Update Release with Version Changes Commit
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          git tag -f "${{ github.event.release.tag_name }}"
-          git push -f origin "${{ github.event.release.tag_name }}"
+          tag_name="${TAG_NAME}"
+          git tag -f "${tag_name}"
+          git push -f origin "${tag_name}"
 
       - name: Update Major Version Tag
         env:

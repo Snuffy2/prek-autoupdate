@@ -43,14 +43,14 @@ class CleanupClient(Protocol):
     def list_pulls(self, *, state: str) -> list[dict[str, object]]:
         """List pull requests by state."""
 
-    def list_branches(self, *, ref_prefix: str) -> list[str]:
-        """List git refs by ref prefix."""
-
     def close_pull(self, pull_number: int) -> None:
         """Close a pull request by number."""
 
     def delete_ref(self, ref: str) -> None:
         """Delete a git ref by name."""
+
+    def get_ref_sha(self, *, ref: str) -> str | None:
+        """Return the current SHA for a git ref."""
 
 
 class GithubClient:
@@ -89,40 +89,6 @@ class GithubClient:
             url = _next_link(link_header)
         return pulls
 
-    def list_branches(self, *, ref_prefix: str) -> list[str]:
-        """List git refs by ref prefix.
-
-        Args:
-            ref_prefix: Ref prefix after ``refs/`` such as ``heads/branch``.
-
-        Returns:
-            Full git ref names matching the prefix.
-
-        """
-        refs: list[str] = []
-        safe_ref_prefix = quote(ref_prefix, safe="/")
-        url: str | None = (
-            f"{GITHUB_API_URL}/repos/{self.repository}/git/matching-refs/{safe_ref_prefix}"
-        )
-        while url is not None:
-            try:
-                payload, link_header = self._request("GET", url)
-            except HTTPError as err:
-                if err.code == HTTP_NOT_FOUND:
-                    return refs
-                raise
-            if not isinstance(payload, list):
-                raise TypeError(f"Expected ref list from {url}")
-            refs.extend(
-                ref
-                for item in payload
-                if isinstance(item, dict)
-                and isinstance(ref := item.get("ref"), str)
-                and ref.startswith(f"refs/{ref_prefix}")
-            )
-            url = _next_link(link_header)
-        return refs
-
     def close_pull(self, pull_number: int) -> None:
         """Close a pull request.
 
@@ -140,7 +106,8 @@ class GithubClient:
             ref: Ref path such as ``heads/branch-name``.
 
         """
-        url = f"{GITHUB_API_URL}/repos/{self.repository}/git/refs/{ref}"
+        safe_ref = quote(ref, safe="/")
+        url = f"{GITHUB_API_URL}/repos/{self.repository}/git/refs/{safe_ref}"
         try:
             self._request("DELETE", url)
         except HTTPError as err:
@@ -150,6 +117,26 @@ class GithubClient:
                 LOGGER.info("Ref %s was already deleted.", ref)
                 return
             raise
+
+    def get_ref_sha(self, *, ref: str) -> str | None:
+        """Return the SHA for a git ref, or None when missing."""
+        safe_ref = quote(ref, safe="/")
+        url = f"{GITHUB_API_URL}/repos/{self.repository}/git/ref/{safe_ref}"
+        try:
+            payload, _ = self._request("GET", url)
+        except HTTPError as err:
+            if err.code == HTTP_NOT_FOUND:
+                return None
+            raise
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected a ref object from {url}")
+        obj = payload.get("object")
+        if not isinstance(obj, dict):
+            raise TypeError(f"Expected ref object payload from {url}")
+        sha = obj.get("sha")
+        if not isinstance(sha, str):
+            raise TypeError(f"Expected ref object SHA from {url}")
+        return sha
 
     def _request(
         self,
@@ -204,7 +191,7 @@ def cleanup_update_branches(
         body_marker: Optional body text identifying workflow-created PRs.
         keep_pr_number: Optional PR number to preserve.
         close_stale_prs: Whether to close open stale update PRs.
-        delete_stale_branches: Whether to delete stale branch-prefix refs.
+        delete_stale_branches: Whether to delete stale workflow-owned branch refs.
         delete_merged_branches: Whether to delete branches from merged update PRs.
         keep_latest_open_pr: Whether to preserve the newest open workflow PR.
 
@@ -213,31 +200,25 @@ def cleanup_update_branches(
 
     """
     result = CleanupResult()
-    protected_branches: set[str] = set()
+    open_pulls = client.list_pulls(state="open")
+    workflow_open_pulls = _workflow_pulls(
+        open_pulls,
+        repository=repository,
+        branch=branch,
+        branch_prefix=branch_prefix,
+        label_name=label_name,
+        author_login=author_login,
+        body_marker=body_marker,
+    )
+    workflow_open_pull_numbers = {_pull_number(pull) for pull in workflow_open_pulls}
+    protected_branches = _collect_protected_branches(
+        all_pulls=open_pulls,
+        workflow_open_pull_numbers=workflow_open_pull_numbers,
+        repository=repository,
+        branch_prefix=branch_prefix,
+    )
     branches_to_delete: set[str] = set()
 
-    all_open_pulls = client.list_pulls(state="open")
-    workflow_open_pulls = [
-        pull
-        for pull in all_open_pulls
-        if _is_workflow_pull(
-            pull,
-            repository=repository,
-            branch=branch,
-            branch_prefix=branch_prefix,
-            label_name=label_name,
-            author_login=author_login,
-            body_marker=body_marker,
-        )
-    ]
-    workflow_open_pull_numbers = {_pull_number(pull) for pull in workflow_open_pulls}
-    protected_branches.update(
-        head_ref
-        for pull in all_open_pulls
-        if _pull_number(pull) not in workflow_open_pull_numbers
-        and (head_ref := _same_repo_head_ref(pull, repository=repository)) is not None
-        and head_ref.startswith(branch_prefix)
-    )
     latest_open_pr_number = (
         max(workflow_open_pull_numbers, default=None) if keep_latest_open_pr else None
     )
@@ -255,28 +236,33 @@ def cleanup_update_branches(
 
         client.close_pull(pull_number)
         result.closed_prs.append(pull_number)
-        branches_to_delete.add(head_ref)
+        if _is_branch_head_sha_match(
+            client=client,
+            pull=pull,
+            repository=repository,
+        ):
+            branches_to_delete.add(head_ref)
 
-    if delete_stale_branches:
+    if delete_stale_branches or delete_merged_branches:
         branches_to_delete.update(
-            branch_name
-            for ref in client.list_branches(ref_prefix=f"heads/{branch_prefix}")
-            if (branch_name := _branch_from_ref(ref)).startswith(branch_prefix)
-        )
-
-    if delete_merged_branches:
-        closed_pulls = client.list_pulls(state="closed")
-        for pull in closed_pulls:
-            if pull.get("merged_at") is not None and _is_workflow_pull(
-                pull,
+            branch_ref
+            for pull in _workflow_pulls(
+                client.list_pulls(state="closed"),
                 repository=repository,
                 branch=branch,
                 branch_prefix=branch_prefix,
                 label_name=label_name,
                 author_login=author_login,
                 body_marker=body_marker,
-            ):
-                branches_to_delete.add(_head_ref(pull))
+            )
+            for branch_ref in _workflow_closed_branch_refs_with_sha_match(
+                client=client,
+                pull=pull,
+                repository=repository,
+                include_stale=delete_stale_branches,
+                include_merged=delete_merged_branches,
+            )
+        )
 
     branches_to_delete -= protected_branches
     for branch_name in sorted(branches_to_delete):
@@ -284,6 +270,68 @@ def cleanup_update_branches(
         result.deleted_branches.append(branch_name)
 
     return result
+
+
+def _collect_protected_branches(
+    *,
+    all_pulls: list[dict[str, object]],
+    workflow_open_pull_numbers: set[int],
+    repository: str,
+    branch_prefix: str,
+) -> set[str]:
+    """Collect same-repo open refs that are not workflow-owned."""
+    return {
+        head_ref
+        for pull in all_pulls
+        if _pull_number(pull) not in workflow_open_pull_numbers
+        and (head_ref := _same_repo_head_ref(pull, repository=repository)) is not None
+        and head_ref.startswith(branch_prefix)
+    }
+
+
+def _workflow_closed_branch_refs_with_sha_match(
+    *,
+    client: CleanupClient,
+    pull: Mapping[str, object],
+    repository: str,
+    include_stale: bool,
+    include_merged: bool,
+) -> set[str]:
+    """Return workflow branch refs that match requested state and current SHA."""
+    is_stale = pull.get("merged_at") is None
+    if is_stale and not include_stale:
+        return set()
+    if not is_stale and not include_merged:
+        return set()
+    if not _is_branch_head_sha_match(client=client, pull=pull, repository=repository):
+        return set()
+    return {_head_ref(pull)}
+
+
+def _workflow_pulls(
+    pulls: list[dict[str, object]],
+    *,
+    repository: str,
+    branch: str,
+    branch_prefix: str,
+    label_name: str,
+    author_login: str | None,
+    body_marker: str | None,
+) -> list[dict[str, object]]:
+    """Filter workflow-owned pull requests."""
+    return [
+        pull
+        for pull in pulls
+        if _is_workflow_pull(
+            pull,
+            repository=repository,
+            branch=branch,
+            branch_prefix=branch_prefix,
+            label_name=label_name,
+            author_login=author_login,
+            body_marker=body_marker,
+        )
+    ]
 
 
 def _same_repo_head_ref(pull: Mapping[str, object], *, repository: str) -> str | None:
@@ -307,25 +355,6 @@ def _same_repo_head_ref(pull: Mapping[str, object], *, repository: str) -> str |
     if not isinstance(head_repo, dict) or head_repo.get("full_name") != repository:
         return None
     return head_ref
-
-
-def _branch_from_ref(ref: str) -> str:
-    """Return a branch name from a full heads ref.
-
-    Args:
-        ref: Full git ref such as ``refs/heads/branch-name``.
-
-    Returns:
-        Branch name.
-
-    Raises:
-        ValueError: If the ref is not a branch ref.
-
-    """
-    prefix = "refs/heads/"
-    if not ref.startswith(prefix):
-        raise ValueError(f"Expected a branch ref, got {ref}")
-    return ref.removeprefix(prefix)
 
 
 def _is_workflow_pull(
@@ -401,6 +430,32 @@ def _head_ref(pull: Mapping[str, object]) -> str:
     if not isinstance(head_ref, str):
         raise TypeError("Pull request is missing a head ref")
     return head_ref
+
+
+def _pull_head_sha(pull: Mapping[str, object]) -> str | None:
+    """Return the pull request head SHA."""
+    head = pull.get("head")
+    if not isinstance(head, dict):
+        return None
+    sha = head.get("sha")
+    return sha if isinstance(sha, str) else None
+
+
+def _is_branch_head_sha_match(
+    *,
+    client: CleanupClient,
+    pull: Mapping[str, object],
+    repository: str,
+) -> bool:
+    """Return whether the current branch SHA still points to the PR head."""
+    head_ref = _same_repo_head_ref(pull, repository=repository)
+    if head_ref is None:
+        return False
+    branch_sha = client.get_ref_sha(ref=f"heads/{head_ref}")
+    if branch_sha is None:
+        return False
+    pull_head_sha = _pull_head_sha(pull)
+    return pull_head_sha is not None and branch_sha == pull_head_sha
 
 
 def _pull_number(pull: Mapping[str, object]) -> int:

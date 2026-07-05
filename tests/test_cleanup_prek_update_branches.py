@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from email.message import Message
 from io import BytesIO
+from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
 
 import pytest
 
 from prek_autoupdate import cleanup_prek_update_branches as cleanup
+
+if TYPE_CHECKING:
+    from urllib.request import Request
 
 WORKFLOW_BRANCH = "chore/prek-updates"
 WORKFLOW_LABEL = "dependencies"
@@ -25,22 +29,22 @@ class FakeCleanupClient:
         *,
         open_pulls: list[dict[str, object]],
         closed_pulls: list[dict[str, object]],
-        branches: list[str] | None = None,
         fail_on_close: bool = False,
+        ref_shas: dict[str, str | None] | None = None,
     ) -> None:
         """Initialize fake pull request state.
 
         Args:
             open_pulls: Pull requests to return for open PR lookups.
             closed_pulls: Pull requests to return for closed PR lookups.
-            branches: Branch refs to return for matching branch lookups.
             fail_on_close: Whether closing a PR should fail the test.
+            ref_shas: Optional fake branch ref -> SHA map.
 
         """
         self.open_pulls = open_pulls
         self.closed_pulls = closed_pulls
-        self.branches = [] if branches is None else branches
         self.fail_on_close = fail_on_close
+        self.ref_shas = {} if ref_shas is None else ref_shas
         self.closed_prs: list[int] = []
         self.deleted_refs: list[str] = []
 
@@ -52,10 +56,6 @@ class FakeCleanupClient:
             return self.closed_pulls
         raise ValueError(f"Unsupported pull request state: {state}")
 
-    def list_branches(self, *, ref_prefix: str) -> list[str]:
-        """Return fake git refs by prefix."""
-        return [ref for ref in self.branches if ref.startswith(f"refs/{ref_prefix}")]
-
     def close_pull(self, pull_number: int) -> None:
         """Record or reject a closed pull request."""
         if self.fail_on_close:
@@ -65,6 +65,10 @@ class FakeCleanupClient:
     def delete_ref(self, ref: str) -> None:
         """Record a deleted git ref."""
         self.deleted_refs.append(ref)
+
+    def get_ref_sha(self, *, ref: str) -> str | None:
+        """Return a fake branch SHA."""
+        return self.ref_shas.get(ref, "sha")
 
 
 def _workflow_pull(
@@ -76,6 +80,7 @@ def _workflow_pull(
     body: str = WORKFLOW_BODY_MARKER,
     repository: str = REPOSITORY,
     merged_at: str | None = None,
+    head_sha: str | None = "sha",
 ) -> dict[str, object]:
     """Return a fake workflow pull request object."""
     return {
@@ -83,7 +88,11 @@ def _workflow_pull(
         "merged_at": merged_at,
         "body": body,
         "user": {"login": author},
-        "head": {"ref": ref, "repo": {"full_name": repository}},
+        "head": {
+            "ref": ref,
+            "repo": {"full_name": repository},
+            "sha": head_sha if head_sha is not None else "sha",
+        },
         "labels": [{"name": label}],
     }
 
@@ -205,29 +214,61 @@ def test_cleanup_script_checks_all_closed_pulls_for_merged_workflow_branches() -
 
 
 def test_cleanup_script_deletes_orphaned_update_branches() -> None:
-    """Cleanup script should delete prefixed workflow branches without open PRs."""
+    """Prefixed branches without workflow PR metadata are preserved."""
     client = FakeCleanupClient(
         open_pulls=[_workflow_pull(number=18)],
         closed_pulls=[],
-        branches=[
-            f"refs/heads/{WORKFLOW_BRANCH}",
-            f"refs/heads/{WORKFLOW_BRANCH}-orphan",
-            f"refs/heads/{WORKFLOW_BRANCH}-manual",
-        ],
     )
 
     result = _cleanup(
         client,
-        keep_latest_open_pr=True,
+        keep_pr_number=18,
         delete_stale_branches=True,
         delete_merged_branches=False,
     )
 
-    assert client.deleted_refs == [
-        f"heads/{WORKFLOW_BRANCH}-manual",
-        f"heads/{WORKFLOW_BRANCH}-orphan",
-    ]
-    assert result.deleted_branches == [f"{WORKFLOW_BRANCH}-manual", f"{WORKFLOW_BRANCH}-orphan"]
+    assert client.deleted_refs == []
+    assert result.deleted_branches == []
+
+
+def test_cleanup_script_deletes_closed_unmerged_workflow_branches_with_sha_match() -> None:
+    """Closed unmerged workflow PR branches are deleted when ownership and SHA match."""
+    stale_branch = f"{WORKFLOW_BRANCH}-manual"
+    client = FakeCleanupClient(
+        open_pulls=[_workflow_pull(number=18)],
+        closed_pulls=[_workflow_pull(number=7, ref=stale_branch)],
+    )
+
+    result = _cleanup(
+        client,
+        keep_pr_number=18,
+        delete_stale_branches=True,
+        delete_merged_branches=False,
+    )
+
+    assert client.deleted_refs == [f"heads/{stale_branch}"]
+    assert result.deleted_branches == [stale_branch]
+
+
+def test_cleanup_script_preserves_merged_workflow_branch_when_sha_differs() -> None:
+    """Merged workflow PR branches are preserved when branch SHA has moved."""
+    stale_branch = f"{WORKFLOW_BRANCH}-merged-different"
+    client = FakeCleanupClient(
+        open_pulls=[],
+        closed_pulls=[
+            _workflow_pull(
+                number=7,
+                ref=stale_branch,
+                merged_at="2026-05-28T00:00:00Z",
+            )
+        ],
+        ref_shas={f"heads/{stale_branch}": "mismatched-sha"},
+    )
+
+    result = _cleanup(client)
+
+    assert client.deleted_refs == []
+    assert result.deleted_branches == []
 
 
 def test_cleanup_script_preserves_open_non_workflow_pr_branches() -> None:
@@ -250,11 +291,6 @@ def test_cleanup_script_preserves_open_non_workflow_pr_branches() -> None:
             ),
         ],
         closed_pulls=[],
-        branches=[
-            f"refs/heads/{WORKFLOW_BRANCH}",
-            f"refs/heads/{WORKFLOW_BRANCH}-manual-fix",
-            f"refs/heads/{WORKFLOW_BRANCH}-orphan",
-        ],
     )
 
     result = _cleanup(
@@ -264,8 +300,8 @@ def test_cleanup_script_preserves_open_non_workflow_pr_branches() -> None:
         delete_merged_branches=False,
     )
 
-    assert client.deleted_refs == [f"heads/{WORKFLOW_BRANCH}-orphan"]
-    assert result.deleted_branches == [f"{WORKFLOW_BRANCH}-orphan"]
+    assert client.deleted_refs == []
+    assert result.deleted_branches == []
 
 
 def test_cleanup_script_preserves_human_prs_with_matching_label_and_prefix() -> None:
@@ -327,27 +363,6 @@ def test_github_headers_include_json_content_type() -> None:
     assert headers["Content-Type"] == "application/json"
 
 
-def test_github_client_list_refs_treats_missing_prefix_as_empty(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """GitHub client should treat a missing matching-ref prefix as no refs."""
-
-    def fake_urlopen(*_args: object, **_kwargs: object) -> object:
-        """Raise a GitHub-style 404 response for missing refs."""
-        raise HTTPError(
-            url="https://api.github.test/repos/o/r/git/matching-refs/heads/missing",
-            code=404,
-            msg="Not Found",
-            hdrs=Message(),
-            fp=BytesIO(b'{"message": "Not Found"}'),
-        )
-
-    monkeypatch.setattr(cleanup, "urlopen", fake_urlopen)
-    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
-
-    assert client.list_branches(ref_prefix="heads/missing") == []
-
-
 def test_main_returns_failure_for_github_request_errors(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -380,3 +395,27 @@ def test_main_returns_failure_for_github_request_errors(
         f"Failed to clean prek update branches for {REPOSITORY} branch {WORKFLOW_BRANCH}"
         in caplog.text
     )
+
+
+def test_github_client_delete_ref_urlencodes_reserved_chars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Delete calls should URL-encode reserved characters in refs."""
+    calls: list[str] = []
+
+    def fake_urlopen(request: Request, *_args: object, **_kwargs: object) -> object:
+        url = request.full_url
+        calls.append(url)
+        raise HTTPError(
+            url=url,
+            code=404,
+            msg="Not Found",
+            hdrs=Message(),
+            fp=BytesIO(b'{"message": "Not Found"}'),
+        )
+
+    monkeypatch.setattr(cleanup, "urlopen", fake_urlopen)
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    client.delete_ref("heads/feature#1")
+
+    assert calls == ["https://api.github.com/repos/o/r/git/refs/heads/feature%231"]

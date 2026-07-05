@@ -16,6 +16,8 @@ coverage.xml
 coverage.json
 htmlcov/
 junit.xml
+build/
+dist/
 pytest.xml
 pythonenv*
 Thumbs.db
