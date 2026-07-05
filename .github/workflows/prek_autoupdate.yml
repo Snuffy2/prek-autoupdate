@@ -45,21 +45,6 @@ on:
         required: false
         type: string
         default: ""
-      tool-repository:
-        description: Repository containing the cleanup helper.
-        required: false
-        type: string
-        default: Snuffy2/prek-autoupdate
-      tool-ref:
-        description: Ref of tool-repository to checkout.
-        required: false
-        type: string
-        default: v1
-      python-version:
-        description: Python version used for cleanup.
-        required: false
-        type: string
-        default: "3.14"
 
 concurrency:
   group: prek-autoupdate-${{ github.repository }}
@@ -81,12 +66,6 @@ jobs:
         with:
           path: target
           persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ inputs.python-version }}
-          cache: pip
 
       - name: Install prek
         uses: taiki-e/install-action@v2
@@ -147,15 +126,15 @@ jobs:
       - name: Checkout Tooling Repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.tool-repository }}
-          ref: ${{ inputs.tool-ref }}
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
           path: tooling
           persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ inputs.python-version }}
+          python-version: "3.14"
 
       - name: Close stale prek update PRs
         env:

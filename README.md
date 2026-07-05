@@ -35,6 +35,7 @@ jobs:
 ```
 
 This runs `prek auto-update` on the caller workflow's schedule or when manually dispatched.
+Major version tags such as `v1` are updated on release to point at the latest release in that major series.
 
 ## Run CI on the Update Branch
 
@@ -83,6 +84,3 @@ GitHub only dispatches workflows that already exist on the repository default br
 | `pr-title` | `Bump prek Hooks` | Pull request title. |
 | `add-paths` | `prek.toml`, `.pre-commit-config.yaml` | Newline-separated paths the PR action may commit. |
 | `dispatch-workflows` | empty | Newline-separated workflow names, filenames, or IDs to run on the update branch with `workflow_dispatch`. |
-| `tool-repository` | `Snuffy2/prek-autoupdate` | Repository containing cleanup tooling. |
-| `tool-ref` | `v1` | Ref used when checking out cleanup tooling. Usually omit this so the workflow default is used. |
-| `python-version` | `"3.14"` | Python runtime for cleanup. |

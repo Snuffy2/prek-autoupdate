@@ -1,0 +1,47 @@
+name: Update Version on Release
+
+on:
+  release:
+    types: [published, edited]
+
+jobs:
+  update-version:
+    name: Update Version on Release
+    runs-on: ubuntu-latest
+    if: ${{ github.event.release.draft == false && github.event.release.prerelease == false }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.target_commitish }}
+
+      - name: Update pyproject version
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          sed -i "s/^version = \".*\"/version = \"${version}\"/" pyproject.toml
+
+      - name: Commit & Push Version Changes
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          branch: ${{ github.event.release.target_commitish }}
+          commit_message: "Updating to version ${{ github.event.release.tag_name }} [skip ci]"
+
+      - name: Update Release with Version Changes Commit
+        run: |
+          set -euo pipefail
+          git tag -f "${{ github.event.release.tag_name }}"
+          git push -f origin "${{ github.event.release.tag_name }}"
+
+      - name: Update Major Version Tag
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          major_tag="${TAG_NAME%%.*}"
+          git tag -f "${major_tag}"
+          git push -f origin "${major_tag}"

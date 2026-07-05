@@ -24,7 +24,6 @@ def test_workflow_is_reusable() -> None:
     assert "update-window" not in text
     assert "should-update" not in text
     assert "dispatch-workflows:" in text
-    assert "default: v1" in text
     assert "          prek.toml\n          .pre-commit-config.yaml" in text
 
 
@@ -34,8 +33,11 @@ def test_workflow_checks_out_target_and_tooling_repositories() -> None:
 
     assert "path: target" in text
     assert "path: tooling" in text
-    assert "repository: ${{ inputs.tool-repository }}" in text
-    assert "ref: ${{ inputs.tool-ref }}" in text
+    assert "repository: ${{ job.workflow_repository }}" in text
+    assert "ref: ${{ job.workflow_sha }}" in text
+    assert "tool-repository:" not in text
+    assert "tool-ref:" not in text
+    assert "${{ inputs.python-version }}" not in text
 
 
 def test_workflow_uses_github_token_dispatch_exception() -> None:

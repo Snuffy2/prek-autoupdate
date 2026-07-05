@@ -14,13 +14,15 @@ def test_readme_documents_reusable_workflow_usage() -> None:
     assert "force-update" not in text
     assert "update-weekday" not in text
     assert "This runs `prek auto-update` on the caller workflow's schedule" in text
+    assert "Major version tags such as `v1` are updated on release" in text
     assert "permissions:" in text
     assert "contents: write" in text
     assert "pull-requests: write" in text
     assert "`prek.toml`, `.pre-commit-config.yaml`" in text
     assert "## Recommended Stable Caller" not in text
     assert "tool-ref: v1" not in text
-    assert "Usually omit this so the workflow default is used." in text
+    assert "`tool-ref`" not in text
+    assert "`python-version`" not in text
 
 
 def test_readme_documents_dispatch_workflows_token_caveat() -> None:
