@@ -39,8 +39,6 @@ jobs:
 
 This runs cleanup daily and runs `prek auto-update` on Mondays or when manually dispatched.
 
-The `@v1` ref is available after the first release tag is published. Before that release, test with a branch or commit SHA and set `tool-ref` to the same ref.
-
 ## Run CI on the Update Branch
 
 GitHub limits what events can be triggered by the repository `GITHUB_TOKEN`. PRs created by automation may require manual workflow approval, and fully automatic PR workflow runs without that approval require a GitHub App token or PAT.
@@ -93,21 +91,5 @@ GitHub only dispatches workflows that already exist on the repository default br
 | `add-paths` | `prek.toml` | Newline-separated paths the PR action may commit. |
 | `dispatch-workflows` | empty | Newline-separated workflow names, filenames, or IDs to run on the update branch with `workflow_dispatch`. |
 | `tool-repository` | `Snuffy2/prek-autoupdate` | Repository containing cleanup tooling. |
-| `tool-ref` | `v1` | Ref used when checking out cleanup tooling. Use the same tag, branch, or SHA as the reusable workflow ref. |
+| `tool-ref` | `v1` | Ref used when checking out cleanup tooling. Usually omit this so the workflow default is used. |
 | `python-version` | `"3.14"` | Python runtime for cleanup. |
-
-## Recommended Stable Caller
-
-After the first release tag exists, pin both the reusable workflow and tooling checkout:
-
-```yaml
-jobs:
-  prek-autoupdate:
-    uses: Snuffy2/prek-autoupdate/.github/workflows/prek_autoupdate.yml@v1
-    permissions:
-      contents: write
-      pull-requests: write
-    with:
-      force-update: ${{ github.event_name == 'workflow_dispatch' }}
-      tool-ref: v1
-```
