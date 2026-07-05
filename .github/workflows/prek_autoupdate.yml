@@ -1,0 +1,213 @@
+name: Reusable prek Autoupdate
+
+on:
+  workflow_call:
+    inputs:
+      force-update:
+        description: Run prek update regardless of update-weekday.
+        required: false
+        type: boolean
+        default: false
+      update-weekday:
+        description: UTC weekday number for scheduled updates, 1 is Monday.
+        required: false
+        type: string
+        default: "1"
+      cooldown-days:
+        description: Cooldown days passed to prek auto-update.
+        required: false
+        type: string
+        default: "7"
+      update-branch:
+        description: Branch used for the generated update PR.
+        required: false
+        type: string
+        default: chore/prek-updates
+      branch-prefix:
+        description: Branch prefix considered owned by this workflow.
+        required: false
+        type: string
+        default: chore/prek-updates
+      label:
+        description: Label applied to generated PRs and used for cleanup ownership checks.
+        required: false
+        type: string
+        default: dependencies
+      commit-message:
+        description: Commit message for hook update commits.
+        required: false
+        type: string
+        default: "chore: update prek hooks"
+      pr-title:
+        description: Title for hook update PRs.
+        required: false
+        type: string
+        default: Bump prek Hooks
+      add-paths:
+        description: Newline-separated paths peter-evans/create-pull-request may commit.
+        required: false
+        type: string
+        default: prek.toml
+      dispatch-workflows:
+        description: Newline-separated workflow filenames or IDs to workflow_dispatch on the update branch.
+        required: false
+        type: string
+        default: ""
+      tool-repository:
+        description: Repository containing the cleanup helper.
+        required: false
+        type: string
+        default: Snuffy2/prek-autoupdate
+      tool-ref:
+        description: Ref of tool-repository to checkout.
+        required: false
+        type: string
+        default: main
+      python-version:
+        description: Python version used for cleanup.
+        required: false
+        type: string
+        default: "3.14"
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: prek-autoupdate-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  update-hooks:
+    name: Update prek Hooks
+    runs-on: ubuntu-latest
+    outputs:
+      pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
+      should-update: ${{ steps.update-window.outputs.should-update }}
+    steps:
+      - name: Check update window
+        id: update-window
+        env:
+          FORCE_UPDATE: ${{ inputs.force-update }}
+          UPDATE_WEEKDAY: ${{ inputs.update-weekday }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${FORCE_UPDATE}" == "true" ]] || [[ "$(date -u +%u)" == "${UPDATE_WEEKDAY}" ]]; then
+            echo "should-update=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "should-update=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Checkout Target Repository
+        if: steps.update-window.outputs.should-update == 'true'
+        uses: actions/checkout@v4
+        with:
+          path: target
+          persist-credentials: false
+
+      - name: Set up Python
+        if: steps.update-window.outputs.should-update == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+
+      - name: Install prek
+        if: steps.update-window.outputs.should-update == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: prek
+
+      - name: Run prek auto-update
+        if: steps.update-window.outputs.should-update == 'true'
+        working-directory: target
+        run: |
+          set -euo pipefail
+          body_file="${GITHUB_WORKSPACE}/prek-autoupdate-body.md"
+          {
+            echo "Automated update of \`prek\` hooks."
+            echo
+            echo '```text'
+            prek auto-update --cooldown-days "${{ inputs.cooldown-days }}" 2>&1
+            echo '```'
+          } | tee "${body_file}"
+
+      - name: Create Pull Request
+        if: steps.update-window.outputs.should-update == 'true'
+        id: cpr
+        uses: peter-evans/create-pull-request@v8
+        with:
+          path: target
+          token: ${{ github.token }}
+          commit-message: ${{ inputs.commit-message }}
+          title: ${{ inputs.pr-title }}
+          branch: ${{ inputs.update-branch }}
+          author: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          labels: ${{ inputs.label }}
+          delete-branch: true
+          body-path: prek-autoupdate-body.md
+          add-paths: ${{ inputs.add-paths }}
+
+      - name: Dispatch workflows for update branch
+        if: steps.cpr.outputs.pull-request-number != '' && inputs.dispatch-workflows != ''
+        env:
+          DISPATCH_WORKFLOWS: ${{ inputs.dispatch-workflows }}
+          GH_TOKEN: ${{ github.token }}
+          UPDATE_BRANCH: ${{ inputs.update-branch }}
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r workflow; do
+            [[ -z "${workflow}" ]] && continue
+            gh workflow run "${workflow}" --ref "${UPDATE_BRANCH}"
+          done <<< "${DISPATCH_WORKFLOWS}"
+
+  cleanup:
+    name: Cleanup prek Update PRs
+    needs: update-hooks
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Checkout Tooling Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.tool-repository }}
+          ref: ${{ inputs.tool-ref }}
+          path: tooling
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Close stale prek update PRs
+        env:
+          BODY_MARKER: Automated update of `prek` hooks.
+          GITHUB_TOKEN: ${{ github.token }}
+          KEEP_PR_NUMBER: ${{ needs.update-hooks.outputs.pull-request-number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          args=(
+            --repository "${REPOSITORY}"
+            --branch "${{ inputs.update-branch }}"
+            --branch-prefix "${{ inputs.branch-prefix }}"
+            --label-name "${{ inputs.label }}"
+            --author-login 'github-actions[bot]'
+            --body-marker "${BODY_MARKER}"
+            --close-stale-prs
+            --delete-stale-branches
+            --delete-merged-branches
+          )
+
+          if [[ -n "${KEEP_PR_NUMBER}" ]]; then
+            args+=(--keep-pr-number "${KEEP_PR_NUMBER}")
+          else
+            args+=(--keep-latest-open-pr)
+          fi
+
+          python tooling/src/prek_autoupdate/cleanup_prek_update_branches.py "${args[@]}"
