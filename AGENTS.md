@@ -7,14 +7,13 @@ This repository maintains the reusable `prek` autoupdate workflow and its cleanu
 - `.github/workflows/prek_autoupdate.yml` is the reusable workflow consumed by other repositories.
 - `src/prek_autoupdate/cleanup_prek_update_branches.py` is the canonical cleanup helper run by the workflow.
 - `README.md` is the end-user contract. Update it with any input, permission, token, or caller-example change.
-- `tests/` contains contract tests for the workflow, README, and cleanup behavior.
+- `tests/` contains cleanup behavior tests.
 
 ## Source Of Truth Rules
 
 - Keep consuming-repo YAML examples thin: schedule plus `jobs.<job>.uses`.
 - Do not copy the cleanup script back into downstream repos. Fix it here and update callers to use this repo.
-- Treat `.github/workflows/prek_autoupdate.yml` and `README.md` as a public API. Renaming inputs or changing defaults requires docs and tests in the same change.
-- `tool-ref` must stay pinned by default to the same release line as the reusable workflow, currently `v1`. Do not default it to `main`; that decouples pinned callers from the cleanup code they execute.
+- Treat `.github/workflows/prek_autoupdate.yml` and `README.md` as a public API. Renaming inputs or changing defaults requires docs in the same change.
 - Do not broaden token permissions casually. `actions: write` is only for the optional `dispatch-workflows` path; cleanup should not receive it.
 
 ## GitHub Token And Workflow Dispatch
@@ -47,7 +46,5 @@ uv run pytest -q
 
 ## Tests
 
-- Workflow tests should assert behavioral contracts, not only file existence.
-- README tests should guard caller examples and token caveats.
 - Cleanup tests should cover ownership boundaries before branch deletion.
-- For bug fixes, add a regression test that fails before the fix.
+- For cleanup helper bug fixes, add a regression test that fails before the fix.

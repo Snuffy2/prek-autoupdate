@@ -22,10 +22,6 @@ on:
     - cron: "0 2 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
-
 jobs:
   prek-autoupdate:
     uses: Snuffy2/prek-autoupdate/.github/workflows/prek_autoupdate.yml@v1
@@ -44,11 +40,6 @@ GitHub limits what events can be triggered by the repository `GITHUB_TOKEN`. PRs
 The token-only workaround is to dispatch named workflows on the update branch with `workflow_dispatch`. Add `actions: write` and list the workflows in `dispatch-workflows`:
 
 ```yaml
-permissions:
-  contents: write
-  pull-requests: write
-  actions: write
-
 jobs:
   prek-autoupdate:
     uses: Snuffy2/prek-autoupdate/.github/workflows/prek_autoupdate.yml@v1

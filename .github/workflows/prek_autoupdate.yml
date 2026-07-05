@@ -57,7 +57,6 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-      actions: write
     outputs:
       pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
     steps:
@@ -100,8 +99,15 @@ jobs:
           body-path: prek-autoupdate-body.md
           add-paths: ${{ inputs.add-paths }}
 
+  dispatch-workflows:
+    name: Dispatch Update Branch Workflows
+    needs: update-hooks
+    runs-on: ubuntu-latest
+    if: needs.update-hooks.outputs.pull-request-number != '' && inputs.dispatch-workflows != ''
+    permissions:
+      actions: write
+    steps:
       - name: Dispatch workflows for update branch
-        if: steps.cpr.outputs.pull-request-number != '' && inputs.dispatch-workflows != ''
         env:
           DISPATCH_WORKFLOWS: ${{ inputs.dispatch-workflows }}
           GH_TOKEN: ${{ github.token }}
@@ -116,7 +122,9 @@ jobs:
 
   cleanup:
     name: Cleanup prek Update PRs
-    needs: update-hooks
+    needs:
+      - update-hooks
+      - dispatch-workflows
     runs-on: ubuntu-latest
     if: always()
     permissions:
