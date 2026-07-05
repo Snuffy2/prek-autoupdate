@@ -1,0 +1,109 @@
+# prek-autoupdate
+
+Reusable GitHub Actions workflow for opening and maintaining `prek auto-update` pull requests.
+
+## What It Does
+
+- Runs `prek auto-update --cooldown-days <days>`.
+- Opens or updates one PR on `chore/prek-updates`.
+- Closes duplicate stale workflow-owned PRs.
+- Deletes stale and merged workflow-owned update branches.
+- Optionally dispatches named workflows on the update branch using the repository `GITHUB_TOKEN`.
+
+## Quick Start
+
+Create `.github/workflows/prek_autoupdate.yml` in the consuming repository:
+
+```yaml
+name: prek Autoupdate
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  prek-autoupdate:
+    uses: Snuffy2/prek-autoupdate/.github/workflows/prek_autoupdate.yml@v1
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      force-update: ${{ github.event_name == 'workflow_dispatch' }}
+      update-weekday: "1"
+```
+
+This runs cleanup daily and runs `prek auto-update` on Mondays or when manually dispatched.
+
+## Run CI on the Update Branch
+
+GitHub limits what events can be triggered by the repository `GITHUB_TOKEN`. PRs created by automation may require manual workflow approval, and fully automatic PR workflow runs without that approval require a GitHub App token or PAT.
+
+The token-only workaround is to dispatch named workflows on the update branch with `workflow_dispatch`. Add `actions: write` and list the workflows in `dispatch-workflows`:
+
+```yaml
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  prek-autoupdate:
+    uses: Snuffy2/prek-autoupdate/.github/workflows/prek_autoupdate.yml@v1
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    with:
+      force-update: ${{ github.event_name == 'workflow_dispatch' }}
+      update-weekday: "1"
+      dispatch-workflows: |
+        ci.yml
+        tests.yml
+```
+
+Each listed workflow must support manual dispatch:
+
+```yaml
+on:
+  pull_request:
+  workflow_dispatch:
+```
+
+## Inputs
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `force-update` | `false` | Run update regardless of weekday. Pass `${{ github.event_name == 'workflow_dispatch' }}` from caller workflows. |
+| `update-weekday` | `"1"` | UTC weekday for scheduled updates. `1` is Monday. |
+| `cooldown-days` | `"7"` | Value passed to `prek auto-update --cooldown-days`. |
+| `update-branch` | `chore/prek-updates` | Branch used for update PRs. |
+| `branch-prefix` | `chore/prek-updates` | Prefix considered owned by cleanup. |
+| `label` | `dependencies` | PR label used for generated PRs and cleanup ownership checks. |
+| `commit-message` | `chore: update prek hooks` | Commit message for update commits. |
+| `pr-title` | `Bump prek Hooks` | Pull request title. |
+| `add-paths` | `prek.toml` | Newline-separated paths the PR action may commit. |
+| `dispatch-workflows` | empty | Newline-separated workflow names, filenames, or IDs to run on the update branch with `workflow_dispatch`. |
+| `tool-repository` | `Snuffy2/prek-autoupdate` | Repository containing cleanup tooling. |
+| `tool-ref` | `main` | Ref used when checking out cleanup tooling. Pin this to `v1` in stable consumers. |
+| `python-version` | `"3.14"` | Python runtime for cleanup. |
+
+## Recommended Stable Caller
+
+After the first release tag exists, pin both the reusable workflow and tooling checkout:
+
+```yaml
+jobs:
+  prek-autoupdate:
+    uses: Snuffy2/prek-autoupdate/.github/workflows/prek_autoupdate.yml@v1
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      force-update: ${{ github.event_name == 'workflow_dispatch' }}
+      tool-ref: v1
+```
