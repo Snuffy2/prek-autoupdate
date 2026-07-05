@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-
 README = Path("README.md")
 
 
@@ -12,10 +11,12 @@ def test_readme_documents_reusable_workflow_usage() -> None:
 
     assert "## Quick Start" in text
     assert "uses: Snuffy2/prek-autoupdate/.github/workflows/prek_autoupdate.yml@v1" in text
-    assert 'force-update: ${{ github.event_name == \'workflow_dispatch\' }}' in text
+    assert "force-update: ${{ github.event_name == 'workflow_dispatch' }}" in text
     assert "permissions:" in text
     assert "contents: write" in text
     assert "pull-requests: write" in text
+    assert "The `@v1` ref is available after the first release tag is published." in text
+    assert "set `tool-ref` to the same ref" in text
 
 
 def test_readme_documents_dispatch_workflows_token_caveat() -> None:
@@ -27,3 +28,4 @@ def test_readme_documents_dispatch_workflows_token_caveat() -> None:
     assert "actions: write" in text
     assert "GitHub App token or PAT" in text
     assert "GITHUB_TOKEN" in text
+    assert "default branch" in text

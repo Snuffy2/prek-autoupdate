@@ -62,17 +62,12 @@ on:
         description: Ref of tool-repository to checkout.
         required: false
         type: string
-        default: main
+        default: v1
       python-version:
         description: Python version used for cleanup.
         required: false
         type: string
         default: "3.14"
-
-permissions:
-  contents: write
-  pull-requests: write
-  actions: write
 
 concurrency:
   group: prek-autoupdate-${{ github.repository }}
@@ -82,6 +77,10 @@ jobs:
   update-hooks:
     name: Update prek Hooks
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
     outputs:
       pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
       should-update: ${{ steps.update-window.outputs.should-update }}
@@ -169,6 +168,9 @@ jobs:
     needs: update-hooks
     runs-on: ubuntu-latest
     if: always()
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - name: Checkout Tooling Repository
         uses: actions/checkout@v4
