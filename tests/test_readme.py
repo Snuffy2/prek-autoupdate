@@ -11,7 +11,9 @@ def test_readme_documents_reusable_workflow_usage() -> None:
 
     assert "## Quick Start" in text
     assert "uses: Snuffy2/prek-autoupdate/.github/workflows/prek_autoupdate.yml@v1" in text
-    assert "force-update: ${{ github.event_name == 'workflow_dispatch' }}" in text
+    assert "force-update" not in text
+    assert "update-weekday" not in text
+    assert "This runs `prek auto-update` on the caller workflow's schedule" in text
     assert "permissions:" in text
     assert "contents: write" in text
     assert "pull-requests: write" in text

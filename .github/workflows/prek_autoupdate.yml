@@ -3,16 +3,6 @@ name: Reusable prek Autoupdate
 on:
   workflow_call:
     inputs:
-      force-update:
-        description: Run prek update regardless of update-weekday.
-        required: false
-        type: boolean
-        default: false
-      update-weekday:
-        description: UTC weekday number for scheduled updates, 1 is Monday.
-        required: false
-        type: string
-        default: "1"
       cooldown-days:
         description: Cooldown days passed to prek auto-update.
         required: false
@@ -83,44 +73,25 @@ jobs:
       actions: write
     outputs:
       pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
-      should-update: ${{ steps.update-window.outputs.should-update }}
     steps:
-      - name: Check update window
-        id: update-window
-        env:
-          FORCE_UPDATE: ${{ inputs.force-update }}
-          UPDATE_WEEKDAY: ${{ inputs.update-weekday }}
-        run: |
-          set -euo pipefail
-
-          if [[ "${FORCE_UPDATE}" == "true" ]] || [[ "$(date -u +%u)" == "${UPDATE_WEEKDAY}" ]]; then
-            echo "should-update=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "should-update=false" >> "${GITHUB_OUTPUT}"
-          fi
-
       - name: Checkout Target Repository
-        if: steps.update-window.outputs.should-update == 'true'
         uses: actions/checkout@v4
         with:
           path: target
           persist-credentials: false
 
       - name: Set up Python
-        if: steps.update-window.outputs.should-update == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
           cache: pip
 
       - name: Install prek
-        if: steps.update-window.outputs.should-update == 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: prek
 
       - name: Run prek auto-update
-        if: steps.update-window.outputs.should-update == 'true'
         working-directory: target
         run: |
           set -euo pipefail
@@ -134,7 +105,6 @@ jobs:
           } | tee "${body_file}"
 
       - name: Create Pull Request
-        if: steps.update-window.outputs.should-update == 'true'
         id: cpr
         uses: peter-evans/create-pull-request@v8
         with:

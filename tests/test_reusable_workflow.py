@@ -19,8 +19,10 @@ def test_workflow_is_reusable() -> None:
     text = WORKFLOW.read_text(encoding="utf-8")
 
     assert "workflow_call:" in text
-    assert "force-update:" in text
-    assert "update-weekday:" in text
+    assert "force-update:" not in text
+    assert "update-weekday:" not in text
+    assert "update-window" not in text
+    assert "should-update" not in text
     assert "dispatch-workflows:" in text
     assert "default: v1" in text
 
@@ -50,8 +52,8 @@ def test_workflow_uses_github_token_dispatch_exception() -> None:
     assert "pull-requests: write" in update_job
 
 
-def test_workflow_runs_cleanup_even_when_update_is_skipped() -> None:
-    """Workflow should keep stale PR cleanup independent from weekly update creation."""
+def test_workflow_runs_cleanup_after_update_job() -> None:
+    """Workflow should run cleanup after the update job finishes."""
     text = WORKFLOW.read_text(encoding="utf-8")
 
     assert "cleanup:" in text

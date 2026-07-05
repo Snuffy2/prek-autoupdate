@@ -32,12 +32,9 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    with:
-      force-update: ${{ github.event_name == 'workflow_dispatch' }}
-      update-weekday: "1"
 ```
 
-This runs cleanup daily and runs `prek auto-update` on Mondays or when manually dispatched.
+This runs `prek auto-update` on the caller workflow's schedule or when manually dispatched.
 
 ## Run CI on the Update Branch
 
@@ -59,8 +56,6 @@ jobs:
       pull-requests: write
       actions: write
     with:
-      force-update: ${{ github.event_name == 'workflow_dispatch' }}
-      update-weekday: "1"
       dispatch-workflows: |
         ci.yml
         tests.yml
@@ -80,8 +75,6 @@ GitHub only dispatches workflows that already exist on the repository default br
 
 | Input | Default | Description |
 | --- | --- | --- |
-| `force-update` | `false` | Run update regardless of weekday. Pass `${{ github.event_name == 'workflow_dispatch' }}` from caller workflows. |
-| `update-weekday` | `"1"` | UTC weekday for scheduled updates. `1` is Monday. |
 | `cooldown-days` | `"7"` | Value passed to `prek auto-update --cooldown-days`. |
 | `update-branch` | `chore/prek-updates` | Branch used for update PRs. |
 | `branch-prefix` | `chore/prek-updates` | Prefix considered owned by cleanup. |
