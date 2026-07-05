@@ -1,6 +1,6 @@
 """Tests for prek autoupdate branch cleanup."""
 
-# ruff: noqa: TC002,PLR0913,S101,SLF001,TRY003,EM102,EM101
+# ruff: noqa: TC002,PLR0913,SLF001,TRY003,EM102,EM101
 
 from __future__ import annotations
 
