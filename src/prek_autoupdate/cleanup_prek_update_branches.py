@@ -17,7 +17,6 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 GITHUB_API_URL = "https://api.github.com"
-CLOSED_PULL_PAGE_LIMIT = 5
 LOGGER = logging.getLogger(__name__)
 
 
@@ -273,7 +272,7 @@ def cleanup_update_branches(
         )
 
     if delete_merged_branches:
-        closed_pulls = client.list_pulls(state="closed", max_pages=CLOSED_PULL_PAGE_LIMIT)
+        closed_pulls = client.list_pulls(state="closed")
         for pull in closed_pulls:
             if pull.get("merged_at") is not None and _is_workflow_pull(
                 pull,

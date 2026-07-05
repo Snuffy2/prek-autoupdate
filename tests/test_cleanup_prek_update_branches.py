@@ -126,7 +126,7 @@ def test_cleanup_script_closes_stale_prs_and_deletes_workflow_branches() -> None
     ]
     assert client.max_pages_by_state == {
         "open": None,
-        "closed": cleanup.CLOSED_PULL_PAGE_LIMIT,
+        "closed": None,
     }
     assert result.closed_prs == [10, 9]
     assert result.deleted_branches == [WORKFLOW_BRANCH, f"{WORKFLOW_BRANCH}-old"]
@@ -200,6 +200,37 @@ def test_cleanup_script_can_keep_latest_open_workflow_pr() -> None:
     ]
     assert result.closed_prs == [17]
     assert result.deleted_branches == [f"{WORKFLOW_BRANCH}-merged", f"{WORKFLOW_BRANCH}-old"]
+
+
+def test_cleanup_script_checks_all_closed_pulls_for_merged_workflow_branches() -> None:
+    """Cleanup script should not cap merged workflow branch cleanup to recent PR pages."""
+    client = FakeCleanupClient(
+        open_pulls=[],
+        closed_pulls=[
+            _workflow_pull(
+                number=4,
+                ref=f"{WORKFLOW_BRANCH}-old-merged",
+                merged_at="2026-05-01T00:00:00Z",
+            ),
+        ],
+    )
+
+    result = cleanup.cleanup_update_branches(
+        client=client,
+        repository=REPOSITORY,
+        branch=WORKFLOW_BRANCH,
+        branch_prefix=WORKFLOW_BRANCH,
+        label_name=WORKFLOW_LABEL,
+        author_login=WORKFLOW_AUTHOR,
+        body_marker=WORKFLOW_BODY_MARKER,
+        keep_pr_number=None,
+        close_stale_prs=True,
+        delete_merged_branches=True,
+    )
+
+    assert client.max_pages_by_state == {"open": None, "closed": None}
+    assert client.deleted_refs == [f"heads/{WORKFLOW_BRANCH}-old-merged"]
+    assert result.deleted_branches == [f"{WORKFLOW_BRANCH}-old-merged"]
 
 
 def test_cleanup_script_deletes_orphaned_update_branches() -> None:
