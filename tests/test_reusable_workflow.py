@@ -25,6 +25,7 @@ def test_workflow_is_reusable() -> None:
     assert "should-update" not in text
     assert "dispatch-workflows:" in text
     assert "default: v1" in text
+    assert "          prek.toml\n          .pre-commit-config.yaml" in text
 
 
 def test_workflow_checks_out_target_and_tooling_repositories() -> None:

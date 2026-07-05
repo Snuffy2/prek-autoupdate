@@ -81,7 +81,7 @@ GitHub only dispatches workflows that already exist on the repository default br
 | `label` | `dependencies` | PR label used for generated PRs and cleanup ownership checks. |
 | `commit-message` | `chore: update prek hooks` | Commit message for update commits. |
 | `pr-title` | `Bump prek Hooks` | Pull request title. |
-| `add-paths` | `prek.toml` | Newline-separated paths the PR action may commit. |
+| `add-paths` | `prek.toml`, `.pre-commit-config.yaml` | Newline-separated paths the PR action may commit. |
 | `dispatch-workflows` | empty | Newline-separated workflow names, filenames, or IDs to run on the update branch with `workflow_dispatch`. |
 | `tool-repository` | `Snuffy2/prek-autoupdate` | Repository containing cleanup tooling. |
 | `tool-ref` | `v1` | Ref used when checking out cleanup tooling. Usually omit this so the workflow default is used. |

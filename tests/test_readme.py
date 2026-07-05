@@ -17,6 +17,7 @@ def test_readme_documents_reusable_workflow_usage() -> None:
     assert "permissions:" in text
     assert "contents: write" in text
     assert "pull-requests: write" in text
+    assert "`prek.toml`, `.pre-commit-config.yaml`" in text
     assert "## Recommended Stable Caller" not in text
     assert "tool-ref: v1" not in text
     assert "Usually omit this so the workflow default is used." in text

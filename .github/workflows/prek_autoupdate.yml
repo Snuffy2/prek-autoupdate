@@ -37,7 +37,9 @@ on:
         description: Newline-separated paths peter-evans/create-pull-request may commit.
         required: false
         type: string
-        default: prek.toml
+        default: |
+          prek.toml
+          .pre-commit-config.yaml
       dispatch-workflows:
         description: Newline-separated workflow filenames or IDs to workflow_dispatch on the update branch.
         required: false
