@@ -61,7 +61,7 @@ jobs:
       pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
     steps:
       - name: Checkout Target Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: target
           persist-credentials: false
@@ -136,7 +136,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout Tooling Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
@@ -144,7 +144,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.14"
 
