@@ -8,6 +8,11 @@ on:
         required: false
         type: string
         default: "7"
+      update-day:
+        description: UTC day of week to run prek auto-update, 0=Sunday through 6=Saturday. Manual runs always update.
+        required: false
+        type: string
+        default: "1"
       update-branch:
         description: Branch used for the generated update PR.
         required: false
@@ -58,18 +63,39 @@ jobs:
     outputs:
       pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
     steps:
+      - name: Check update day
+        id: update-day
+        env:
+          UPDATE_DAY: ${{ inputs.update-day }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "${UPDATE_DAY}" =~ ^[0-6]$ ]]; then
+            echo "::error::update-day must be an integer from 0 through 6"
+            exit 1
+          fi
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "$(date -u +%w)" == "${UPDATE_DAY}" ]]; then
+            echo "should-update=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "should-update=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Checkout Target Repository
+        if: steps.update-day.outputs.should-update == 'true'
         uses: actions/checkout@v7
         with:
           path: target
           persist-credentials: false
 
       - name: Install prek
+        if: steps.update-day.outputs.should-update == 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: prek
 
       - name: Run prek auto-update
+        if: steps.update-day.outputs.should-update == 'true'
         working-directory: target
         env:
           COOLDOWN_DAYS: ${{ inputs.cooldown-days }}
@@ -86,6 +112,7 @@ jobs:
           } | tee "${body_file}"
 
       - name: Resolve add paths
+        if: steps.update-day.outputs.should-update == 'true'
         id: add-paths
         working-directory: target
         env:
@@ -115,6 +142,7 @@ jobs:
           echo "value=${paths[0]}" >> "${GITHUB_OUTPUT}"
 
       - name: Create Pull Request
+        if: steps.update-day.outputs.should-update == 'true'
         id: cpr
         uses: peter-evans/create-pull-request@v8
         with:

@@ -30,7 +30,7 @@ jobs:
       pull-requests: write
 ```
 
-This runs `prek auto-update` on the caller workflow's schedule or when manually dispatched.
+Run the caller workflow daily so stale PR and branch cleanup happens every night. `prek auto-update` only runs on `update-day`, or when the workflow is manually dispatched.
 This normal path does not need `actions: write`.
 Major version tags such as `v1` are updated on release to point at the latest release in that major series.
 
@@ -58,6 +58,7 @@ jobs:
       pull-requests: write
       actions: write
     with:
+      update-day: "1"
       dispatch-workflows: |
         ci.yml
         tests.yml
@@ -80,6 +81,7 @@ GitHub only dispatches workflows that already exist on the repository default br
 | Input | Default | Description |
 | --- | --- | --- |
 | `cooldown-days` | `"7"` | Value passed to `prek auto-update --cooldown-days`. |
+| `update-day` | `"1"` | UTC day of week to run `prek auto-update`, where `0` is Sunday and `6` is Saturday. Manual runs always check for updates. Schedule callers daily so cleanup can run every night. |
 | `update-branch` | `chore/prek-updates` | Branch used for update PRs. |
 | `branch-prefix` | `chore/prek-updates` | Prefix considered owned by cleanup. |
 | `label` | `dependencies` | PR label used for generated PRs and cleanup ownership checks. |
