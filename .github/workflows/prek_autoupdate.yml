@@ -37,9 +37,7 @@ on:
         description: Newline-separated paths peter-evans/create-pull-request may commit.
         required: false
         type: string
-        default: |
-          prek.toml
-          .pre-commit-config.yaml
+        default: ""
       dispatch-workflows:
         description: Newline-separated workflow filenames or IDs to workflow_dispatch on the update branch.
         required: false
@@ -87,6 +85,34 @@ jobs:
             echo '```'
           } | tee "${body_file}"
 
+      - name: Resolve add paths
+        id: add-paths
+        working-directory: target
+        env:
+          ADD_PATHS: ${{ inputs.add-paths }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${ADD_PATHS}" ]]; then
+            {
+              echo "value<<EOF"
+              printf '%s\n' "${ADD_PATHS}"
+              echo "EOF"
+            } >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          paths=()
+          [[ -f prek.toml ]] && paths+=(prek.toml)
+          [[ -f .pre-commit-config.yaml ]] && paths+=(.pre-commit-config.yaml)
+
+          if [[ "${#paths[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one prek config file: prek.toml or .pre-commit-config.yaml"
+            exit 1
+          fi
+
+          echo "value=${paths[0]}" >> "${GITHUB_OUTPUT}"
+
       - name: Create Pull Request
         id: cpr
         uses: peter-evans/create-pull-request@v8
@@ -100,7 +126,7 @@ jobs:
           labels: ${{ inputs.label }}
           delete-branch: true
           body-path: prek-autoupdate-body.md
-          add-paths: ${{ inputs.add-paths }}
+          add-paths: ${{ steps.add-paths.outputs.value }}
 
   dispatch-workflows:
     name: Dispatch Update Branch Workflows
