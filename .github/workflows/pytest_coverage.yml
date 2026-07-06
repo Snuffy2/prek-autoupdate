@@ -24,14 +24,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
-
-      - name: Debug GitHub Variables
-        run: |
-          echo "github.event_name: ${{ github.event_name }}"
-          echo "github.ref_name: ${{ github.ref_name }}"
-          echo "github.event.repository.default_branch: ${{ github.event.repository.default_branch }}"
-          echo "github.event.pull_request.user.type: ${{ github.event.pull_request.user.type }}"
-          echo "PR labels: ${{ github.event_name == 'pull_request' && toJSON(github.event.pull_request.labels.*.name) || '' }}"
+        with:
+          persist-credentials: false
 
       - name: Setup Python 3 (with caching)
         uses: actions/setup-python@v6
