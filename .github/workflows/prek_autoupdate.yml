@@ -94,10 +94,11 @@ jobs:
           set -euo pipefail
 
           if [[ -n "${ADD_PATHS}" ]]; then
+            delimiter="$(openssl rand -hex 16)"
             {
-              echo "value<<EOF"
+              echo "value<<${delimiter}"
               printf '%s\n' "${ADD_PATHS}"
-              echo "EOF"
+              echo "${delimiter}"
             } >> "${GITHUB_OUTPUT}"
             exit 0
           fi
