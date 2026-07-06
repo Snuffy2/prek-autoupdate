@@ -31,15 +31,25 @@ jobs:
 ```
 
 This runs `prek auto-update` on the caller workflow's schedule or when manually dispatched.
+This normal path does not need `actions: write`.
 Major version tags such as `v1` are updated on release to point at the latest release in that major series.
 
 ## Run CI on the Update Branch
 
 GitHub limits what events can be triggered by the repository `GITHUB_TOKEN`. PRs created by automation may require manual workflow approval, and fully automatic PR workflow runs without that approval require a GitHub App token or PAT.
 
-The token-only workaround is to dispatch named workflows on the update branch with `workflow_dispatch`. Add `actions: write` and list the workflows in `dispatch-workflows`:
+The token-only workaround is to dispatch named workflows on the update branch with `workflow_dispatch`. When setting `dispatch-workflows`, the caller job must also grant `actions: write`.
+
+Example caller workflow:
 
 ```yaml
+name: prek Autoupdate
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
 jobs:
   prek-autoupdate:
     uses: Snuffy2/prek-autoupdate/.github/workflows/prek_autoupdate.yml@v1
@@ -52,6 +62,8 @@ jobs:
         ci.yml
         tests.yml
 ```
+
+Without `actions: write`, GitHub can reject the reusable workflow call before it reaches the hook update job.
 
 Each listed workflow must support manual dispatch:
 
@@ -74,4 +86,4 @@ GitHub only dispatches workflows that already exist on the repository default br
 | `commit-message` | `chore: update prek hooks` | Commit message for update commits. |
 | `pr-title` | `Bump prek Hooks` | Pull request title. |
 | `add-paths` | `prek.toml`, `.pre-commit-config.yaml` | Newline-separated paths the PR action may commit. |
-| `dispatch-workflows` | empty | Newline-separated workflow names, filenames, or IDs to run on the update branch with `workflow_dispatch`. |
+| `dispatch-workflows` | empty | Newline-separated workflow names, filenames, or IDs to run on the update branch with `workflow_dispatch`. Requires caller permission `actions: write` when set. |
