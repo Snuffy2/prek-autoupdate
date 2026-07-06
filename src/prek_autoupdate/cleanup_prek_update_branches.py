@@ -244,25 +244,23 @@ def cleanup_update_branches(
             branches_to_delete.add(head_ref)
 
     if delete_stale_branches or delete_merged_branches:
-        branches_to_delete.update(
-            branch_ref
-            for pull in _workflow_pulls(
-                client.list_pulls(state="closed"),
-                repository=repository,
-                branch=branch,
-                branch_prefix=branch_prefix,
-                label_name=label_name,
-                author_login=author_login,
-                body_marker=body_marker,
-            )
-            for branch_ref in _workflow_closed_branch_refs_with_sha_match(
+        for pull in _workflow_pulls(
+            client.list_pulls(state="closed"),
+            repository=repository,
+            branch=branch,
+            branch_prefix=branch_prefix,
+            label_name=label_name,
+            author_login=author_login,
+            body_marker=body_marker,
+        ):
+            is_stale = pull.get("merged_at") is None
+            should_delete = delete_stale_branches if is_stale else delete_merged_branches
+            if should_delete and _is_branch_head_sha_match(
                 client=client,
                 pull=pull,
                 repository=repository,
-                include_stale=delete_stale_branches,
-                include_merged=delete_merged_branches,
-            )
-        )
+            ):
+                branches_to_delete.add(_head_ref(pull))
 
     branches_to_delete -= protected_branches
     for branch_name in sorted(branches_to_delete):
@@ -287,25 +285,6 @@ def _collect_protected_branches(
         and (head_ref := _same_repo_head_ref(pull, repository=repository)) is not None
         and head_ref.startswith(branch_prefix)
     }
-
-
-def _workflow_closed_branch_refs_with_sha_match(
-    *,
-    client: CleanupClient,
-    pull: Mapping[str, object],
-    repository: str,
-    include_stale: bool,
-    include_merged: bool,
-) -> set[str]:
-    """Return workflow branch refs that match requested state and current SHA."""
-    is_stale = pull.get("merged_at") is None
-    if is_stale and not include_stale:
-        return set()
-    if not is_stale and not include_merged:
-        return set()
-    if not _is_branch_head_sha_match(client=client, pull=pull, repository=repository):
-        return set()
-    return {_head_ref(pull)}
 
 
 def _workflow_pulls(
@@ -398,19 +377,8 @@ def _is_workflow_pull(
         if not isinstance(body, str) or body_marker not in body:
             return False
 
-    head = pull.get("head", {})
-    if not isinstance(head, dict):
-        return False
-    head_ref = head.get("ref")
-    if not isinstance(head_ref, str):
-        return False
-    if head_ref != branch and not head_ref.startswith(branch_prefix):
-        return False
-
-    head_repo = head.get("repo", {})
-    if not isinstance(head_repo, dict):
-        return False
-    return head_repo.get("full_name") == repository
+    head_ref = _same_repo_head_ref(pull, repository=repository)
+    return head_ref is not None and (head_ref == branch or head_ref.startswith(branch_prefix))
 
 
 def _head_ref(pull: Mapping[str, object]) -> str:
