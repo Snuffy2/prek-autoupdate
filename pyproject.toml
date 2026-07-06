@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prek-autoupdate"
-version = "1.0.0"
+version = "1.0.1"
 description = "Reusable GitHub workflow helpers for prek autoupdate pull requests."
 readme = "README.md"
 requires-python = ">=3.14"
