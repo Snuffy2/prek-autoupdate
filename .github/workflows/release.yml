@@ -1,0 +1,68 @@
+name: Update Version on Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-version:
+    name: Update Version on Release
+    runs-on: ubuntu-latest
+    if: ${{ github.event.release.draft == false && github.event.release.prerelease == false }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.target_commitish }}
+
+      - name: Update pyproject version
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          tag_name = os.environ["TAG_NAME"]
+          version = tag_name.removeprefix("v")
+          path = Path("pyproject.toml")
+          text = path.read_text()
+          text, count = re.subn(
+              r'(?m)^version = ".*"$',
+              lambda _match: f"version = {json.dumps(version)}",
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("Unable to find version field in pyproject.toml")
+          path.write_text(text)
+          PY
+
+      - name: Commit & Push Version Changes
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          branch: ${{ github.event.release.target_commitish }}
+          commit_message: "Updating to version ${{ github.event.release.tag_name }} [skip ci]"
+
+      - name: Update Release with Version Changes Commit
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          tag_name="${TAG_NAME}"
+          git tag -f "${tag_name}"
+          git push -f origin "${tag_name}"
+
+      - name: Update Major Version Tag
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          major_tag="${TAG_NAME%%.*}"
+          git tag -f "${major_tag}"
+          git push -f origin "${major_tag}"

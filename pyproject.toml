@@ -1,0 +1,81 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "prek-autoupdate"
+version = "0.1.0"
+description = "Reusable GitHub workflow helpers for prek autoupdate pull requests."
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+
+[project.scripts]
+prek-autoupdate-cleanup = "prek_autoupdate.cleanup_prek_update_branches:main"
+
+[dependency-groups]
+lint = [
+  "mypy>=1.17.0",
+  "prek>=0.4.8",
+  "ruff>=0.12.0",
+]
+pytest = [
+  "pytest>=8.4.0",
+  "pytest-cov>=6.2.0",
+  "pytest-timeout>=2.4.0",
+]
+dev = [
+  { include-group = "lint" },
+  { include-group = "pytest" },
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/prek_autoupdate"]
+
+[tool.pytest.ini_options]
+addopts = """
+  --quiet
+  --timeout=20
+  --durations=10
+  -o console_output_style=progress
+  --cov=prek_autoupdate
+  --cov-report=term-missing
+  --cov-report=html
+"""
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["src/prek_autoupdate"]
+relative_files = true
+parallel = false
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "COM812",
+  "D203",
+  "D213",
+  "EM101",
+  "EM102",
+  "PLR0911",
+  "PLR0913",
+  "S310",
+  "TRY003",
+  "TRY400",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S106", "SLF001", "TC002"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+files = ["src", "tests"]
