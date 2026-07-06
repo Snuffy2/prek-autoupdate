@@ -213,7 +213,7 @@ def test_cleanup_script_checks_all_closed_pulls_for_merged_workflow_branches() -
     assert result.deleted_branches == [f"{WORKFLOW_BRANCH}-old-merged"]
 
 
-def test_cleanup_script_deletes_orphaned_update_branches() -> None:
+def test_cleanup_script_preserves_prefixed_branches_without_workflow_metadata() -> None:
     """Prefixed branches without workflow PR metadata are preserved."""
     client = FakeCleanupClient(
         open_pulls=[_workflow_pull(number=18)],

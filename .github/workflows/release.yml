@@ -22,8 +22,26 @@ jobs:
           TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          version="${TAG_NAME#v}"
-          sed -i "s/^version = \".*\"/version = \"${version}\"/" pyproject.toml
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          tag_name = os.environ["TAG_NAME"]
+          version = tag_name.removeprefix("v")
+          path = Path("pyproject.toml")
+          text = path.read_text()
+          text, count = re.subn(
+              r'(?m)^version = ".*"$',
+              lambda _match: f"version = {json.dumps(version)}",
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("Unable to find version field in pyproject.toml")
+          path.write_text(text)
+          PY
 
       - name: Commit & Push Version Changes
         uses: stefanzweifel/git-auto-commit-action@v7
