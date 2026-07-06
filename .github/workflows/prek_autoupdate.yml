@@ -70,6 +70,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          if ! [[ "${UPDATE_DAY}" =~ ^[0-6]$ ]]; then
+            echo "::error::update-day must be an integer from 0 through 6"
+            exit 1
+          fi
+
           if [[ "${{ github.event_name }}" == "workflow_dispatch" || "$(date -u +%w)" == "${UPDATE_DAY}" ]]; then
             echo "should-update=true" >> "${GITHUB_OUTPUT}"
           else
