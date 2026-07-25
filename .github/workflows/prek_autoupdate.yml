@@ -61,6 +61,7 @@ jobs:
       contents: write
       pull-requests: write
     outputs:
+      pull-request-head-sha: ${{ steps.cpr.outputs.pull-request-head-sha }}
       pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
     steps:
       - name: Check update day
@@ -164,20 +165,45 @@ jobs:
     if: needs.update-hooks.outputs.pull-request-number != '' && inputs.dispatch-workflows != ''
     permissions:
       actions: write
+      contents: read
     steps:
-      - name: Dispatch workflows for update branch
+      - name: Checkout Tooling Repository
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: tooling
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Dispatch workflows and remove approval gates
         env:
           DISPATCH_WORKFLOWS: ${{ inputs.dispatch-workflows }}
-          GH_TOKEN: ${{ github.token }}
-          UPDATE_BRANCH: ${{ inputs.update-branch }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ needs.update-hooks.outputs.pull-request-head-sha }}
+          PR_NUMBER: ${{ needs.update-hooks.outputs.pull-request-number }}
           REPOSITORY: ${{ github.repository }}
+          UPDATE_BRANCH: ${{ inputs.update-branch }}
         run: |
           set -euo pipefail
 
+          args=(
+            --repository "${REPOSITORY}"
+            --ref "${UPDATE_BRANCH}"
+            --pr-number "${PR_NUMBER}"
+            --head-sha "${PR_HEAD_SHA}"
+          )
+
           while IFS= read -r workflow; do
             [[ -z "${workflow}" ]] && continue
-            gh workflow run "${workflow}" --repo "${REPOSITORY}" --ref "${UPDATE_BRANCH}"
+            args+=(--workflow "${workflow}")
           done <<< "${DISPATCH_WORKFLOWS}"
+
+          python tooling/src/prek_autoupdate/dispatch_workflows.py "${args[@]}"
 
   cleanup:
     name: Cleanup prek Update PRs

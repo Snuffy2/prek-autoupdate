@@ -9,6 +9,7 @@ Reusable GitHub Actions workflow for opening and maintaining `prek auto-update` 
 - Closes duplicate stale workflow-owned PRs.
 - Deletes stale and merged workflow-owned update branches.
 - Optionally dispatches named workflows on the update branch using the repository `GITHUB_TOKEN`.
+- Removes the duplicate approval-required runs for successfully dispatched workflows.
 
 ## Quick Start
 
@@ -36,9 +37,11 @@ Major version tags such as `v1` are updated on release to point at the latest re
 
 ## Run CI on the Update Branch
 
-GitHub limits what events can be triggered by the repository `GITHUB_TOKEN`. PRs created by automation may require manual workflow approval, and fully automatic PR workflow runs without that approval require a GitHub App token or PAT.
+GitHub creates approval-required `pull_request` runs when this workflow opens or updates a PR with the repository `GITHUB_TOKEN`.
 
-The token-only workaround is to dispatch named workflows on the update branch with `workflow_dispatch`. When setting `dispatch-workflows`, the caller job must also grant `actions: write`.
+The token-only workaround dispatches named workflows on the update branch with `workflow_dispatch`, then deletes the duplicate approval-required runs for those same workflow IDs, PR number, and head commit. The dispatched runs remain as the PR's checks, without requiring a PAT or GitHub App.
+
+When setting `dispatch-workflows`, the caller job must also grant `actions: write`.
 
 Example caller workflow:
 
@@ -66,7 +69,7 @@ jobs:
 
 Without `actions: write`, GitHub can reject the reusable workflow call before it reaches the hook update job.
 
-Each listed workflow must support manual dispatch:
+Each listed workflow must support manual dispatch, and its jobs and steps must support the `workflow_dispatch` event:
 
 ```yaml
 on:
@@ -75,6 +78,8 @@ on:
 ```
 
 GitHub only dispatches workflows that already exist on the repository default branch, so add `workflow_dispatch` before relying on `dispatch-workflows` for a new workflow.
+
+The workflow removes only `action_required` runs that match the configured workflow, generated PR number, and exact PR head SHA. If dispatching fails, the approval-required runs remain available for manual approval.
 
 ## Inputs
 
@@ -88,4 +93,4 @@ GitHub only dispatches workflows that already exist on the repository default br
 | `commit-message` | `chore: update prek hooks` | Commit message for update commits. |
 | `pr-title` | `Bump prek Hooks` | Pull request title. |
 | `add-paths` | auto-detect | Newline-separated paths the PR action may commit. By default, the workflow uses the one existing `prek` config file: `prek.toml` or `.pre-commit-config.yaml`. |
-| `dispatch-workflows` | empty | Newline-separated workflow names, filenames, or IDs to run on the update branch with `workflow_dispatch`. Requires caller permission `actions: write` when set. |
+| `dispatch-workflows` | empty | Newline-separated workflow names, filenames, full paths, or IDs to run on the update branch with `workflow_dispatch`; matching approval-required runs are removed after dispatch. Requires caller permission `actions: write` when set. |
