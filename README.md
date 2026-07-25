@@ -93,4 +93,4 @@ The workflow removes only `action_required` runs that match the configured workf
 | `commit-message` | `chore: update prek hooks` | Commit message for update commits. |
 | `pr-title` | `Bump prek Hooks` | Pull request title. |
 | `add-paths` | auto-detect | Newline-separated paths the PR action may commit. By default, the workflow uses the one existing `prek` config file: `prek.toml` or `.pre-commit-config.yaml`. |
-| `dispatch-workflows` | empty | Newline-separated workflow names, filenames, or IDs to run on the update branch with `workflow_dispatch`; matching approval-required runs are removed after dispatch. Requires caller permission `actions: write` when set. |
+| `dispatch-workflows` | empty | Newline-separated workflow names, filenames, full paths, or IDs to run on the update branch with `workflow_dispatch`; matching approval-required runs are removed after dispatch. Requires caller permission `actions: write` when set. |

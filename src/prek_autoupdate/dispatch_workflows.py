@@ -54,7 +54,13 @@ class WorkflowApi(Protocol):
     def dispatch_workflow(self, workflow_id: int, ref: str) -> None:
         """Dispatch a workflow on a ref."""
 
-    def list_pull_request_runs(self, workflow_id: int, branch: str) -> list[Run]:
+    def list_pull_request_runs(
+        self,
+        workflow_id: int,
+        branch: str,
+        head_sha: str,
+        status: str,
+    ) -> list[Run]:
         """Return pull-request runs for a workflow and branch."""
 
     def delete_run(self, run_id: int) -> None:
@@ -154,12 +160,20 @@ class GitHubApi:
             {"ref": ref},
         )
 
-    def list_pull_request_runs(self, workflow_id: int, branch: str) -> list[Run]:
+    def list_pull_request_runs(
+        self,
+        workflow_id: int,
+        branch: str,
+        head_sha: str,
+        status: str,
+    ) -> list[Run]:
         """Return pull-request runs for a workflow and branch."""
         query = urlencode(
             {
                 "event": "pull_request",
                 "branch": branch,
+                "head_sha": head_sha,
+                "status": status,
                 "per_page": 100,
             }
         )
@@ -284,7 +298,12 @@ def dispatch_workflows(
         for workflow_id in tuple(pending_workflow_ids):
             matching_runs = [
                 run
-                for run in api.list_pull_request_runs(workflow_id, ref)
+                for run in api.list_pull_request_runs(
+                    workflow_id,
+                    ref,
+                    head_sha,
+                    "action_required",
+                )
                 if run.head_sha == head_sha
                 and run.conclusion == "action_required"
                 and pr_number in run.pull_request_numbers
@@ -307,7 +326,7 @@ def dispatch_workflows(
             time.sleep(retry_delay)
 
     missing = ", ".join(resolved[workflow_id].name for workflow_id in pending_workflow_ids)
-    LOGGER.info("No matching approval-required runs found for: %s", missing)
+    LOGGER.warning("No matching approval-required runs found for: %s", missing)
 
 
 def _parser() -> argparse.ArgumentParser:

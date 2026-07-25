@@ -40,9 +40,17 @@ class FakeGitHubApi:
         """Record a workflow dispatch."""
         self.dispatched.append((workflow_id, ref))
 
-    def list_pull_request_runs(self, workflow_id: int, branch: str) -> list[Run]:
+    def list_pull_request_runs(
+        self,
+        workflow_id: int,
+        branch: str,
+        head_sha: str,
+        status: str,
+    ) -> list[Run]:
         """Return runs for a workflow."""
         assert branch == "chore/prek-updates"
+        assert head_sha == "expected-sha"
+        assert status == "action_required"
         return self.runs.get(workflow_id, [])
 
     def delete_run(self, run_id: int) -> None:
@@ -166,11 +174,17 @@ def test_dispatch_retries_until_approval_run_appears(
     class DelayedApi(FakeGitHubApi):
         attempts = 0
 
-        def list_pull_request_runs(self, workflow_id: int, branch: str) -> list[Run]:
+        def list_pull_request_runs(
+            self,
+            workflow_id: int,
+            branch: str,
+            head_sha: str,
+            status: str,
+        ) -> list[Run]:
             self.attempts += 1
             if self.attempts == 1:
                 return []
-            return super().list_pull_request_runs(workflow_id, branch)
+            return super().list_pull_request_runs(workflow_id, branch, head_sha, status)
 
     api = DelayedApi(
         workflows=[workflows[0]],
@@ -254,10 +268,16 @@ def test_github_api_requests_and_paginates(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert [workflow.id for workflow in api.list_workflows()] == [1, 2]
     api.dispatch_workflow(1, "branch")
-    assert api.list_pull_request_runs(1, "branch") == [Run(9, "abc", None, frozenset({7}))]
+    assert api.list_pull_request_runs(1, "branch", "abc", "action_required") == [
+        Run(9, "abc", None, frozenset({7}))
+    ]
     api.delete_run(9)
-    assert len(requests) == len(
-        ["workflow page 1", "workflow page 2", "dispatch", "runs", "delete"]
+    assert len(requests) == 5  # noqa: PLR2004
+    assert isinstance(requests[3], urllib.request.Request)
+    assert (
+        requests[3].full_url == "https://example/repos/owner/repo/actions/workflows/1/runs"
+        "?event=pull_request&branch=branch&head_sha=abc"
+        "&status=action_required&per_page=100"
     )
 
 
@@ -338,7 +358,12 @@ def test_dispatch_validates_retries_and_exhausts(
     api = FakeGitHubApi(workflows=[workflows[0]], runs={})
     with pytest.raises(ValueError, match="at least 1"):
         dispatch_workflows(
-            api, identifiers=["CI"], ref="x", pr_number=1, head_sha="x", retry_attempts=0
+            api,
+            identifiers=["CI"],
+            ref="chore/prek-updates",
+            pr_number=1,
+            head_sha="expected-sha",
+            retry_attempts=0,
         )
     sleeps: list[float] = []
     monkeypatch.setattr(time, "sleep", sleeps.append)
@@ -347,7 +372,7 @@ def test_dispatch_validates_retries_and_exhausts(
         identifiers=["Linters", "101"],
         ref="chore/prek-updates",
         pr_number=1,
-        head_sha="x",
+        head_sha="expected-sha",
         retry_attempts=2,
         retry_delay=0.1,
     )
