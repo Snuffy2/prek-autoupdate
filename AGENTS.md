@@ -19,6 +19,7 @@ This repository maintains the reusable `prek` autoupdate workflow and its cleanu
 ## GitHub Token And Workflow Dispatch
 
 - This project must work with the repository `GITHUB_TOKEN`; do not require per-repo PATs or custom app tokens for the normal path.
+- A PAT is not an option for this project. Do not add, recommend, or document a classic or fine-grained PAT as a solution, optional escape hatch, fallback, advanced configuration, or secret input for this repository or its downstream callers.
 - PR workflow approval limits are a GitHub platform behavior. The token-only workaround here is `dispatch-workflows`, which calls `workflow_dispatch` on named workflows.
 - Document that dispatched workflows must already exist on the consuming repository default branch.
 
