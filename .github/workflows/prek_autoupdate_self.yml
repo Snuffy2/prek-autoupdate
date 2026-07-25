@@ -14,8 +14,3 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-      actions: write
-    with:
-      dispatch-workflows: |
-        linters.yml
-        pytest_coverage.yml

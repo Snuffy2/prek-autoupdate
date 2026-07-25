@@ -12,7 +12,6 @@ license = "MIT"
 
 [project.scripts]
 prek-autoupdate-cleanup = "prek_autoupdate.cleanup_prek_update_branches:main"
-prek-autoupdate-dispatch = "prek_autoupdate.dispatch_workflows:main"
 
 [dependency-groups]
 lint = [

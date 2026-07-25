@@ -14,14 +14,14 @@ This repository maintains the reusable `prek` autoupdate workflow and its cleanu
 - Keep consuming-repo YAML examples thin: schedule plus `jobs.<job>.uses`.
 - Do not copy the cleanup script back into downstream repos. Fix it here and update callers to use this repo.
 - Treat `.github/workflows/prek_autoupdate.yml` and `README.md` as a public API. Renaming inputs or changing defaults requires docs in the same change.
-- Do not broaden token permissions casually. `actions: write` is only for the optional `dispatch-workflows` path; cleanup should not receive it.
+- Do not request `actions: write`; no active workflow path needs it.
 
-## GitHub Token And Workflow Dispatch
+## GitHub Token And Deprecated Dispatch Input
 
 - This project must work with the repository `GITHUB_TOKEN`; do not require per-repo PATs or custom app tokens for the normal path.
 - A PAT is not an option for this project. Do not add, recommend, or document a classic or fine-grained PAT as a solution, optional escape hatch, fallback, advanced configuration, or secret input for this repository or its downstream callers.
-- PR workflow approval limits are a GitHub platform behavior. The token-only workaround here is `dispatch-workflows`, which calls `workflow_dispatch` on named workflows.
-- Document that dispatched workflows must already exist on the consuming repository default branch.
+- PR workflow approval limits are a GitHub platform behavior.
+- Keep `dispatch-workflows` as an accepted but ignored compatibility input so existing callers do not fail workflow validation. Do not restore workflow dispatch or approval-run deletion behavior without an explicit redesign.
 
 ## Cleanup Safety
 
