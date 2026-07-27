@@ -19,6 +19,9 @@ name: prek Autoupdate
 on:
   schedule:
     - cron: "0 2 * * *"
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -27,6 +30,8 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    with:
+      update-day: "1"
 ```
 
 Run the caller workflow daily so stale PR and branch cleanup happens every night. `prek auto-update` only runs on `update-day`, or when the workflow is manually dispatched.
