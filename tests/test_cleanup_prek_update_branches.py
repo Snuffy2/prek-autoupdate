@@ -411,6 +411,92 @@ def test_github_headers_include_json_content_type() -> None:
     assert headers["Content-Type"] == "application/json"
 
 
+def test_github_client_closes_and_gets_pull(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub client should use the pull endpoint for mutations and details."""
+    calls: list[tuple[str, str, dict[str, str] | None]] = []
+    pull = _workflow_pull(number=18)
+
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        payload: dict[str, str] | None = None,
+    ) -> tuple[object, None]:
+        """Record GitHub requests and return pull details."""
+        calls.append((method, url, payload))
+        return pull, None
+
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    client.close_pull(18)
+    assert client.get_pull(18) == pull
+    assert calls == [
+        (
+            "PATCH",
+            "https://api.github.com/repos/o/r/pulls/18",
+            {"state": "closed"},
+        ),
+        ("GET", "https://api.github.com/repos/o/r/pulls/18", None),
+    ]
+
+
+def test_github_client_rejects_invalid_pull_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub client should reject non-object pull details."""
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    monkeypatch.setattr(client, "_request", lambda *_args: ([], None))
+
+    with pytest.raises(TypeError, match="Expected a pull request object"):
+        client.get_pull(18)
+
+
+def test_pull_metadata_rejects_invalid_numeric_values() -> None:
+    """Pull metadata helpers should reject invalid number and file counts."""
+    with pytest.raises(TypeError, match="numeric number"):
+        cleanup._pull_number({"number": None})
+
+    with pytest.raises(TypeError, match="valid changed file count"):
+        cleanup._pull_changed_files({"changed_files": -1})
+
+
+def test_main_logs_successful_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CLI entry point should report successful cleanup results."""
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+    monkeypatch.setattr(
+        cleanup,
+        "cleanup_update_branches",
+        lambda **_kwargs: cleanup.CleanupResult(
+            closed_prs=[18],
+            deleted_branches=[WORKFLOW_BRANCH],
+        ),
+    )
+
+    with caplog.at_level("INFO"):
+        exit_code = cleanup.main(
+            [
+                "--repository",
+                REPOSITORY,
+                "--branch",
+                WORKFLOW_BRANCH,
+                "--branch-prefix",
+                WORKFLOW_BRANCH,
+                "--label-name",
+                WORKFLOW_LABEL,
+            ]
+        )
+
+    assert exit_code == 0
+    assert "Closed PRs: [18]" in caplog.text
+    assert f"Deleted branches: ['{WORKFLOW_BRANCH}']" in caplog.text
+
+
 def test_main_returns_failure_for_github_request_errors(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
