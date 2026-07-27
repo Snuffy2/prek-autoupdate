@@ -20,9 +20,11 @@ lint = [
   "ruff>=0.12.0",
 ]
 pytest = [
+  "PyYAML>=6.0.2",
   "pytest>=8.4.0",
   "pytest-cov>=6.2.0",
   "pytest-timeout>=2.4.0",
+  "types-PyYAML>=6.0.12.20250516",
 ]
 dev = [
   { include-group = "lint" },
