@@ -9,7 +9,7 @@ on:
         type: string
         default: "7"
       update-day:
-        description: UTC day of week to run prek auto-update, 0=Sunday through 6=Saturday. Manual runs always update.
+        description: UTC day of week for scheduled updates, 0=Sunday through 6=Saturday. Manual runs always update.
         required: false
         type: string
         default: "1"
@@ -75,7 +75,7 @@ jobs:
             exit 1
           fi
 
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "$(date -u +%w)" == "${UPDATE_DAY}" ]]; then
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || ( "${{ github.event_name }}" == "schedule" && "$(date -u +%w)" == "${UPDATE_DAY}" ) ]]; then
             echo "should-update=true" >> "${GITHUB_OUTPUT}"
           else
             echo "should-update=false" >> "${GITHUB_OUTPUT}"
@@ -182,6 +182,7 @@ jobs:
       - name: Close stale prek update PRs
         env:
           BODY_MARKER: Automated update of `prek` hooks.
+          EVENT_NAME: ${{ github.event_name }}
           GITHUB_TOKEN: ${{ github.token }}
           KEEP_PR_NUMBER: ${{ needs.update-hooks.outputs.pull-request-number }}
           REPOSITORY: ${{ github.repository }}
@@ -211,6 +212,10 @@ jobs:
             args+=(--keep-pr-number "${KEEP_PR_NUMBER}")
           else
             args+=(--keep-latest-open-pr)
+          fi
+
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            args+=(--close-obsolete-prs)
           fi
 
           python tooling/src/prek_autoupdate/cleanup_prek_update_branches.py "${args[@]}"

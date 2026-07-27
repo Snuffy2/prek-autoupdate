@@ -62,6 +62,10 @@ class FakeCleanupClient:
             raise AssertionError(f"Unexpected close for PR {pull_number}")
         self.closed_prs.append(pull_number)
 
+    def get_pull(self, pull_number: int) -> dict[str, object]:
+        """Return fake pull request details."""
+        return next(pull for pull in self.open_pulls if pull["number"] == pull_number)
+
     def delete_ref(self, ref: str) -> None:
         """Record a deleted git ref."""
         self.deleted_refs.append(ref)
@@ -81,9 +85,10 @@ def _workflow_pull(
     repository: str = REPOSITORY,
     merged_at: str | None = None,
     head_sha: str | None = "sha",
+    changed_files: int | None = None,
 ) -> dict[str, object]:
     """Return a fake workflow pull request object."""
-    return {
+    pull: dict[str, object] = {
         "number": number,
         "merged_at": merged_at,
         "body": body,
@@ -95,6 +100,9 @@ def _workflow_pull(
         },
         "labels": [{"name": label}],
     }
+    if changed_files is not None:
+        pull["changed_files"] = changed_files
+    return pull
 
 
 def _cleanup(
@@ -104,6 +112,7 @@ def _cleanup(
     keep_latest_open_pr: bool = False,
     delete_stale_branches: bool = False,
     delete_merged_branches: bool = True,
+    close_obsolete_prs: bool = False,
 ) -> cleanup.CleanupResult:
     """Run cleanup with workflow defaults."""
     return cleanup.cleanup_update_branches(
@@ -117,9 +126,48 @@ def _cleanup(
         keep_pr_number=keep_pr_number,
         keep_latest_open_pr=keep_latest_open_pr,
         close_stale_prs=True,
+        close_obsolete_prs=close_obsolete_prs,
         delete_stale_branches=delete_stale_branches,
         delete_merged_branches=delete_merged_branches,
     )
+
+
+def test_cleanup_script_closes_kept_obsolete_pull_request() -> None:
+    """Push cleanup should close a kept workflow PR only when it has no changes."""
+    client = FakeCleanupClient(
+        open_pulls=[_workflow_pull(number=18, changed_files=0)],
+        closed_pulls=[],
+    )
+
+    result = _cleanup(
+        client,
+        keep_latest_open_pr=True,
+        close_obsolete_prs=True,
+    )
+
+    assert client.closed_prs == [18]
+    assert client.deleted_refs == [f"heads/{WORKFLOW_BRANCH}"]
+    assert result.closed_prs == [18]
+    assert result.deleted_branches == [WORKFLOW_BRANCH]
+
+
+def test_cleanup_script_preserves_kept_pull_request_with_changes() -> None:
+    """Push cleanup should leave a still-needed workflow PR untouched."""
+    client = FakeCleanupClient(
+        open_pulls=[_workflow_pull(number=18, changed_files=1)],
+        closed_pulls=[],
+        fail_on_close=True,
+    )
+
+    result = _cleanup(
+        client,
+        keep_latest_open_pr=True,
+        close_obsolete_prs=True,
+    )
+
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+    assert result.deleted_branches == []
 
 
 def test_cleanup_script_closes_stale_prs_and_deletes_workflow_branches() -> None:
@@ -320,7 +368,7 @@ def test_cleanup_script_preserves_human_prs_with_matching_label_and_prefix() -> 
         ],
     )
 
-    result = _cleanup(client)
+    result = _cleanup(client, close_obsolete_prs=True)
 
     assert client.closed_prs == []
     assert client.deleted_refs == []

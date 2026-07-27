@@ -6,6 +6,7 @@ Reusable GitHub Actions workflow for opening and maintaining `prek auto-update` 
 
 - Runs `prek auto-update --cooldown-days <days>`.
 - Opens or updates one PR on `chore/prek-updates`.
+- Checks the existing update PR after pushes to `main`, closing it when it is no longer needed.
 - Closes duplicate stale workflow-owned PRs.
 - Deletes stale and merged workflow-owned update branches.
 
@@ -34,7 +35,9 @@ jobs:
       update-day: "1"
 ```
 
-Run the caller workflow daily so stale PR and branch cleanup happens every night. `prek auto-update` only runs on `update-day`, or when the workflow is manually dispatched.
+Keep the `push` trigger so changes landing on `main` check whether an existing workflow-owned update PR still changes any files. This covers upstream syncs and similar workflows that may make the PR unnecessary. Push runs do not call `prek auto-update`, create a PR, or update a still-needed PR; cleanup only closes a PR with no changed files and safely deletes its branch.
+
+Run the caller workflow daily so stale PR and branch cleanup happens every night. Scheduled runs only call `prek auto-update` on `update-day`, and manual runs always check for updates.
 This normal path does not need `actions: write`.
 Major version tags such as `v1` are updated on release to point at the latest release in that major series.
 
@@ -43,7 +46,7 @@ Major version tags such as `v1` are updated on release to point at the latest re
 | Input | Default | Description |
 | --- | --- | --- |
 | `cooldown-days` | `"7"` | Value passed to `prek auto-update --cooldown-days`. |
-| `update-day` | `"1"` | UTC day of week to run `prek auto-update`, where `0` is Sunday and `6` is Saturday. Manual runs always check for updates. Schedule callers daily so cleanup can run every night. |
+| `update-day` | `"1"` | UTC day of week for scheduled `prek auto-update`, where `0` is Sunday and `6` is Saturday. Manual runs always check for updates. Schedule callers daily so cleanup can run every night. |
 | `update-branch` | `chore/prek-updates` | Branch used for update PRs. |
 | `branch-prefix` | `chore/prek-updates` | Prefix considered owned by cleanup. |
 | `label` | `dependencies` | PR label used for generated PRs and cleanup ownership checks. |
