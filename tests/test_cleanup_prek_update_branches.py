@@ -9,7 +9,7 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
-from prek_autoupdate import cleanup_prek_update_branches as cleanup
+import prek_autoupdate.cleanup_prek_update_branches as cleanup
 
 if TYPE_CHECKING:
     from urllib.request import Request
