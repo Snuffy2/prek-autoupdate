@@ -10,7 +10,12 @@ import {
   hardenedGitArguments,
   sanitizedChildEnvironment,
 } from "../environment.js";
-import type { CleanupApi, DeleteRefOutcome, Payload } from "./model.js";
+import type {
+  CleanupApi,
+  DeleteRefOutcome,
+  Payload,
+  VersionedPull,
+} from "./model.js";
 import { payload } from "./payload.js";
 
 const execFileAsync = promisify(execFile);
@@ -60,33 +65,61 @@ export class OctokitCleanupApi implements CleanupApi {
     return payload(response.data, "pull request object");
   }
 
-  public async reopenPull(number: number): Promise<void> {
-    await this.client.rest.pulls.update({
+  public async getVersionedPull(number: number): Promise<VersionedPull> {
+    const response = await this.client.rest.pulls.get({
+      owner: this.owner,
+      repo: this.repo,
+      pull_number: number,
+    });
+    const etag = response.headers.etag;
+    if (typeof etag !== "string") throw new TypeError("Expected pull ETag");
+    return { pull: payload(response.data, "pull request object"), etag };
+  }
+
+  public async reopenPull(number: number, etag: string): Promise<Payload> {
+    const response = await this.client.rest.pulls.update({
       owner: this.owner,
       repo: this.repo,
       pull_number: number,
       state: "open",
+      headers: { "if-match": etag },
     });
+    const reopened = payload(response.data, "reopened pull request object");
+    if (reopened.number !== number || reopened.state !== "open")
+      throw new TypeError("Reopen response did not match requested pull");
+    return reopened;
   }
 
   public async compareFiles(
     baseSha: string,
     headSha: string,
   ): Promise<Payload[]> {
-    const response = await this.client.rest.repos.compareCommitsWithBasehead({
-      owner: this.owner,
-      repo: this.repo,
-      basehead: `${baseSha}...${headSha}`,
-      per_page: 100,
-    });
-    const data = payload(response.data, "comparison object");
+    let data: Payload | undefined;
+    let finalCommit: Payload | undefined;
+    for await (const response of this.client.paginate.iterator(
+      this.client.rest.repos.compareCommitsWithBasehead,
+      {
+        owner: this.owner,
+        repo: this.repo,
+        basehead: `${baseSha}...${headSha}`,
+        per_page: 100,
+      },
+    )) {
+      const page = payload(response.data, "comparison object");
+      data ??= page;
+      if (!Array.isArray(page.commits) || page.commits.length === 0)
+        throw new TypeError(
+          "Comparison response did not match immutable revisions",
+        );
+      finalCommit = payload(page.commits.at(-1), "comparison head commit");
+    }
+    if (data === undefined) throw new TypeError("Expected comparison response");
     const base = payload(data.base_commit, "comparison base commit");
     const commits = data.commits;
     if (
       base.sha !== baseSha ||
       !Array.isArray(commits) ||
-      commits.length === 0 ||
-      payload(commits.at(-1), "comparison head commit").sha !== headSha
+      finalCommit?.sha !== headSha
     ) {
       throw new TypeError(
         "Comparison response did not match immutable revisions",
@@ -94,6 +127,15 @@ export class OctokitCleanupApi implements CleanupApi {
     }
     if (!Array.isArray(data.files))
       throw new TypeError("Expected comparison file list");
+    if (
+      typeof data.total_commits === "number" &&
+      data.files.length === 300 &&
+      typeof data.changed_files === "number" &&
+      data.changed_files > data.files.length
+    )
+      throw new TypeError(
+        "Comparison file list exceeded GitHub's 300-file limit",
+      );
     return data.files.map((file) => payload(file, "comparison file"));
   }
 
@@ -194,6 +236,15 @@ export class OctokitCleanupApi implements CleanupApi {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  }
+
+  public async restoreRef(ref: string, sha: string): Promise<void> {
+    await this.client.rest.git.createRef({
+      owner: this.owner,
+      repo: this.repo,
+      ref: `refs/${ref}`,
+      sha,
+    });
   }
 }
 

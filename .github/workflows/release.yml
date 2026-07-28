@@ -4,15 +4,17 @@ on:
   release:
     types: [published]
 
-permissions:
-  contents: write
-
 jobs:
   update-v2:
     name: Move v2 tag
     if:
       ${{ !github.event.release.draft && !github.event.release.prerelease &&
       startsWith(github.event.release.tag_name, 'v2.') }}
+    concurrency:
+      group: update-v2-major-tag
+      cancel-in-progress: false
+    permissions:
+      contents: write
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout release
@@ -24,8 +26,51 @@ jobs:
 
       - name: Move v2 to the released commit
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
+
+          releases='[]'
+          page=1
+          while true; do
+            response="$(
+              curl --fail-with-body --silent --show-error \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${REPOSITORY}/releases?per_page=100&page=${page}"
+            )"
+            releases="$(jq --compact-output \
+              --argjson page_releases "${response}" \
+              '. + $page_releases' <<<"${releases}")"
+            if [[ "$(jq 'length' <<<"${response}")" -lt 100 ]]; then
+              break
+            fi
+            page=$((page + 1))
+          done
+
+          newest_v2="$(
+            jq --raw-output '
+              map(select(
+                (.draft | not) and
+                (.prerelease | not) and
+                (.tag_name | test("^v2\\."))
+              ))
+              | if length == 0 then "" else max_by(.published_at).tag_name end
+            ' <<<"${releases}"
+          )"
+          if [[ "${RELEASE_TAG}" != "${newest_v2}" ]]; then
+            echo "::error::${RELEASE_TAG} is not the newest published stable v2 release (${newest_v2:-none})."
+            exit 1
+          fi
+
+          observed_v2="$(
+            git ls-remote --refs origin refs/tags/v2 |
+              awk 'NR == 1 { print $1 }'
+          )"
           git tag --force v2 "${RELEASE_TAG}^{commit}"
-          git push --force origin refs/tags/v2
+          git push \
+            --force-with-lease="refs/tags/v2:${observed_v2}" \
+            origin refs/tags/v2

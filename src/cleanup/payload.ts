@@ -66,7 +66,9 @@ export function sameRepoHeadRef(
   const repo = headPayload.repo;
   if (repo === null || typeof repo !== "object" || Array.isArray(repo))
     return undefined;
-  return (repo as Payload).full_name === repository &&
+  const fullName = (repo as Payload).full_name;
+  return typeof fullName === "string" &&
+    fullName.toLowerCase() === repository.toLowerCase() &&
     typeof headPayload.ref === "string"
     ? headPayload.ref
     : undefined;

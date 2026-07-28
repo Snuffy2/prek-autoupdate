@@ -86,8 +86,9 @@ runner tool cache.
 
 ## Output
 
-`pull-request-number` is the created or updated pull-request number. It is empty
-when the run does not leave an update pull request:
+`pull-request-number` is the number of the pull request created or updated by
+this run. It is empty on cleanup-only and no-update runs, even if an existing
+owned update pull request remains:
 
 ```yaml
 - name: Report update PR

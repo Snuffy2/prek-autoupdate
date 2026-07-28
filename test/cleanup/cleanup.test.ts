@@ -86,6 +86,8 @@ class FakeApi implements CleanupApi {
   public deleted: Array<[string, string]> = [];
   public deleteOutcome: DeleteRefOutcome = "deleted";
   public listOpenValues: Payload[][] = [];
+  public reopenError?: Error;
+  private versionedPull?: Payload;
 
   async listPulls(state: "closed" | "open"): Promise<Payload[]> {
     if (state === "open" && this.listOpenValues.length > 0)
@@ -105,8 +107,15 @@ class FakeApi implements CleanupApi {
       throw new Error(`No close for ${number}`);
     return values.length === 1 ? values[0]! : values.shift()!;
   }
-  async reopenPull(number: number): Promise<void> {
+  async getVersionedPull(number: number) {
+    const checked = await this.getPull(number);
+    this.versionedPull = checked;
+    return { pull: checked, etag: `"${number}"` };
+  }
+  async reopenPull(number: number): Promise<Payload> {
+    if (this.reopenError !== undefined) throw this.reopenError;
     this.reopenedNumbers.push(number);
+    return { ...this.versionedPull, number, state: "open" };
   }
   async compareFiles(): Promise<Payload[]> {
     return this.comparisons;
@@ -125,6 +134,9 @@ class FakeApi implements CleanupApi {
   async deleteRef(ref: string, expected: string): Promise<DeleteRefOutcome> {
     this.deleted.push([ref, expected]);
     return this.deleteOutcome;
+  }
+  async restoreRef(ref: string, sha: string): Promise<void> {
+    this.refs.set(ref, sha);
   }
 }
 
@@ -455,6 +467,32 @@ describe("cleanupUpdateBranches safety behavior", () => {
     expect(api.reopenedNumbers).toEqual([1]);
   });
 
+  it("retains snapshot and compensation errors when reopening fails", async () => {
+    const api = new FakeApi();
+    const compensation = new Error("reopen failed");
+    api.reopenError = compensation;
+    api.open = [pull({ changed_files: 0 })];
+    api.refs.set("heads/main", "base");
+    api.details.set(1, [
+      pull({ changed_files: 0 }),
+      pull({ changed_files: 0 }),
+      pull({ changed_files: 0 }),
+      closed({ changed_files: 0 }),
+      pull({ state: "closed", changed_files: -1 }),
+      closed({ changed_files: 0 }),
+    ]);
+    const failure = await cleanupWithApi(api, execution, {
+      ...defaults,
+      closeObsoletePullRequests: true,
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toHaveLength(2);
+    expect((failure as AggregateError).errors[0]).toMatchObject({
+      message: expect.stringContaining("valid changed file count"),
+    });
+    expect((failure as AggregateError).errors[1]).toBe(compensation);
+  });
+
   it.each<DeleteRefOutcome>(["already-absent", "lease-rejected"])(
     "does not claim a %s deletion outcome",
     async (outcome) => {
@@ -479,6 +517,19 @@ describe("cleanupUpdateBranches safety behavior", () => {
     const result = await cleanupWithApi(api, execution, defaults);
     expect(result.deletedBranches).toEqual([]);
     expect(api.deleted).toEqual([]);
+  });
+
+  it("restores the leased branch when an open pull appears after deletion", async () => {
+    const api = new FakeApi();
+    const candidate = closed();
+    api.closed = [candidate];
+    api.refs.set(`heads/${branch}`, "head");
+    api.details.set(1, [candidate]);
+    api.listOpenValues = [[], [], [pull({ number: 9 })]];
+    const result = await cleanupWithApi(api, execution, defaults);
+    expect(result.deletedBranches).toEqual([]);
+    expect(api.deleted).toEqual([[`heads/${branch}`, "head"]]);
+    expect(api.refs.get(`heads/${branch}`)).toBe("head");
   });
 
   it.each([

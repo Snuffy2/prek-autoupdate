@@ -41,12 +41,17 @@ export interface BranchDeletion {
 }
 
 export type DeleteRefOutcome = "already-absent" | "deleted" | "lease-rejected";
+export interface VersionedPull {
+  readonly pull: Payload;
+  readonly etag: string;
+}
 
 export interface CleanupApi {
   listPulls(state: "closed" | "open"): Promise<Payload[]>;
   getPull(number: number): Promise<Payload>;
   closePull(number: number): Promise<Payload>;
-  reopenPull(number: number): Promise<void>;
+  getVersionedPull(number: number): Promise<VersionedPull>;
+  reopenPull(number: number, etag: string): Promise<Payload>;
   compareFiles(baseSha: string, headSha: string): Promise<Payload[]>;
   getTreeEntries(
     paths: ReadonlySet<string>,
@@ -54,4 +59,5 @@ export interface CleanupApi {
   ): Promise<ReadonlyMap<string, string | undefined> | undefined>;
   getRefSha(ref: string): Promise<string | undefined>;
   deleteRef(ref: string, expectedSha: string): Promise<DeleteRefOutcome>;
+  restoreRef(ref: string, sha: string): Promise<void>;
 }

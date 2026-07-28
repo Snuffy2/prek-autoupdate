@@ -50,6 +50,8 @@ describe("action metadata", () => {
       using: "node24",
       main: "dist/index.js",
     });
-    expect(metadata.outputs["pull-request-number"]?.description).toBeTruthy();
+    expect(metadata.outputs["pull-request-number"]?.description).toBe(
+      "Number of the pull request created or updated by this run; empty on cleanup-only or no-update runs, even if an existing owned pull request remains.",
+    );
   });
 });

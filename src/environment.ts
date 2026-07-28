@@ -19,6 +19,8 @@ const BLOCKED_GIT_VARIABLES = new Set([
   "SSH_ASKPASS",
 ]);
 
+const TRUSTED_SYSTEM_PATH = "/usr/bin:/bin";
+
 /** Return a child environment without action inputs or caller-controlled Git behavior. */
 export function sanitizedChildEnvironment(
   additions: NodeJS.ProcessEnv = {},
@@ -37,6 +39,7 @@ export function sanitizedChildEnvironment(
     GIT_CONFIG_GLOBAL: "/dev/null",
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_TERMINAL_PROMPT: "0",
+    PATH: TRUSTED_SYSTEM_PATH,
   };
 }
 
@@ -56,6 +59,8 @@ export function hardenedGitArguments(
 function isBlocked(key: string): boolean {
   return (
     key.startsWith("INPUT_") ||
+    key.startsWith("LD_") ||
+    key.startsWith("DYLD_") ||
     key.startsWith("GIT_CONFIG_KEY_") ||
     key.startsWith("GIT_CONFIG_VALUE_") ||
     key.startsWith("GIT_TRACE") ||

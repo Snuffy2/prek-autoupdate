@@ -86,23 +86,35 @@ export async function runUpdate(
       execution.context.baseSha,
     ]);
     added = true;
-    await configureBot(worktree);
     const prek = await installPrek();
     const output = await runPrek(prek, worktree, execution.inputs.cooldownDays);
     await git(worktree, ["add", "--", ...addPaths]);
-    const changed =
-      (await gitExit(worktree, [
-        "diff",
-        "--cached",
-        "--quiet",
-        "--",
-        ...addPaths,
-      ])) === 1;
+    const diffStatus = await gitExit(worktree, [
+      "diff",
+      "--cached",
+      "--quiet",
+      "--",
+      ...addPaths,
+    ]);
+    if (diffStatus !== 0 && diffStatus !== 1) {
+      throw new Error(
+        `git diff --cached --quiet failed with status ${diffStatus}`,
+      );
+    }
+    const changed = diffStatus === 1;
     if (!changed) {
       return await closeUnneededPullRequest(execution, remote);
     }
 
-    await git(worktree, ["commit", "-m", execution.inputs.commitMessage]);
+    await git(worktree, [
+      "-c",
+      "user.name=github-actions[bot]",
+      "-c",
+      "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+      "commit",
+      "-m",
+      execution.inputs.commitMessage,
+    ]);
     const newSha = await git(worktree, ["rev-parse", "HEAD"]);
     const body = makeBody(output, execution.context.workspace);
     if (remote.ownedPullRequest !== undefined) {
@@ -158,30 +170,66 @@ export async function runUpdate(
     } catch (error) {
       await rollbackExistingPush(execution, remote, newSha, error);
     }
-    const response = await execution.client.rest.pulls.update({
-      owner: execution.context.owner,
-      repo: execution.context.repository,
-      pull_number: remote.ownedPullRequest.number,
-      title: execution.inputs.prTitle,
-      body,
-    });
-    const updated = pullFromData(response.data);
-    if (
-      !isOwned(execution, updated) ||
-      updated.state !== "open" ||
-      updated.number !== remote.ownedPullRequest.number ||
-      updated.headSha !== newSha ||
-      updated.title !== execution.inputs.prTitle ||
-      updated.body !== body
-    ) {
-      throw new Error(
+    let updateError: unknown;
+    try {
+      const response = await execution.client.rest.pulls.update({
+        owner: execution.context.owner,
+        repo: execution.context.repository,
+        pull_number: remote.ownedPullRequest.number,
+        title: execution.inputs.prTitle,
+        body,
+      });
+      const updated = pullFromData(response.data);
+      if (
+        isExactUpdatedPull(
+          execution,
+          updated,
+          remote.ownedPullRequest.number,
+          newSha,
+          body,
+        )
+      ) {
+        return {
+          operation: "updated",
+          pullRequestNumber: remote.ownedPullRequest.number,
+        };
+      }
+      updateError = new Error(
         "GitHub returned an unexpected pull request after update",
       );
+    } catch (error) {
+      updateError = error;
     }
-    return {
-      operation: "updated",
-      pullRequestNumber: remote.ownedPullRequest.number,
-    };
+    try {
+      const response = await execution.client.rest.pulls.get({
+        owner: execution.context.owner,
+        repo: execution.context.repository,
+        pull_number: remote.ownedPullRequest.number,
+      });
+      const verified = pullFromData(response.data);
+      if (
+        isExactUpdatedPull(
+          execution,
+          verified,
+          remote.ownedPullRequest.number,
+          newSha,
+          body,
+        )
+      ) {
+        return {
+          operation: "updated",
+          pullRequestNumber: remote.ownedPullRequest.number,
+        };
+      }
+      throw new Error("Fresh pull request verification was not exact");
+    } catch (verificationError) {
+      return await rollbackExistingPush(
+        execution,
+        remote,
+        newSha,
+        new AggregateError([updateError, verificationError]),
+      );
+    }
   } finally {
     if (added) {
       await git(execution.context.workspace, [
@@ -193,6 +241,23 @@ export async function runUpdate(
     }
     await rm(temporaryRoot, { force: true, recursive: true });
   }
+}
+
+function isExactUpdatedPull(
+  execution: ActionExecution,
+  pull: PullRequest,
+  pullNumber: number,
+  newSha: string,
+  body: string,
+): boolean {
+  return (
+    isOwned(execution, pull) &&
+    pull.state === "open" &&
+    pull.number === pullNumber &&
+    pull.headSha === newSha &&
+    pull.title === execution.inputs.prTitle &&
+    pull.body === body
+  );
 }
 
 async function recoverAmbiguousCreatedPull(
@@ -465,15 +530,6 @@ function isOwned(execution: ActionExecution, pull: PullRequest): boolean {
     pull.baseRef === execution.context.baseBranch &&
     pull.labels.includes(execution.inputs.label)
   );
-}
-
-async function configureBot(worktree: string): Promise<void> {
-  await git(worktree, ["config", "user.name", "github-actions[bot]"]);
-  await git(worktree, [
-    "config",
-    "user.email",
-    "41898282+github-actions[bot]@users.noreply.github.com",
-  ]);
 }
 
 async function runPrek(

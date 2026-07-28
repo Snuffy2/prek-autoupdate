@@ -241,8 +241,30 @@ async function deleteQueued(
       `heads/${branch}`,
       deletion.expectedSha,
     );
-    if (outcome === "deleted") result.deletedBranches.push(branch);
-    else if (outcome === "lease-rejected") protectedBranches.add(branch);
+    if (outcome === "deleted") {
+      try {
+        const appeared = (await api.listPulls("open")).some(
+          (pull) => sameRepoHeadRef(pull, policy.repository) === branch,
+        );
+        if (appeared) {
+          await api.restoreRef(`heads/${branch}`, deletion.expectedSha);
+          protectedBranches.add(branch);
+          continue;
+        }
+        result.deletedBranches.push(branch);
+      } catch (original: unknown) {
+        try {
+          await api.restoreRef(`heads/${branch}`, deletion.expectedSha);
+        } catch (compensation: unknown) {
+          throw new AggregateError(
+            [original, compensation],
+            "Post-delete validation and branch restoration both failed",
+            { cause: compensation },
+          );
+        }
+        throw original;
+      }
+    } else if (outcome === "lease-rejected") protectedBranches.add(branch);
   }
 }
 
@@ -300,14 +322,22 @@ async function closeObsolete(
       return true;
     }
   } catch (error: unknown) {
-    await reopenAndProtect(
-      api,
-      [identity],
-      snapshot.headRef,
-      protectedBranches,
-      result,
-      policy,
-    );
+    try {
+      await reopenAndProtect(
+        api,
+        [identity],
+        snapshot.headRef,
+        protectedBranches,
+        result,
+        policy,
+      );
+    } catch (compensation: unknown) {
+      throw new AggregateError(
+        [error, compensation],
+        "Snapshot validation and pull request compensation both failed",
+        { cause: compensation },
+      );
+    }
     throw error;
   }
   result.closedPullRequests.push(number);
@@ -329,13 +359,24 @@ async function reopenAndProtect(
     const index = result.closedPullRequests.indexOf(identity.number);
     if (index >= 0) result.closedPullRequests.splice(index, 1);
     let current: Payload;
+    let etag: string;
     try {
-      current = await api.getPull(identity.number);
+      ({ pull: current, etag } = await api.getVersionedPull(identity.number));
     } catch {
       continue;
     }
-    if (canCompensate(current, identity, policy))
-      await api.reopenPull(identity.number);
+    if (canCompensate(current, identity, policy)) {
+      const reopened = await api.reopenPull(identity.number, etag);
+      if (
+        reopened.state !== "open" ||
+        pullNumber(reopened) !== identity.number ||
+        !isWorkflowPull(reopened, policy) ||
+        pullHeadSha(reopened) !== pullHeadSha(current) ||
+        pullHeadRef(reopened) !== pullHeadRef(current) ||
+        pullBaseRef(reopened) !== pullBaseRef(current)
+      )
+        throw new TypeError("Reopen response did not match checked pull");
+    }
   }
   protectedBranches.add(branch);
 }

@@ -36010,6 +36010,7 @@ const BLOCKED_GIT_VARIABLES = new Set([
     "GIT_WORK_TREE",
     "SSH_ASKPASS",
 ]);
+const TRUSTED_SYSTEM_PATH = "/usr/bin:/bin";
 /** Return a child environment without action inputs or caller-controlled Git behavior. */
 function sanitizedChildEnvironment(additions = {}) {
     const environment = {};
@@ -36028,6 +36029,7 @@ function sanitizedChildEnvironment(additions = {}) {
         GIT_CONFIG_GLOBAL: "/dev/null",
         GIT_CONFIG_NOSYSTEM: "1",
         GIT_TERMINAL_PROMPT: "0",
+        PATH: TRUSTED_SYSTEM_PATH,
     };
 }
 /** Prefix Git arguments with settings that suppress hooks and credential helpers. */
@@ -36042,6 +36044,8 @@ function hardenedGitArguments(arguments_) {
 }
 function isBlocked(key) {
     return (key.startsWith("INPUT_") ||
+        key.startsWith("LD_") ||
+        key.startsWith("DYLD_") ||
         key.startsWith("GIT_CONFIG_KEY_") ||
         key.startsWith("GIT_CONFIG_VALUE_") ||
         key.startsWith("GIT_TRACE") ||
@@ -36093,7 +36097,9 @@ function sameRepoHeadRef(pull, repository) {
     const repo = headPayload.repo;
     if (repo === null || typeof repo !== "object" || Array.isArray(repo))
         return undefined;
-    return repo.full_name === repository &&
+    const fullName = repo.full_name;
+    return typeof fullName === "string" &&
+        fullName.toLowerCase() === repository.toLowerCase() &&
         typeof headPayload.ref === "string"
         ? headPayload.ref
         : undefined;
@@ -36216,32 +36222,61 @@ class OctokitCleanupApi {
         });
         return payload(response.data, "pull request object");
     }
-    async reopenPull(number) {
-        await this.client.rest.pulls.update({
+    async getVersionedPull(number) {
+        const response = await this.client.rest.pulls.get({
+            owner: this.owner,
+            repo: this.repo,
+            pull_number: number,
+        });
+        const etag = response.headers.etag;
+        if (typeof etag !== "string")
+            throw new TypeError("Expected pull ETag");
+        return { pull: payload(response.data, "pull request object"), etag };
+    }
+    async reopenPull(number, etag) {
+        const response = await this.client.rest.pulls.update({
             owner: this.owner,
             repo: this.repo,
             pull_number: number,
             state: "open",
+            headers: { "if-match": etag },
         });
+        const reopened = payload(response.data, "reopened pull request object");
+        if (reopened.number !== number || reopened.state !== "open")
+            throw new TypeError("Reopen response did not match requested pull");
+        return reopened;
     }
     async compareFiles(baseSha, headSha) {
-        const response = await this.client.rest.repos.compareCommitsWithBasehead({
+        let data;
+        let finalCommit;
+        for await (const response of this.client.paginate.iterator(this.client.rest.repos.compareCommitsWithBasehead, {
             owner: this.owner,
             repo: this.repo,
             basehead: `${baseSha}...${headSha}`,
             per_page: 100,
-        });
-        const data = payload(response.data, "comparison object");
+        })) {
+            const page = payload(response.data, "comparison object");
+            data ??= page;
+            if (!Array.isArray(page.commits) || page.commits.length === 0)
+                throw new TypeError("Comparison response did not match immutable revisions");
+            finalCommit = payload(page.commits.at(-1), "comparison head commit");
+        }
+        if (data === undefined)
+            throw new TypeError("Expected comparison response");
         const base = payload(data.base_commit, "comparison base commit");
         const commits = data.commits;
         if (base.sha !== baseSha ||
             !Array.isArray(commits) ||
-            commits.length === 0 ||
-            payload(commits.at(-1), "comparison head commit").sha !== headSha) {
+            finalCommit?.sha !== headSha) {
             throw new TypeError("Comparison response did not match immutable revisions");
         }
         if (!Array.isArray(data.files))
             throw new TypeError("Expected comparison file list");
+        if (typeof data.total_commits === "number" &&
+            data.files.length === 300 &&
+            typeof data.changed_files === "number" &&
+            data.changed_files > data.files.length)
+            throw new TypeError("Comparison file list exceeded GitHub's 300-file limit");
         return data.files.map((file) => payload(file, "comparison file"));
     }
     async getTreeEntries(paths, ref) {
@@ -36327,6 +36362,14 @@ class OctokitCleanupApi {
         finally {
             await rm$1(directory, { recursive: true, force: true });
         }
+    }
+    async restoreRef(ref, sha) {
+        await this.client.rest.git.createRef({
+            owner: this.owner,
+            repo: this.repo,
+            ref: `refs/${ref}`,
+            sha,
+        });
     }
 }
 function isStatus(error, status) {
@@ -36459,8 +36502,26 @@ async function deleteQueued(api, queued, protectedBranches, result, policy) {
             continue;
         }
         const outcome = await api.deleteRef(`heads/${branch}`, deletion.expectedSha);
-        if (outcome === "deleted")
-            result.deletedBranches.push(branch);
+        if (outcome === "deleted") {
+            try {
+                const appeared = (await api.listPulls("open")).some((pull) => sameRepoHeadRef(pull, policy.repository) === branch);
+                if (appeared) {
+                    await api.restoreRef(`heads/${branch}`, deletion.expectedSha);
+                    protectedBranches.add(branch);
+                    continue;
+                }
+                result.deletedBranches.push(branch);
+            }
+            catch (original) {
+                try {
+                    await api.restoreRef(`heads/${branch}`, deletion.expectedSha);
+                }
+                catch (compensation) {
+                    throw new AggregateError([original, compensation], "Post-delete validation and branch restoration both failed", { cause: compensation });
+                }
+                throw original;
+            }
+        }
         else if (outcome === "lease-rejected")
             protectedBranches.add(branch);
     }
@@ -36494,7 +36555,12 @@ async function closeObsolete(api, pull, policy, enabled, result, protectedBranch
         }
     }
     catch (error) {
-        await reopenAndProtect(api, [identity], snapshot.headRef, protectedBranches, result, policy);
+        try {
+            await reopenAndProtect(api, [identity], snapshot.headRef, protectedBranches, result, policy);
+        }
+        catch (compensation) {
+            throw new AggregateError([error, compensation], "Snapshot validation and pull request compensation both failed", { cause: compensation });
+        }
         throw error;
     }
     result.closedPullRequests.push(number);
@@ -36507,14 +36573,23 @@ async function reopenAndProtect(api, pulls, branch, protectedBranches, result, p
         if (index >= 0)
             result.closedPullRequests.splice(index, 1);
         let current;
+        let etag;
         try {
-            current = await api.getPull(identity.number);
+            ({ pull: current, etag } = await api.getVersionedPull(identity.number));
         }
         catch {
             continue;
         }
-        if (canCompensate(current, identity, policy))
-            await api.reopenPull(identity.number);
+        if (canCompensate(current, identity, policy)) {
+            const reopened = await api.reopenPull(identity.number, etag);
+            if (reopened.state !== "open" ||
+                pullNumber(reopened) !== identity.number ||
+                !isWorkflowPull(reopened, policy) ||
+                pullHeadSha(reopened) !== pullHeadSha(current) ||
+                pullHeadRef(reopened) !== pullHeadRef(current) ||
+                pullBaseRef(reopened) !== pullBaseRef(current))
+                throw new TypeError("Reopen response did not match checked pull");
+        }
     }
     protectedBranches.add(branch);
 }
@@ -42071,21 +42146,32 @@ async function runUpdate(execution) {
             execution.context.baseSha,
         ]);
         added = true;
-        await configureBot(worktree);
         const prek = await installPrek();
         const output = await runPrek(prek, worktree, execution.inputs.cooldownDays);
         await git(worktree, ["add", "--", ...addPaths]);
-        const changed = (await gitExit(worktree, [
+        const diffStatus = await gitExit(worktree, [
             "diff",
             "--cached",
             "--quiet",
             "--",
             ...addPaths,
-        ])) === 1;
+        ]);
+        if (diffStatus !== 0 && diffStatus !== 1) {
+            throw new Error(`git diff --cached --quiet failed with status ${diffStatus}`);
+        }
+        const changed = diffStatus === 1;
         if (!changed) {
             return await closeUnneededPullRequest(execution, remote);
         }
-        await git(worktree, ["commit", "-m", execution.inputs.commitMessage]);
+        await git(worktree, [
+            "-c",
+            "user.name=github-actions[bot]",
+            "-c",
+            "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+            "commit",
+            "-m",
+            execution.inputs.commitMessage,
+        ]);
         const newSha = await git(worktree, ["rev-parse", "HEAD"]);
         const body = makeBody(output, execution.context.workspace);
         if (remote.ownedPullRequest !== undefined) {
@@ -42137,26 +42223,45 @@ async function runUpdate(execution) {
         catch (error) {
             await rollbackExistingPush(execution, remote, newSha, error);
         }
-        const response = await execution.client.rest.pulls.update({
-            owner: execution.context.owner,
-            repo: execution.context.repository,
-            pull_number: remote.ownedPullRequest.number,
-            title: execution.inputs.prTitle,
-            body,
-        });
-        const updated = pullFromData(response.data);
-        if (!isOwned(execution, updated) ||
-            updated.state !== "open" ||
-            updated.number !== remote.ownedPullRequest.number ||
-            updated.headSha !== newSha ||
-            updated.title !== execution.inputs.prTitle ||
-            updated.body !== body) {
-            throw new Error("GitHub returned an unexpected pull request after update");
+        let updateError;
+        try {
+            const response = await execution.client.rest.pulls.update({
+                owner: execution.context.owner,
+                repo: execution.context.repository,
+                pull_number: remote.ownedPullRequest.number,
+                title: execution.inputs.prTitle,
+                body,
+            });
+            const updated = pullFromData(response.data);
+            if (isExactUpdatedPull(execution, updated, remote.ownedPullRequest.number, newSha, body)) {
+                return {
+                    operation: "updated",
+                    pullRequestNumber: remote.ownedPullRequest.number,
+                };
+            }
+            updateError = new Error("GitHub returned an unexpected pull request after update");
         }
-        return {
-            operation: "updated",
-            pullRequestNumber: remote.ownedPullRequest.number,
-        };
+        catch (error) {
+            updateError = error;
+        }
+        try {
+            const response = await execution.client.rest.pulls.get({
+                owner: execution.context.owner,
+                repo: execution.context.repository,
+                pull_number: remote.ownedPullRequest.number,
+            });
+            const verified = pullFromData(response.data);
+            if (isExactUpdatedPull(execution, verified, remote.ownedPullRequest.number, newSha, body)) {
+                return {
+                    operation: "updated",
+                    pullRequestNumber: remote.ownedPullRequest.number,
+                };
+            }
+            throw new Error("Fresh pull request verification was not exact");
+        }
+        catch (verificationError) {
+            return await rollbackExistingPush(execution, remote, newSha, new AggregateError([updateError, verificationError]));
+        }
     }
     finally {
         if (added) {
@@ -42169,6 +42274,14 @@ async function runUpdate(execution) {
         }
         await rm$1(temporaryRoot, { force: true, recursive: true });
     }
+}
+function isExactUpdatedPull(execution, pull, pullNumber, newSha, body) {
+    return (isOwned(execution, pull) &&
+        pull.state === "open" &&
+        pull.number === pullNumber &&
+        pull.headSha === newSha &&
+        pull.title === execution.inputs.prTitle &&
+        pull.body === body);
 }
 async function recoverAmbiguousCreatedPull(execution, newSha, body) {
     const pulls = await execution.client.paginate(execution.client.rest.pulls.list, {
@@ -42358,14 +42471,6 @@ function isOwned(execution, pull) {
             execution.context.repositoryFullName.toLowerCase() &&
         pull.baseRef === execution.context.baseBranch &&
         pull.labels.includes(execution.inputs.label));
-}
-async function configureBot(worktree) {
-    await git(worktree, ["config", "user.name", "github-actions[bot]"]);
-    await git(worktree, [
-        "config",
-        "user.email",
-        "41898282+github-actions[bot]@users.noreply.github.com",
-    ]);
 }
 async function runPrek(binary, worktree, cooldownDays) {
     try {

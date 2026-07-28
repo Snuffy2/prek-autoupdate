@@ -6,8 +6,22 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type * as EnvironmentModule from "../../src/environment.js";
+
 const installPrek = vi.hoisted(() => vi.fn<() => Promise<string>>());
 vi.mock("../../src/prek/index.js", () => ({ installPrek }));
+vi.mock("../../src/environment.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof EnvironmentModule>();
+  return {
+    ...actual,
+    sanitizedChildEnvironment: (
+      additions: NodeJS.ProcessEnv = {},
+    ): NodeJS.ProcessEnv => ({
+      ...actual.sanitizedChildEnvironment(additions),
+      PATH: process.env.PATH,
+    }),
+  };
+});
 
 import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
 import { BODY_MARKER, runUpdate } from "../../src/update/index.js";
@@ -21,6 +35,7 @@ afterEach(async () => {
   delete process.env.TEST_GIT_LOG;
   delete process.env.TEST_GIT_REMOTE;
   delete process.env.TEST_GIT_FAIL_PUSH;
+  delete process.env.TEST_GIT_FAIL_DIFF;
   installPrek.mockReset();
   await Promise.all(
     cleanups
@@ -193,6 +208,80 @@ describe("update publication races", () => {
     );
     expect(await pushes(harness.log)).toHaveLength(2);
     expect(harness.update).not.toHaveBeenCalled();
+  });
+
+  it("rolls an existing branch back when pull metadata update fails", async () => {
+    const harness = await makeHarness({ existing: true });
+    harness.update.mockRejectedValueOnce(new Error("timeout"));
+    let calls = 0;
+    harness.get.mockImplementation(async () => {
+      calls += 1;
+      const sha = await remoteSha(harness.remote);
+      return {
+        data: mergePull(harness.pull, {
+          head: { ...harness.pull.head, sha },
+          ...(calls >= 3 ? { title: "stale" } : {}),
+        }),
+        headers: { etag: '"after"' },
+      };
+    });
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /lease-rolled back/u,
+    );
+    expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
+  });
+
+  it("accepts an unexpected update response only after an exact fresh GET", async () => {
+    const harness = await makeHarness({ existing: true });
+    harness.update.mockResolvedValueOnce({
+      data: mergePull(harness.pull, { body: "unexpected response" }),
+      headers: { etag: '"unexpected"' },
+    });
+
+    await expect(runUpdate(harness.execution)).resolves.toEqual({
+      operation: "updated",
+      pullRequestNumber: 42,
+    });
+    expect(harness.get).toHaveBeenCalledTimes(3);
+    expect(await pushes(harness.log)).toHaveLength(1);
+  });
+
+  it("does not close or delete an existing pull when cached diff errors", async () => {
+    const harness = await makeHarness({ existing: true, noChange: true });
+    process.env.TEST_GIT_FAIL_DIFF = "1";
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /diff --cached --quiet failed/u,
+    );
+    expect(harness.update).not.toHaveBeenCalled();
+    expect(await pushes(harness.log)).toEqual([]);
+  });
+
+  it("does not persist the bot commit identity in repository config", async () => {
+    const harness = await makeHarness({ existing: true });
+    await runUpdate(harness.execution);
+
+    expect(
+      (
+        await exec("git", [
+          "-C",
+          harness.execution.context.workspace,
+          "config",
+          "user.name",
+        ])
+      ).stdout.trim(),
+    ).toBe("Test");
+    expect(
+      (
+        await exec("git", [
+          "-C",
+          harness.execution.context.workspace,
+          "config",
+          "user.email",
+        ])
+      ).stdout.trim(),
+    ).toBe("test@example.com");
   });
 
   it.each([
@@ -469,6 +558,9 @@ for arg in "$@"; do
   args="$args '$arg'"
 done
 case " $* " in
+  *" diff --cached --quiet "*)
+    [ "$TEST_GIT_FAIL_DIFF" = "1" ] && exit 2
+    ;;
   *" push "*)
     printf '%s\\n' "$*" >> "$TEST_GIT_LOG"
     count=$(wc -l < "$TEST_GIT_LOG" | tr -d ' ')

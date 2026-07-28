@@ -48,7 +48,9 @@ inputs:
 outputs:
   pull-request-number:
     description:
-      Number of the created or updated pull request, or empty when none remains.
+      Number of the pull request created or updated by this run; empty on
+      cleanup-only or no-update runs, even if an existing owned pull request
+      remains.
 
 runs:
   using: node24
