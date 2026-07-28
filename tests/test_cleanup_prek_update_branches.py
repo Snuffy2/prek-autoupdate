@@ -55,6 +55,9 @@ class FakeCleanupClient:
         self.tree_entries = {} if tree_entries is None else tree_entries
         self.pull_details = {} if pull_details is None else pull_details
         self.get_pull_calls: dict[int, int] = {}
+        self.pull_states: dict[int, str] = {
+            cleanup._pull_number(pull): "open" for pull in open_pulls
+        }
         self.closed_prs: list[int] = []
         self.reopened_prs: list[int] = []
         self.deleted_refs: list[str] = []
@@ -72,18 +75,22 @@ class FakeCleanupClient:
         if self.fail_on_close:
             raise AssertionError(f"Unexpected close for PR {pull_number}")
         self.closed_prs.append(pull_number)
+        self.pull_states[pull_number] = "closed"
 
     def reopen_pull(self, pull_number: int) -> None:
         """Record a reopened pull request."""
         self.reopened_prs.append(pull_number)
+        self.pull_states[pull_number] = "open"
 
     def get_pull(self, pull_number: int) -> dict[str, object]:
         """Return fake pull request details."""
         if responses := self.pull_details.get(pull_number):
             call = self.get_pull_calls.get(pull_number, 0)
             self.get_pull_calls[pull_number] = call + 1
-            return responses[min(call, len(responses) - 1)]
-        return next(pull for pull in self.open_pulls if pull["number"] == pull_number)
+            pull = responses[min(call, len(responses) - 1)]
+        else:
+            pull = next(pull for pull in self.open_pulls if pull["number"] == pull_number)
+        return {**pull, "state": self.pull_states[pull_number]}
 
     def list_pull_files(self, pull_number: int) -> list[dict[str, object]]:
         """Return fake changed files for a pull request."""
@@ -265,6 +272,69 @@ def test_cleanup_script_reopens_obsolete_pull_when_base_moves_before_close() -> 
     )
 
     assert client.closed_prs == [18]
+    assert client.reopened_prs == [18]
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+    assert result.deleted_branches == []
+
+
+def test_cleanup_script_reopens_pull_when_post_close_state_is_open() -> None:
+    """Cleanup should not record a close unless GitHub reports the PR closed."""
+    pull = _workflow_pull(number=18, changed_files=0)
+
+    class StillOpenAfterCloseClient(FakeCleanupClient):
+        """Fake client that reports the pull open after the close mutation."""
+
+        def close_pull(self, pull_number: int) -> None:
+            """Record the close but keep the refreshed pull state open."""
+            super().close_pull(pull_number)
+            self.pull_states[pull_number] = "open"
+
+    client = StillOpenAfterCloseClient(open_pulls=[pull], closed_pulls=[])
+
+    result = _cleanup(
+        client,
+        keep_latest_open_pr=True,
+        close_obsolete_prs=True,
+    )
+
+    assert client.closed_prs == [18]
+    assert client.reopened_prs == [18]
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+    assert result.deleted_branches == []
+
+
+def test_cleanup_script_protects_compensated_branch_from_closed_listing() -> None:
+    """A reopened pull branch should survive an eventually consistent closed listing."""
+    pull = _workflow_pull(number=18, changed_files=1)
+
+    class MovingBaseOnCloseClient(FakeCleanupClient):
+        """Fake client whose base ref moves as the pull is closed."""
+
+        def close_pull(self, pull_number: int) -> None:
+            """Record the close and move the base before post-close validation."""
+            super().close_pull(pull_number)
+            self.ref_shas["heads/main"] = "new-base-sha"
+
+    client = MovingBaseOnCloseClient(
+        open_pulls=[pull],
+        closed_pulls=[pull],
+        pull_files={18: [{"filename": "prek.toml"}]},
+        ref_shas={"heads/main": "base-sha"},
+        tree_entries={
+            "sha": {"prek.toml": ("100644", "blob", "shared-blob")},
+            "base-sha": {"prek.toml": ("100644", "blob", "shared-blob")},
+        },
+    )
+
+    result = _cleanup(
+        client,
+        keep_latest_open_pr=True,
+        close_obsolete_prs=True,
+        delete_stale_branches=True,
+    )
+
     assert client.reopened_prs == [18]
     assert client.deleted_refs == []
     assert result.closed_prs == []
@@ -801,6 +871,7 @@ def test_pull_file_paths_reject_invalid_names(
     "details",
     [
         _workflow_pull(number=18, head_sha=None, changed_files=1),
+        {**_workflow_pull(number=18, changed_files=1), "head": None},
         {**_workflow_pull(number=18, changed_files=1), "base": {}},
         {**_workflow_pull(number=18, changed_files=1), "base": None},
     ],

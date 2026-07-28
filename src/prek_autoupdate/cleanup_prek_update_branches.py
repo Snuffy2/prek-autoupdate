@@ -354,6 +354,7 @@ def cleanup_update_branches(
             enabled=close_obsolete_prs,
             result=result,
             branches_to_delete=branches_to_delete,
+            protected_branches=protected_branches,
         ):
             continue
 
@@ -409,6 +410,7 @@ def _close_obsolete_pull(
     enabled: bool,
     result: CleanupResult,
     branches_to_delete: set[str],
+    protected_branches: set[str],
 ) -> bool:
     """Close an obsolete workflow pull request and queue its branch deletion."""
     snapshot = _obsolete_pull_snapshot(client, pull) if enabled else None
@@ -417,8 +419,9 @@ def _close_obsolete_pull(
 
     pull_number = _pull_number(pull)
     client.close_pull(pull_number)
-    if not _pull_matches_snapshot(client, pull_number, snapshot):
+    if not _pull_matches_snapshot(client, pull_number, snapshot, required_state="closed"):
         client.reopen_pull(pull_number)
+        protected_branches.add(_head_ref(pull))
         return True
 
     result.closed_prs.append(pull_number)
@@ -474,11 +477,14 @@ def _pull_matches_snapshot(
     client: CleanupClient,
     pull_number: int,
     snapshot: PullComparisonSnapshot,
+    *,
+    required_state: str | None = None,
 ) -> bool:
     """Return whether pull and base revisions still match a comparison snapshot."""
     refreshed = client.get_pull(pull_number)
     return (
-        _pull_head_sha(refreshed) == snapshot.head_sha
+        (required_state is None or refreshed.get("state") == required_state)
+        and _pull_head_sha(refreshed) == snapshot.head_sha
         and _pull_base_ref(refreshed) == snapshot.base_ref
         and _pull_changed_files(refreshed) == snapshot.changed_files
         and client.get_ref_sha(ref=f"heads/{snapshot.base_ref}") == snapshot.base_sha
