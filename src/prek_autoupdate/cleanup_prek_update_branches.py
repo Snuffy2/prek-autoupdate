@@ -52,11 +52,23 @@ class PullComparisonSnapshot:
 
 
 @dataclass(frozen=True)
+class CompensatablePull:
+    """Exact closed pull revision that cleanup may safely reopen."""
+
+    number: int
+    head_sha: str
+    head_ref: str
+    base_ref: str
+    changed_files: int
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class BranchDeletion:
     """A branch deletion bound to an expected revision."""
 
     expected_sha: str
-    reopen_prs: frozenset[int] = frozenset()
+    compensatable_pulls: frozenset[CompensatablePull] = frozenset()
 
 
 class DeleteRefOutcome(Enum):
@@ -84,8 +96,8 @@ class CleanupClient(Protocol):
     ) -> dict[str, tuple[str, str, str] | None] | None:
         """Return Git tree entry identities for paths at a git ref."""
 
-    def close_pull(self, pull_number: int) -> None:
-        """Close a pull request by number."""
+    def close_pull(self, pull_number: int) -> dict[str, object]:
+        """Close a pull request and return the resulting payload."""
 
     def reopen_pull(self, pull_number: int) -> None:
         """Reopen a pull request by number."""
@@ -133,7 +145,7 @@ class GithubClient:
             url = _next_link(link_header)
         return pulls
 
-    def close_pull(self, pull_number: int) -> None:
+    def close_pull(self, pull_number: int) -> dict[str, object]:
         """Close a pull request.
 
         Args:
@@ -141,7 +153,10 @@ class GithubClient:
 
         """
         url = f"{GITHUB_API_URL}/repos/{self.repository}/pulls/{pull_number}"
-        self._request("PATCH", url, payload={"state": "closed"})
+        payload, _ = self._request("PATCH", url, payload={"state": "closed"})
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected a pull request object from {url}")
+        return payload
 
     def reopen_pull(self, pull_number: int) -> None:
         """Reopen a pull request.
@@ -495,13 +510,13 @@ def _queue_branch_deletion(
     if existing is None:
         branches_to_delete[branch_name] = deletion
         return
-    affected_prs = existing.reopen_prs | deletion.reopen_prs
+    affected_pulls = existing.compensatable_pulls | deletion.compensatable_pulls
     if existing.expected_sha == deletion.expected_sha:
-        branches_to_delete[branch_name] = BranchDeletion(existing.expected_sha, affected_prs)
+        branches_to_delete[branch_name] = BranchDeletion(existing.expected_sha, affected_pulls)
         return
     _reopen_and_protect(
         client=client,
-        pull_numbers=affected_prs,
+        pulls=affected_pulls,
         branch_name=branch_name,
         protected_branches=protected_branches,
         result=result,
@@ -512,16 +527,32 @@ def _queue_branch_deletion(
 def _reopen_and_protect(
     *,
     client: CleanupClient,
-    pull_numbers: frozenset[int],
+    pulls: frozenset[CompensatablePull],
     branch_name: str,
     protected_branches: set[str],
     result: CleanupResult,
 ) -> None:
-    """Reopen compensatable pulls and protect their shared head branch."""
-    for pull_number in sorted(pull_numbers):
-        client.reopen_pull(pull_number)
-        if pull_number in result.closed_prs:
-            result.closed_prs.remove(pull_number)
+    """Reopen only pulls still matching cleanup's exact close identity."""
+    for identity in sorted(pulls, key=lambda pull: pull.number):
+        if identity.number in result.closed_prs:
+            result.closed_prs.remove(identity.number)
+        try:
+            current = client.get_pull(identity.number)
+        except (HTTPError, URLError, TimeoutError, TypeError) as err:
+            LOGGER.warning(
+                "Could not validate compensated PR #%s after a concurrent transition: %s",
+                identity.number,
+                err,
+            )
+            continue
+        if not _pull_matches_close_identity(current, identity):
+            LOGGER.warning(
+                "PR #%s changed after cleanup closed it; preserving branch %s without reopening.",
+                identity.number,
+                branch_name,
+            )
+            continue
+        client.reopen_pull(identity.number)
     protected_branches.add(branch_name)
 
 
@@ -542,7 +573,7 @@ def _delete_queued_branches(
         except HTTPError, URLError, TimeoutError, TypeError:
             _reopen_and_protect(
                 client=client,
-                pull_numbers=deletion.reopen_prs,
+                pulls=deletion.compensatable_pulls,
                 branch_name=branch_name,
                 protected_branches=protected_branches,
                 result=result,
@@ -551,7 +582,7 @@ def _delete_queued_branches(
         if current_sha != deletion.expected_sha:
             _reopen_and_protect(
                 client=client,
-                pull_numbers=deletion.reopen_prs,
+                pulls=deletion.compensatable_pulls,
                 branch_name=branch_name,
                 protected_branches=protected_branches,
                 result=result,
@@ -562,7 +593,7 @@ def _delete_queued_branches(
         except HTTPError, URLError, TimeoutError, TypeError, subprocess.SubprocessError:
             _reopen_and_protect(
                 client=client,
-                pull_numbers=deletion.reopen_prs,
+                pulls=deletion.compensatable_pulls,
                 branch_name=branch_name,
                 protected_branches=protected_branches,
                 result=result,
@@ -573,7 +604,7 @@ def _delete_queued_branches(
         elif outcome is DeleteRefOutcome.LEASE_REJECTED:
             _reopen_and_protect(
                 client=client,
-                pull_numbers=deletion.reopen_prs,
+                pulls=deletion.compensatable_pulls,
                 branch_name=branch_name,
                 protected_branches=protected_branches,
                 result=result,
@@ -597,11 +628,18 @@ def _close_obsolete_pull(
 
     pull_number = _pull_number(pull)
     try:
-        client.close_pull(pull_number)
-    except HTTPError, URLError, TimeoutError:
-        client.reopen_pull(pull_number)
+        closed_pull = client.close_pull(pull_number)
+        close_identity = _close_identity(closed_pull)
+    except HTTPError, URLError, TimeoutError, TypeError:
         protected_branches.add(snapshot.head_ref)
         raise
+    if close_identity is None:
+        protected_branches.add(snapshot.head_ref)
+        LOGGER.warning(
+            "PR #%s close response lacked a safe mutation identity; preserving its branch.",
+            pull_number,
+        )
+        return True
     try:
         snapshot_matches = _pull_matches_snapshot(
             client, pull_number, snapshot, required_state="closed"
@@ -611,12 +649,22 @@ def _close_obsolete_pull(
             and client.get_ref_sha(ref=f"heads/{snapshot.head_ref}") == snapshot.head_sha
         )
     except HTTPError, URLError, TimeoutError, TypeError:
-        client.reopen_pull(pull_number)
-        protected_branches.add(snapshot.head_ref)
+        _reopen_and_protect(
+            client=client,
+            pulls=frozenset({close_identity}),
+            branch_name=snapshot.head_ref,
+            protected_branches=protected_branches,
+            result=result,
+        )
         raise
     if not snapshot_matches or not branch_matches:
-        client.reopen_pull(pull_number)
-        protected_branches.add(snapshot.head_ref)
+        _reopen_and_protect(
+            client=client,
+            pulls=frozenset({close_identity}),
+            branch_name=snapshot.head_ref,
+            protected_branches=protected_branches,
+            result=result,
+        )
         return True
 
     result.closed_prs.append(pull_number)
@@ -626,7 +674,7 @@ def _close_obsolete_pull(
         protected_branches=protected_branches,
         result=result,
         branch_name=snapshot.head_ref,
-        deletion=BranchDeletion(snapshot.head_sha, frozenset({pull_number})),
+        deletion=BranchDeletion(snapshot.head_sha, frozenset({close_identity})),
     )
     return True
 
@@ -634,6 +682,34 @@ def _close_obsolete_pull(
 def _pull_is_obsolete(client: CleanupClient, pull: Mapping[str, object]) -> bool:
     """Return whether a pull request has no changes unique to its current base."""
     return _obsolete_pull_snapshot(client, pull) is not None
+
+
+def _close_identity(pull: Mapping[str, object]) -> CompensatablePull | None:
+    """Return a safe compensation identity from a close mutation response."""
+    number = pull.get("number")
+    changed_files = pull.get("changed_files")
+    updated_at = pull.get("updated_at")
+    head_sha = _pull_head_sha(pull)
+    head_ref = _pull_head_ref(pull)
+    base_ref = _pull_base_ref(pull)
+    if (
+        type(number) is not int
+        or pull.get("state") != "closed"
+        or pull.get("merged_at") is not None
+        or type(changed_files) is not int
+        or changed_files < 0
+        or not isinstance(updated_at, str)
+        or head_sha is None
+        or head_ref is None
+        or base_ref is None
+    ):
+        return None
+    return CompensatablePull(number, head_sha, head_ref, base_ref, changed_files, updated_at)
+
+
+def _pull_matches_close_identity(pull: Mapping[str, object], identity: CompensatablePull) -> bool:
+    """Return whether a pull remains the exact unmerged close mutation."""
+    return _close_identity(pull) == identity
 
 
 def _obsolete_pull_snapshot(
@@ -1004,7 +1080,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             delete_stale_branches=args.delete_stale_branches,
             delete_merged_branches=args.delete_merged_branches,
         )
-    except (HTTPError, URLError, TimeoutError) as err:
+    except (HTTPError, URLError, TimeoutError, subprocess.SubprocessError) as err:
         LOGGER.error(
             "Failed to clean prek update branches for %s branch %s: %s",
             args.repository,

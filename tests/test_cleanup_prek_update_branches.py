@@ -59,6 +59,7 @@ class FakeCleanupClient:
         self.pull_states: dict[int, str] = {
             cleanup._pull_number(pull): "open" for pull in open_pulls
         }
+        self.close_responses: dict[int, dict[str, object]] = {}
         self.closed_prs: list[int] = []
         self.reopened_prs: list[int] = []
         self.deleted_refs: list[str] = []
@@ -71,12 +72,20 @@ class FakeCleanupClient:
             return self.closed_pulls
         raise ValueError(f"Unsupported pull request state: {state}")
 
-    def close_pull(self, pull_number: int) -> None:
-        """Record or reject a closed pull request."""
+    def close_pull(self, pull_number: int) -> dict[str, object]:
+        """Record a close and return its mutation identity payload."""
         if self.fail_on_close:
             raise AssertionError(f"Unexpected close for PR {pull_number}")
+        pull = self.get_pull(pull_number)
         self.closed_prs.append(pull_number)
         self.pull_states[pull_number] = "closed"
+        response = {
+            **pull,
+            "state": "closed",
+            "updated_at": "2026-07-27T12:00:00Z",
+        }
+        self.close_responses[pull_number] = response
+        return response
 
     def reopen_pull(self, pull_number: int) -> None:
         """Record a reopened pull request."""
@@ -91,7 +100,14 @@ class FakeCleanupClient:
             pull = responses[min(call, len(responses) - 1)]
         else:
             pull = next(pull for pull in self.open_pulls if pull["number"] == pull_number)
-        return {**pull, "state": self.pull_states[pull_number]}
+        refreshed = {**pull, "state": self.pull_states[pull_number]}
+        if (
+            refreshed["state"] == "closed"
+            and "updated_at" not in refreshed
+            and pull_number in self.close_responses
+        ):
+            refreshed["updated_at"] = self.close_responses[pull_number]["updated_at"]
+        return refreshed
 
     def list_pull_files(self, pull_number: int) -> list[dict[str, object]]:
         """Return fake changed files for a pull request."""
@@ -258,10 +274,11 @@ def test_cleanup_script_reopens_obsolete_pull_when_base_moves_before_close() -> 
     class MovingBaseOnCloseClient(FakeCleanupClient):
         """Fake client whose base ref moves as the pull is closed."""
 
-        def close_pull(self, pull_number: int) -> None:
+        def close_pull(self, pull_number: int) -> dict[str, object]:
             """Record the close and move the base before post-close validation."""
-            super().close_pull(pull_number)
+            response = super().close_pull(pull_number)
             self.ref_shas["heads/main"] = "new-base-sha"
+            return response
 
     client = MovingBaseOnCloseClient(
         open_pulls=[pull],
@@ -287,17 +304,18 @@ def test_cleanup_script_reopens_obsolete_pull_when_base_moves_before_close() -> 
     assert result.deleted_branches == []
 
 
-def test_cleanup_script_reopens_pull_when_post_close_state_is_open() -> None:
-    """Cleanup should not record a close unless GitHub reports the PR closed."""
+def test_cleanup_script_preserves_pull_when_post_close_state_is_open() -> None:
+    """Cleanup should not reopen a pull whose close identity no longer matches."""
     pull = _workflow_pull(number=18, changed_files=0)
 
     class StillOpenAfterCloseClient(FakeCleanupClient):
         """Fake client that reports the pull open after the close mutation."""
 
-        def close_pull(self, pull_number: int) -> None:
+        def close_pull(self, pull_number: int) -> dict[str, object]:
             """Record the close but keep the refreshed pull state open."""
-            super().close_pull(pull_number)
+            response = super().close_pull(pull_number)
             self.pull_states[pull_number] = "open"
+            return response
 
     client = StillOpenAfterCloseClient(open_pulls=[pull], closed_pulls=[])
 
@@ -308,7 +326,30 @@ def test_cleanup_script_reopens_pull_when_post_close_state_is_open() -> None:
     )
 
     assert client.closed_prs == [18]
-    assert client.reopened_prs == [18]
+    assert client.reopened_prs == []
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+    assert result.deleted_branches == []
+
+
+def test_cleanup_script_preserves_when_close_identity_is_incomplete() -> None:
+    """Cleanup should not reopen or delete without close mutation evidence."""
+    pull = _workflow_pull(number=18, changed_files=0)
+
+    class IncompleteCloseResponseClient(FakeCleanupClient):
+        """Fake client whose close response lacks mutation evidence."""
+
+        def close_pull(self, pull_number: int) -> dict[str, object]:
+            """Remove updated_at from the otherwise successful close response."""
+            response = super().close_pull(pull_number)
+            response.pop("updated_at")
+            return response
+
+    client = IncompleteCloseResponseClient(open_pulls=[pull], closed_pulls=[])
+
+    result = _cleanup(client, close_obsolete_prs=True)
+
+    assert client.reopened_prs == []
     assert client.deleted_refs == []
     assert result.closed_prs == []
     assert result.deleted_branches == []
@@ -321,10 +362,11 @@ def test_cleanup_script_protects_compensated_branch_from_closed_listing() -> Non
     class MovingBaseOnCloseClient(FakeCleanupClient):
         """Fake client whose base ref moves as the pull is closed."""
 
-        def close_pull(self, pull_number: int) -> None:
+        def close_pull(self, pull_number: int) -> dict[str, object]:
             """Record the close and move the base before post-close validation."""
-            super().close_pull(pull_number)
+            response = super().close_pull(pull_number)
             self.ref_shas["heads/main"] = "new-base-sha"
+            return response
 
     client = MovingBaseOnCloseClient(
         open_pulls=[pull],
@@ -415,6 +457,62 @@ def test_cleanup_script_reopens_when_head_moves_before_final_delete() -> None:
     assert result.deleted_branches == []
 
 
+@pytest.mark.parametrize(
+    ("updated_at", "merged_at"),
+    [
+        ("2026-07-27T12:01:00Z", None),
+        ("2026-07-27T12:01:00Z", "2026-07-27T12:00:30Z"),
+    ],
+)
+def test_cleanup_script_does_not_reopen_concurrently_changed_pull(
+    updated_at: str,
+    merged_at: str | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Concurrent close updates and merges should block compensation reopening."""
+    pull = _workflow_pull(number=18, changed_files=0)
+
+    class ConcurrentTransitionClient(FakeCleanupClient):
+        """Fake client whose PR changes before final compensation."""
+
+        head_ref_calls = 0
+        concurrently_changed = False
+
+        def get_ref_sha(self, *, ref: str) -> str | None:
+            """Move the head before final deletion and expose the concurrent PR."""
+            if ref == f"heads/{WORKFLOW_BRANCH}":
+                self.head_ref_calls += 1
+                if self.head_ref_calls > 1:
+                    self.concurrently_changed = True
+                    return "new-sha"
+            return super().get_ref_sha(ref=ref)
+
+        def get_pull(self, pull_number: int) -> dict[str, object]:
+            """Return a concurrent closed update or merge during compensation."""
+            if self.concurrently_changed:
+                return {
+                    **_workflow_pull(
+                        number=pull_number,
+                        changed_files=0,
+                        merged_at=merged_at,
+                    ),
+                    "state": "closed",
+                    "updated_at": updated_at,
+                }
+            return super().get_pull(pull_number)
+
+    client = ConcurrentTransitionClient(open_pulls=[pull], closed_pulls=[])
+
+    with caplog.at_level("WARNING"):
+        result = _cleanup(client, close_obsolete_prs=True)
+
+    assert client.reopened_prs == []
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+    assert result.deleted_branches == []
+    assert "changed after cleanup closed it" in caplog.text
+
+
 def test_cleanup_script_reopens_all_shared_head_pulls_on_final_mismatch() -> None:
     """Same-revision shared-head candidates should aggregate compensation PRs."""
     pulls = [
@@ -474,8 +572,8 @@ def test_cleanup_script_compensates_conflicting_shared_head_candidates() -> None
     assert result.deleted_branches == []
 
 
-def test_cleanup_script_compensates_post_close_validation_error() -> None:
-    """A post-close payload failure should reopen before propagating."""
+def test_cleanup_script_preserves_on_post_close_validation_error() -> None:
+    """An unprovable post-close state should preserve without blind reopen."""
     pull = _workflow_pull(number=18, changed_files=0)
 
     class InvalidPostClosePullClient(FakeCleanupClient):
@@ -483,10 +581,11 @@ def test_cleanup_script_compensates_post_close_validation_error() -> None:
 
         closed = False
 
-        def close_pull(self, pull_number: int) -> None:
+        def close_pull(self, pull_number: int) -> dict[str, object]:
             """Record that subsequent pull validation should fail."""
-            super().close_pull(pull_number)
+            response = super().close_pull(pull_number)
             self.closed = True
+            return response
 
         def get_pull(self, pull_number: int) -> dict[str, object]:
             """Raise for the first pull read after closing."""
@@ -499,18 +598,18 @@ def test_cleanup_script_compensates_post_close_validation_error() -> None:
     with pytest.raises(TypeError, match="Malformed pull response"):
         _cleanup(client, close_obsolete_prs=True)
 
-    assert client.reopened_prs == [18]
+    assert client.reopened_prs == []
     assert client.deleted_refs == []
 
 
-def test_cleanup_script_compensates_ambiguous_close_timeout() -> None:
-    """A close timeout should attempt reopen before propagating."""
+def test_cleanup_script_preserves_on_ambiguous_close_timeout() -> None:
+    """A close without mutation identity should not be blindly reopened."""
     pull = _workflow_pull(number=18, changed_files=0)
 
     class TimedOutCloseClient(FakeCleanupClient):
         """Fake client whose close times out after recording the mutation."""
 
-        def close_pull(self, pull_number: int) -> None:
+        def close_pull(self, pull_number: int) -> dict[str, object]:
             """Record the possibly completed close and time out."""
             super().close_pull(pull_number)
             raise TimeoutError("close timed out")
@@ -520,12 +619,12 @@ def test_cleanup_script_compensates_ambiguous_close_timeout() -> None:
     with pytest.raises(TimeoutError, match="close timed out"):
         _cleanup(client, close_obsolete_prs=True)
 
-    assert client.reopened_prs == [18]
+    assert client.reopened_prs == []
     assert client.deleted_refs == []
 
 
-def test_cleanup_script_compensates_post_close_validation_timeout() -> None:
-    """A post-close timeout should reopen before propagating."""
+def test_cleanup_script_preserves_on_post_close_validation_timeout() -> None:
+    """A post-close timeout should preserve without blind reopen."""
     pull = _workflow_pull(number=18, changed_files=0)
 
     class TimedOutPostCloseClient(FakeCleanupClient):
@@ -533,10 +632,11 @@ def test_cleanup_script_compensates_post_close_validation_timeout() -> None:
 
         closed = False
 
-        def close_pull(self, pull_number: int) -> None:
+        def close_pull(self, pull_number: int) -> dict[str, object]:
             """Record the close before enabling the timeout."""
-            super().close_pull(pull_number)
+            response = super().close_pull(pull_number)
             self.closed = True
+            return response
 
         def get_pull(self, pull_number: int) -> dict[str, object]:
             """Time out after the close mutation."""
@@ -549,7 +649,7 @@ def test_cleanup_script_compensates_post_close_validation_timeout() -> None:
     with pytest.raises(TimeoutError, match="validation timed out"):
         _cleanup(client, close_obsolete_prs=True)
 
-    assert client.reopened_prs == [18]
+    assert client.reopened_prs == []
     assert client.deleted_refs == []
 
 
@@ -655,12 +755,11 @@ def test_cleanup_script_propagates_reopen_failure_after_revision_moves() -> None
     class FailedReopenClient(FakeCleanupClient):
         """Fake client whose head moves on close and cannot be reopened."""
 
-        def close_pull(self, pull_number: int) -> None:
-            """Record the close and expose a moved head to revalidation."""
-            super().close_pull(pull_number)
-            self.pull_details[pull_number] = [
-                _workflow_pull(number=pull_number, head_sha="new-sha", changed_files=1)
-            ]
+        def close_pull(self, pull_number: int) -> dict[str, object]:
+            """Record the close and move the base to require compensation."""
+            response = super().close_pull(pull_number)
+            self.ref_shas["heads/main"] = "new-base-sha"
+            return response
 
         def reopen_pull(self, pull_number: int) -> None:
             """Raise the compensation failure."""
@@ -669,7 +768,6 @@ def test_cleanup_script_propagates_reopen_failure_after_revision_moves() -> None
     client = FailedReopenClient(
         open_pulls=[pull],
         closed_pulls=[],
-        pull_details={18: [pull, pull]},
     )
 
     with pytest.raises(RuntimeError, match="Could not reopen PR 18"):
@@ -1018,7 +1116,7 @@ def test_github_client_closes_reopens_and_gets_pull(
     client = cleanup.GithubClient(repository=REPOSITORY, token="token")
     monkeypatch.setattr(client, "_request", fake_request)
 
-    client.close_pull(18)
+    assert client.close_pull(18) == pull
     client.reopen_pull(18)
     assert client.get_pull(18) == pull
     assert calls == [
@@ -1034,6 +1132,17 @@ def test_github_client_closes_reopens_and_gets_pull(
         ),
         ("GET", "https://api.github.com/repos/o/r/pulls/18", None),
     ]
+
+
+def test_github_client_rejects_invalid_close_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Close should reject a response that cannot provide pull metadata."""
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    monkeypatch.setattr(client, "_request", lambda *_args, **_kwargs: ([], None))
+
+    with pytest.raises(TypeError, match="Expected a pull request object"):
+        client.close_pull(18)
 
 
 def test_github_client_lists_pulls_across_pages(
@@ -1059,6 +1168,17 @@ def test_github_client_lists_pulls_across_pages(
         "https://api.github.com/repos/o/r/pulls?state=open&per_page=100",
         next_url,
     ]
+
+
+def test_github_client_rejects_invalid_pull_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub client should reject a non-list pull response."""
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    monkeypatch.setattr(client, "_request", lambda *_args: ({}, None))
+
+    with pytest.raises(TypeError, match="Expected pull request list"):
+        client.list_pulls(state="open")
 
 
 def test_github_client_lists_pull_files_across_pages(
@@ -1435,6 +1555,48 @@ def test_main_returns_failure_for_github_request_errors(
     )
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        subprocess.TimeoutExpired(["git", "push"], 30),
+        subprocess.CalledProcessError(1, ["git", "push"]),
+    ],
+)
+def test_main_returns_failure_for_subprocess_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: subprocess.SubprocessError,
+) -> None:
+    """CLI should convert git timeout and command failures into exit code 1."""
+
+    def fail_cleanup(**_kwargs: object) -> object:
+        """Raise a subprocess operational error."""
+        raise error
+
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+    monkeypatch.setattr(cleanup, "cleanup_update_branches", fail_cleanup)
+
+    with caplog.at_level("ERROR"):
+        exit_code = cleanup.main(
+            [
+                "--repository",
+                REPOSITORY,
+                "--branch",
+                WORKFLOW_BRANCH,
+                "--branch-prefix",
+                WORKFLOW_BRANCH,
+                "--label-name",
+                WORKFLOW_LABEL,
+            ]
+        )
+
+    assert exit_code == 1
+    assert (
+        f"Failed to clean prek update branches for {REPOSITORY} branch {WORKFLOW_BRANCH}"
+        in caplog.text
+    )
+
+
 def test_github_client_deletes_ref_with_atomic_push_lease(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1500,10 +1662,19 @@ def test_github_client_reports_rejected_delete_lease(
     )
 
 
-def test_github_client_reports_absent_ref_after_push_timeout(
+@pytest.mark.parametrize(
+    ("current_sha", "outcome"),
+    [
+        (None, cleanup.DeleteRefOutcome.ALREADY_ABSENT),
+        ("moved-sha", cleanup.DeleteRefOutcome.LEASE_REJECTED),
+    ],
+)
+def test_github_client_resolves_ref_state_after_push_timeout(
     monkeypatch: pytest.MonkeyPatch,
+    current_sha: str | None,
+    outcome: cleanup.DeleteRefOutcome,
 ) -> None:
-    """A timeout followed by a missing ref should be idempotent success."""
+    """A timed-out deletion should report the ref's refreshed state."""
 
     def time_out(*_args: object, **_kwargs: object) -> None:
         """Raise a bounded git push timeout."""
@@ -1511,12 +1682,9 @@ def test_github_client_reports_absent_ref_after_push_timeout(
 
     monkeypatch.setattr("prek_autoupdate.cleanup_prek_update_branches.subprocess.run", time_out)
     client = cleanup.GithubClient(repository=REPOSITORY, token="token")
-    monkeypatch.setattr(client, "get_ref_sha", lambda **_kwargs: None)
+    monkeypatch.setattr(client, "get_ref_sha", lambda **_kwargs: current_sha)
 
-    assert (
-        client.delete_ref("heads/feature", expected_sha="expected-sha")
-        is cleanup.DeleteRefOutcome.ALREADY_ABSENT
-    )
+    assert client.delete_ref("heads/feature", expected_sha="expected-sha") is outcome
 
 
 def test_github_client_propagates_push_timeout_when_ref_is_unchanged(
