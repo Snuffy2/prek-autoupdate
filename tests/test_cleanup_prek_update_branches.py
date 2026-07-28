@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import hmac
-import shutil
 import subprocess
 from typing import TYPE_CHECKING
 from urllib.error import URLError
@@ -87,6 +86,7 @@ class FakeCleanupClient:
             "state": "closed",
             "changed_files": pull.get("changed_files", 0),
             "updated_at": "2026-07-27T12:00:00Z",
+            "closed_at": "2026-07-27T12:00:00Z",
         }
         self.close_responses[pull_number] = response
         return response
@@ -114,6 +114,7 @@ class FakeCleanupClient:
                 "changed_files", self.close_responses[pull_number]["changed_files"]
             )
             refreshed.setdefault("updated_at", self.close_responses[pull_number]["updated_at"])
+            refreshed.setdefault("closed_at", self.close_responses[pull_number]["closed_at"])
         return refreshed
 
     def compare_files(self, *, base_sha: str, head_sha: str) -> list[dict[str, object]]:
@@ -889,6 +890,7 @@ def test_reopen_and_protect_removes_compensated_pull_from_result() -> None:
         **_workflow_pull(number=18, changed_files=0),
         "state": "closed",
         "updated_at": "2026-07-27T12:00:00Z",
+        "closed_at": "2026-07-27T12:00:00Z",
     }
     identity = cleanup._close_identity(pull)
     assert identity is not None
@@ -922,6 +924,7 @@ def test_reopen_and_protect_allows_new_revision_on_same_owned_pull() -> None:
     closed = {
         **_workflow_pull(number=18, head_sha="old-sha", changed_files=1),
         "state": "closed",
+        "closed_at": "2026-07-27T12:00:00Z",
     }
     identity = cleanup._close_identity(closed)
     assert identity is not None
@@ -933,6 +936,7 @@ def test_reopen_and_protect_allows_new_revision_on_same_owned_pull() -> None:
             updated_at="2026-07-27T12:05:00Z",
         ),
         "state": "closed",
+        "closed_at": "2026-07-27T12:00:00Z",
     }
     client = FakeCleanupClient(
         open_pulls=[],
@@ -963,6 +967,7 @@ def test_reopen_and_protect_rejects_same_head_reclose() -> None:
     original = {
         **_workflow_pull(number=18, head_sha="same-sha", changed_files=1),
         "state": "closed",
+        "closed_at": "2026-07-27T12:00:00Z",
     }
     identity = cleanup._close_identity(original)
     assert identity is not None
@@ -974,8 +979,49 @@ def test_reopen_and_protect_rejects_same_head_reclose() -> None:
             updated_at="2026-07-27T12:05:00Z",
         ),
         "state": "closed",
+        "closed_at": "2026-07-27T12:05:00Z",
     }
     client = FakeCleanupClient(open_pulls=[], closed_pulls=[reclosed])
+
+    cleanup._reopen_and_protect(
+        client=client,
+        pulls=frozenset({identity}),
+        branch_name=WORKFLOW_BRANCH,
+        protected_branches=set(),
+        result=cleanup.CleanupResult(),
+        policy=cleanup.OwnershipPolicy(
+            REPOSITORY,
+            WORKFLOW_BRANCH,
+            WORKFLOW_BRANCH,
+            WORKFLOW_LABEL,
+            WORKFLOW_AUTHOR,
+            WORKFLOW_BODY_MARKER,
+        ),
+    )
+
+    assert client.reopened_prs == []
+
+
+def test_reopen_and_protect_rejects_moved_head_after_independent_reclose() -> None:
+    """Compensation should reject a moved head from a different close event."""
+    original = {
+        **_workflow_pull(number=18, head_sha="old-sha", changed_files=1),
+        "state": "closed",
+        "closed_at": "2026-07-27T12:00:00Z",
+    }
+    identity = cleanup._close_identity(original)
+    assert identity is not None
+    independently_reclosed = {
+        **_workflow_pull(
+            number=18,
+            head_sha="new-sha",
+            changed_files=2,
+            updated_at="2026-07-27T12:05:00Z",
+        ),
+        "state": "closed",
+        "closed_at": "2026-07-27T12:05:00Z",
+    }
+    client = FakeCleanupClient(open_pulls=[], closed_pulls=[independently_reclosed])
 
     cleanup._reopen_and_protect(
         client=client,
@@ -1032,6 +1078,7 @@ def test_reopen_and_protect_rejects_unsafe_current_pull(
     original = {
         **_workflow_pull(number=18, changed_files=1),
         "state": "closed",
+        "closed_at": "2026-07-27T12:00:00Z",
     }
     identity = cleanup._close_identity(original)
     assert identity is not None
@@ -2030,6 +2077,31 @@ def test_workflow_pull_preserves_explicit_missing_head_sha() -> None:
     }
 
 
+def test_main_requires_github_token(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CLI entry point should fail clearly when authentication is unavailable."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    with caplog.at_level("ERROR"):
+        exit_code = cleanup.main(
+            [
+                "--repository",
+                REPOSITORY,
+                "--branch",
+                WORKFLOW_BRANCH,
+                "--branch-prefix",
+                WORKFLOW_BRANCH,
+                "--label-name",
+                WORKFLOW_LABEL,
+            ]
+        )
+
+    assert exit_code == 1
+    assert "GITHUB_TOKEN is required for cleanup." in caplog.text
+
+
 def test_main_logs_successful_cleanup(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -2147,24 +2219,14 @@ def test_github_client_deletes_ref_with_atomic_push_lease(
 ) -> None:
     """Lease deletion should target the consumer repo without relying on a checkout."""
     calls: list[tuple[list[str], dict[str, str]]] = []
-    tooling_root = tmp_path / "tooling"
-    git_executable = shutil.which("git")
-    assert git_executable is not None, "git is required for the isolated repository test"
-    subprocess.run(  # noqa: S603 - initializes the isolated test repository
-        [git_executable, "init", str(tooling_root)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    monkeypatch.setattr(cleanup, "TOOLING_ROOT", tooling_root)
+    unavailable_tooling_root = tmp_path / "installed-package-without-checkout"
+    monkeypatch.setattr(cleanup, "TOOLING_ROOT", unavailable_tooling_root, raising=False)
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        """Record the lease-guarded git invocation."""
+        """Record repository initialization and the lease-guarded git invocation."""
         environment = kwargs["env"]
         assert isinstance(environment, dict)
         assert kwargs["timeout"] == cleanup.GIT_PUSH_TIMEOUT_SECONDS
-        assert command[1:3] == ["-C", str(tooling_root)]
-        assert (tooling_root / ".git").is_dir()
         calls.append((command, environment))
         return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -2191,11 +2253,17 @@ def test_github_client_deletes_ref_with_atomic_push_lease(
         is cleanup.DeleteRefOutcome.DELETED
     )
 
-    command, environment = calls[0]
+    init_command, init_environment = calls[0]
+    assert init_command[:3] == ["git", "init", "--quiet"]
+    temporary_repository = init_command[3]
+    assert temporary_repository != str(unavailable_tooling_root)
+    assert init_environment["GIT_TERMINAL_PROMPT"] == "0"
+
+    command, environment = calls[1]
     assert command == [
         "git",
         "-C",
-        str(tooling_root),
+        temporary_repository,
         "push",
         "https://github.com/o/r.git",
         "--force-with-lease=refs/heads/feature#1:expected-sha",
@@ -2297,8 +2365,10 @@ def test_github_client_resolves_ref_state_after_push_timeout(
 ) -> None:
     """A timed-out deletion should report the ref's refreshed state."""
 
-    def time_out(*_args: object, **_kwargs: object) -> None:
+    def time_out(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         """Raise a bounded git push timeout."""
+        if command[1] == "init":
+            return subprocess.CompletedProcess(command, 0, "", "")
         raise subprocess.TimeoutExpired(["git", "push"], 30)
 
     monkeypatch.setattr("prek_autoupdate.cleanup_prek_update_branches.subprocess.run", time_out)
@@ -2313,8 +2383,10 @@ def test_github_client_propagates_push_timeout_when_ref_is_unchanged(
 ) -> None:
     """An uncertain timeout should propagate while the expected ref remains."""
 
-    def time_out(*_args: object, **_kwargs: object) -> None:
+    def time_out(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         """Raise a bounded git push timeout."""
+        if command[1] == "init":
+            return subprocess.CompletedProcess(command, 0, "", "")
         raise subprocess.TimeoutExpired(["git", "push"], 30)
 
     monkeypatch.setattr("prek_autoupdate.cleanup_prek_update_branches.subprocess.run", time_out)

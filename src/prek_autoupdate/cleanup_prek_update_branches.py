@@ -9,9 +9,9 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -24,7 +24,6 @@ GITHUB_API_URL = "https://api.github.com"
 HTTP_NO_CONTENT = 204
 HTTP_NOT_FOUND = 404
 GIT_PUSH_TIMEOUT_SECONDS = 30
-TOOLING_ROOT = Path(__file__).resolve().parents[2]
 LOGGER = logging.getLogger(__name__)
 
 
@@ -63,6 +62,7 @@ class CompensatablePull:
     base_ref: str
     changed_files: int
     updated_at: str
+    closed_at: str
 
 
 @dataclass(frozen=True)
@@ -324,31 +324,40 @@ class GithubClient:
             }
         )
         remote_url = f"https://github.com/{self.repository}.git"
-        command = [
-            "git",
-            "-C",
-            str(TOOLING_ROOT),
-            "push",
-            remote_url,
-            f"--force-with-lease={full_ref}:{expected_sha}",
-            f":{full_ref}",
-        ]
-        try:
-            completed = subprocess.run(  # noqa: S603 - fixed git with validated repo/ref
-                command,
-                check=False,
+        with tempfile.TemporaryDirectory(prefix="prek-autoupdate-git-") as repository:
+            subprocess.run(  # noqa: S603 - fixed git initializes an isolated repository
+                ["git", "init", "--quiet", repository],  # noqa: S607
+                check=True,
                 capture_output=True,
                 env=environment,
                 text=True,
                 timeout=GIT_PUSH_TIMEOUT_SECONDS,
             )
-        except subprocess.TimeoutExpired:
-            current_sha = self.get_ref_sha(ref=ref)
-            if current_sha is None:
-                return DeleteRefOutcome.ALREADY_ABSENT
-            if current_sha != expected_sha:
-                return DeleteRefOutcome.LEASE_REJECTED
-            raise
+            command = [
+                "git",
+                "-C",
+                repository,
+                "push",
+                remote_url,
+                f"--force-with-lease={full_ref}:{expected_sha}",
+                f":{full_ref}",
+            ]
+            try:
+                completed = subprocess.run(  # noqa: S603 - fixed git with validated repo/ref
+                    command,
+                    check=False,
+                    capture_output=True,
+                    env=environment,
+                    text=True,
+                    timeout=GIT_PUSH_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                current_sha = self.get_ref_sha(ref=ref)
+                if current_sha is None:
+                    return DeleteRefOutcome.ALREADY_ABSENT
+                if current_sha != expected_sha:
+                    return DeleteRefOutcome.LEASE_REJECTED
+                raise
         if completed.returncode == 0:
             return DeleteRefOutcome.DELETED
         current_sha = self.get_ref_sha(ref=ref)
@@ -748,6 +757,7 @@ def _close_identity(pull: Mapping[str, object]) -> CompensatablePull | None:
     number = pull.get("number")
     changed_files = pull.get("changed_files")
     updated_at = pull.get("updated_at")
+    closed_at = pull.get("closed_at")
     head_sha = _pull_head_sha(pull)
     head_ref = _pull_head_ref(pull)
     base_ref = _pull_base_ref(pull)
@@ -758,12 +768,21 @@ def _close_identity(pull: Mapping[str, object]) -> CompensatablePull | None:
         or type(changed_files) is not int
         or changed_files < 0
         or not isinstance(updated_at, str)
+        or not isinstance(closed_at, str)
         or head_sha is None
         or head_ref is None
         or base_ref is None
     ):
         return None
-    return CompensatablePull(number, head_sha, head_ref, base_ref, changed_files, updated_at)
+    return CompensatablePull(
+        number,
+        head_sha,
+        head_ref,
+        base_ref,
+        changed_files,
+        updated_at,
+        closed_at,
+    )
 
 
 def _pull_can_be_compensated(
@@ -784,6 +803,7 @@ def _pull_can_be_compensated(
                 and current.head_ref == identity.head_ref
                 and current.base_ref == identity.base_ref
                 and current.head_sha != identity.head_sha
+                and current.closed_at == identity.closed_at
             )
         )
     )
