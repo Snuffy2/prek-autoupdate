@@ -697,6 +697,13 @@ def test_conflicting_branch_deletion_evidence_protects_branch() -> None:
     assert protected_branches == {WORKFLOW_BRANCH}
 
 
+def test_closed_deletion_identity_rejects_incomplete_metadata() -> None:
+    """Closed-list deletion evidence should require a timestamp."""
+    pull = {**_workflow_pull(number=18), "updated_at": None}
+
+    assert cleanup._closed_deletion_identity(pull) is None
+
+
 def test_cleanup_script_preserves_on_post_close_validation_error() -> None:
     """An unprovable post-close state should preserve without blind reopen."""
     pull = _workflow_pull(number=18, changed_files=0)
@@ -1647,7 +1654,7 @@ def test_pull_is_not_obsolete_without_comparison_refs(
     """Obsolete detection should preserve PRs without usable comparison refs."""
     client = FakeCleanupClient(open_pulls=[details], closed_pulls=[])
 
-    assert not cleanup._pull_is_obsolete(client, details)
+    assert cleanup._obsolete_pull_snapshot(client, details) is None
 
 
 @pytest.mark.parametrize(
@@ -1683,7 +1690,7 @@ def test_pull_is_not_obsolete_when_changed_file_list_is_empty() -> None:
         ref_shas={"heads/main": "base-sha"},
     )
 
-    assert not cleanup._pull_is_obsolete(client, pull)
+    assert cleanup._obsolete_pull_snapshot(client, pull) is None
 
 
 def test_pull_is_not_obsolete_when_file_listing_is_incomplete() -> None:
@@ -1696,7 +1703,7 @@ def test_pull_is_not_obsolete_when_file_listing_is_incomplete() -> None:
         ref_shas={"heads/main": "base-sha"},
     )
 
-    assert not cleanup._pull_is_obsolete(client, pull)
+    assert cleanup._obsolete_pull_snapshot(client, pull) is None
 
 
 def test_obsolete_comparison_ignores_mutable_pull_file_aba_state() -> None:
@@ -1727,7 +1734,7 @@ def test_obsolete_comparison_ignores_mutable_pull_file_aba_state() -> None:
         },
     )
 
-    assert cleanup._pull_is_obsolete(client, pull)
+    assert cleanup._obsolete_pull_snapshot(client, pull) is not None
     assert client.comparisons == (("base-sha", "sha"),)
 
 
@@ -1747,7 +1754,7 @@ def test_pull_is_not_obsolete_when_head_changes_during_comparison() -> None:
         pull_details={18: [pull, moved]},
     )
 
-    assert not cleanup._pull_is_obsolete(client, pull)
+    assert cleanup._obsolete_pull_snapshot(client, pull) is None
 
 
 @pytest.mark.parametrize(
@@ -1774,7 +1781,7 @@ def test_pull_is_not_obsolete_when_tree_entry_identity_differs(
         },
     )
 
-    assert not cleanup._pull_is_obsolete(client, pull)
+    assert cleanup._obsolete_pull_snapshot(client, pull) is None
 
 
 def test_pull_is_not_obsolete_when_tree_is_truncated() -> None:
@@ -1788,7 +1795,7 @@ def test_pull_is_not_obsolete_when_tree_is_truncated() -> None:
         tree_entries={"sha": None},
     )
 
-    assert not cleanup._pull_is_obsolete(client, pull)
+    assert cleanup._obsolete_pull_snapshot(client, pull) is None
 
 
 def test_pull_is_not_obsolete_when_base_moves_during_comparison() -> None:
@@ -1815,7 +1822,7 @@ def test_pull_is_not_obsolete_when_base_moves_during_comparison() -> None:
         },
     )
 
-    assert not cleanup._pull_is_obsolete(client, pull)
+    assert cleanup._obsolete_pull_snapshot(client, pull) is None
 
 
 def test_workflow_pull_preserves_explicit_missing_head_sha() -> None:

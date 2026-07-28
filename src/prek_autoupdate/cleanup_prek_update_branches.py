@@ -724,11 +724,6 @@ def _close_obsolete_pull(
     return True
 
 
-def _pull_is_obsolete(client: CleanupClient, pull: Mapping[str, object]) -> bool:
-    """Return whether a pull request has no changes unique to its current base."""
-    return _obsolete_pull_snapshot(client, pull) is not None
-
-
 def _close_identity(pull: Mapping[str, object]) -> CompensatablePull | None:
     """Return a safe compensation identity from a close mutation response."""
     number = pull.get("number")
