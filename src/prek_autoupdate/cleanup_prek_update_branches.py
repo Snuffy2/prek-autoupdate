@@ -176,6 +176,9 @@ class GithubClient:
         Args:
             pull_number: Pull request number to close.
 
+        Returns:
+            Pull request payload returned by the close mutation.
+
         """
         url = f"{GITHUB_API_URL}/repos/{self.repository}/pulls/{pull_number}"
         payload, _ = self._request("PATCH", url, payload={"state": "closed"})
@@ -301,6 +304,16 @@ class GithubClient:
         full_ref = f"refs/{ref}"
         basic_credential = base64.b64encode(f"x-access-token:{self.token}".encode()).decode()
         environment = os.environ.copy()
+        for key in tuple(environment):
+            if key in {
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_SYSTEM",
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_CONFIG_COUNT",
+            } or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+                environment.pop(key)
         environment.update(
             {
                 "GIT_CONFIG_COUNT": "1",
@@ -554,6 +567,7 @@ def _handle_stale_open_pull(
             branch_name=head_ref,
             protected_branches=protected_branches,
             result=result,
+            policy=policy,
         )
         return
     result.closed_prs.append(pull_number)
@@ -587,6 +601,7 @@ def _reopen_and_protect(
     branch_name: str,
     protected_branches: set[str],
     result: CleanupResult,
+    policy: OwnershipPolicy,
 ) -> None:
     """Reopen only pulls still matching cleanup's exact close identity."""
     for identity in sorted(pulls, key=lambda pull: pull.number):
@@ -601,7 +616,7 @@ def _reopen_and_protect(
                 err,
             )
             continue
-        if not _pull_matches_close_identity(current, identity):
+        if not _pull_can_be_compensated(current, identity=identity, policy=policy):
             LOGGER.warning(
                 "PR #%s changed after cleanup closed it; preserving branch %s without reopening.",
                 identity.number,
@@ -690,6 +705,7 @@ def _close_obsolete_pull(
             branch_name=snapshot.head_ref,
             protected_branches=protected_branches,
             result=result,
+            policy=policy,
         )
         return True
     try:
@@ -707,6 +723,7 @@ def _close_obsolete_pull(
             branch_name=snapshot.head_ref,
             protected_branches=protected_branches,
             result=result,
+            policy=policy,
         )
         raise
     if not snapshot_matches or not branch_matches:
@@ -716,6 +733,7 @@ def _close_obsolete_pull(
             branch_name=snapshot.head_ref,
             protected_branches=protected_branches,
             result=result,
+            policy=policy,
         )
         return True
 
@@ -747,9 +765,21 @@ def _close_identity(pull: Mapping[str, object]) -> CompensatablePull | None:
     return CompensatablePull(number, head_sha, head_ref, base_ref, changed_files, updated_at)
 
 
-def _pull_matches_close_identity(pull: Mapping[str, object], identity: CompensatablePull) -> bool:
-    """Return whether a pull remains the exact unmerged close mutation."""
-    return _close_identity(pull) == identity
+def _pull_can_be_compensated(
+    pull: Mapping[str, object],
+    *,
+    identity: CompensatablePull,
+    policy: OwnershipPolicy,
+) -> bool:
+    """Return whether a still-owned close may be safely compensated."""
+    current = _close_identity(pull)
+    return (
+        current is not None
+        and current.number == identity.number
+        and current.head_ref == identity.head_ref
+        and current.base_ref == identity.base_ref
+        and _pull_owned_by_policy(pull, policy=policy)
+    )
 
 
 def _obsolete_pull_snapshot(
@@ -1171,7 +1201,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             delete_stale_branches=args.delete_stale_branches,
             delete_merged_branches=args.delete_merged_branches,
         )
-    except (HTTPError, URLError, TimeoutError, subprocess.SubprocessError) as err:
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as err:
         LOGGER.error(
             "Failed to clean prek update branches for %s branch %s: %s",
             args.repository,

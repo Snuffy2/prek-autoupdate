@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hmac
+import shutil
 import subprocess
 from typing import TYPE_CHECKING
 from urllib.error import URLError
@@ -61,6 +62,7 @@ class FakeCleanupClient:
         }
         self.pull_states.update({cleanup._pull_number(pull): "closed" for pull in closed_pulls})
         self.close_responses: dict[int, dict[str, object]] = {}
+        self.tree_requests: list[tuple[set[str], str]] = []
         self.closed_prs: list[int] = []
         self.reopened_prs: list[int] = []
         self.deleted_refs: list[str] = []
@@ -122,6 +124,7 @@ class FakeCleanupClient:
         self, *, paths: set[str], ref: str
     ) -> dict[str, tuple[str, str, str] | None] | None:
         """Return fake Git tree entries."""
+        self.tree_requests.append((paths, ref))
         entries = self.tree_entries.get(ref, {})
         if entries is None:
             return None
@@ -600,8 +603,8 @@ def test_cleanup_script_does_not_reopen_concurrently_changed_pull(
     assert result.deleted_branches == []
 
 
-def test_cleanup_script_reopens_all_shared_head_pulls_on_final_mismatch() -> None:
-    """Same-revision shared-head candidates should aggregate compensation PRs."""
+def test_cleanup_script_defers_shared_head_deletion_after_close() -> None:
+    """Same-revision shared-head closures should defer branch deletion."""
     pulls = [
         _workflow_pull(number=18, base_ref="main", changed_files=0),
         _workflow_pull(number=19, base_ref="develop", changed_files=0),
@@ -630,8 +633,8 @@ def test_cleanup_script_reopens_all_shared_head_pulls_on_final_mismatch() -> Non
     assert result.deleted_branches == []
 
 
-def test_cleanup_script_compensates_conflicting_shared_head_candidates() -> None:
-    """Different expected SHAs for one head should reopen every affected pull."""
+def test_cleanup_script_defers_conflicting_shared_head_deletion() -> None:
+    """Different closed revisions on one head should remain deferred."""
     pulls = [
         _workflow_pull(number=18, base_ref="main", head_sha="old-sha", changed_files=0),
         _workflow_pull(number=19, base_ref="develop", head_sha="new-sha", changed_files=0),
@@ -785,8 +788,8 @@ def test_cleanup_script_preserves_on_post_close_validation_timeout() -> None:
     assert client.deleted_refs == []
 
 
-def test_cleanup_script_compensates_final_ref_lookup_error() -> None:
-    """A final ref lookup error should reopen before propagating."""
+def test_cleanup_script_defers_obsolete_branch_before_ref_error() -> None:
+    """Deferred obsolete cleanup should not reach a later ref error."""
     pull = _workflow_pull(number=18, changed_files=0)
 
     class FailingFinalLookupClient(FakeCleanupClient):
@@ -811,8 +814,8 @@ def test_cleanup_script_compensates_final_ref_lookup_error() -> None:
     assert result.closed_prs == [18]
 
 
-def test_cleanup_script_compensates_final_ref_lookup_timeout() -> None:
-    """A final ref timeout should reopen before propagating."""
+def test_cleanup_script_defers_obsolete_branch_before_ref_timeout() -> None:
+    """Deferred obsolete cleanup should not reach a later ref timeout."""
     pull = _workflow_pull(number=18, changed_files=0)
 
     class TimedOutFinalLookupClient(FakeCleanupClient):
@@ -837,8 +840,8 @@ def test_cleanup_script_compensates_final_ref_lookup_timeout() -> None:
     assert result.closed_prs == [18]
 
 
-def test_cleanup_script_compensates_delete_timeout() -> None:
-    """A deletion timeout should reopen the just-closed pull and propagate."""
+def test_cleanup_script_defers_obsolete_branch_before_delete_timeout() -> None:
+    """Deferred obsolete cleanup should not attempt same-run deletion."""
     pull = _workflow_pull(number=18, changed_files=0)
 
     class TimedOutDeleteClient(FakeCleanupClient):
@@ -899,11 +902,121 @@ def test_reopen_and_protect_removes_compensated_pull_from_result() -> None:
         branch_name=WORKFLOW_BRANCH,
         protected_branches=protected_branches,
         result=result,
+        policy=cleanup.OwnershipPolicy(
+            REPOSITORY,
+            WORKFLOW_BRANCH,
+            WORKFLOW_BRANCH,
+            WORKFLOW_LABEL,
+            WORKFLOW_AUTHOR,
+            WORKFLOW_BODY_MARKER,
+        ),
     )
 
     assert client.reopened_prs == [18]
     assert result.closed_prs == []
     assert protected_branches == {WORKFLOW_BRANCH}
+
+
+def test_reopen_and_protect_allows_new_revision_on_same_owned_pull() -> None:
+    """Compensation should reopen a second revision on the same PR identity."""
+    closed = {
+        **_workflow_pull(number=18, head_sha="old-sha", changed_files=1),
+        "state": "closed",
+    }
+    identity = cleanup._close_identity(closed)
+    assert identity is not None
+    second_revision = {
+        **_workflow_pull(
+            number=18,
+            head_sha="new-sha",
+            changed_files=2,
+            updated_at="2026-07-27T12:05:00Z",
+        ),
+        "state": "closed",
+    }
+    client = FakeCleanupClient(
+        open_pulls=[],
+        closed_pulls=[second_revision],
+    )
+
+    cleanup._reopen_and_protect(
+        client=client,
+        pulls=frozenset({identity}),
+        branch_name=WORKFLOW_BRANCH,
+        protected_branches=set(),
+        result=cleanup.CleanupResult(),
+        policy=cleanup.OwnershipPolicy(
+            REPOSITORY,
+            WORKFLOW_BRANCH,
+            WORKFLOW_BRANCH,
+            WORKFLOW_LABEL,
+            WORKFLOW_AUTHOR,
+            WORKFLOW_BODY_MARKER,
+        ),
+    )
+
+    assert client.reopened_prs == [18]
+
+
+@pytest.mark.parametrize(
+    "current",
+    [
+        {
+            **_workflow_pull(number=18, changed_files=1),
+            "state": "open",
+        },
+        {
+            **_workflow_pull(number=18, changed_files=1, label="other"),
+            "state": "closed",
+        },
+        {
+            **_workflow_pull(number=18, changed_files=1, base_ref="develop"),
+            "state": "closed",
+        },
+        {
+            **_workflow_pull(
+                number=18,
+                changed_files=1,
+                merged_at="2026-07-27T12:05:00Z",
+            ),
+            "state": "closed",
+        },
+        {
+            **_workflow_pull(number=18, changed_files=1, ref="different-ref"),
+            "state": "closed",
+        },
+    ],
+)
+def test_reopen_and_protect_rejects_unsafe_current_pull(
+    current: dict[str, object],
+) -> None:
+    """Compensation should reject open, ownership-lost, or different-base pulls."""
+    original = {
+        **_workflow_pull(number=18, changed_files=1),
+        "state": "closed",
+    }
+    identity = cleanup._close_identity(original)
+    assert identity is not None
+    client = FakeCleanupClient(open_pulls=[], closed_pulls=[current])
+    client.pull_states[18] = str(current["state"])
+
+    cleanup._reopen_and_protect(
+        client=client,
+        pulls=frozenset({identity}),
+        branch_name=WORKFLOW_BRANCH,
+        protected_branches=set(),
+        result=cleanup.CleanupResult(),
+        policy=cleanup.OwnershipPolicy(
+            REPOSITORY,
+            WORKFLOW_BRANCH,
+            WORKFLOW_BRANCH,
+            WORKFLOW_LABEL,
+            WORKFLOW_AUTHOR,
+            WORKFLOW_BODY_MARKER,
+        ),
+    )
+
+    assert client.reopened_prs == []
 
 
 def test_cleanup_script_preserves_closed_branch_that_moves_before_delete() -> None:
@@ -977,8 +1090,14 @@ def test_cleanup_script_closes_pull_when_rename_matches_current_base() -> None:
         },
         ref_shas={"heads/main": "base-sha"},
         tree_entries={
-            "sha": {"prek.toml": ("100644", "blob", "shared-blob")},
-            "base-sha": {"prek.toml": ("100644", "blob", "shared-blob")},
+            "sha": {
+                "prek.toml": ("100644", "blob", "shared-blob"),
+                ".pre-commit-config.yaml": None,
+            },
+            "base-sha": {
+                "prek.toml": ("100644", "blob", "shared-blob"),
+                ".pre-commit-config.yaml": None,
+            },
         },
     )
 
@@ -990,6 +1109,11 @@ def test_cleanup_script_closes_pull_when_rename_matches_current_base() -> None:
 
     assert client.closed_prs == [18]
     assert result.closed_prs == [18]
+    expected_paths = {"prek.toml", ".pre-commit-config.yaml"}
+    assert client.tree_requests == [
+        (expected_paths, "sha"),
+        (expected_paths, "base-sha"),
+    ]
 
 
 def test_cleanup_script_preserves_pull_when_current_base_cannot_be_resolved() -> None:
@@ -1909,14 +2033,15 @@ def test_main_returns_failure_for_github_request_errors(
     [
         subprocess.TimeoutExpired(["git", "push"], 30),
         subprocess.CalledProcessError(1, ["git", "push"]),
+        OSError("git executable unavailable"),
     ],
 )
 def test_main_returns_failure_for_subprocess_errors(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    error: subprocess.SubprocessError,
+    error: OSError | subprocess.SubprocessError,
 ) -> None:
-    """CLI should convert git timeout and command failures into exit code 1."""
+    """CLI should convert git launch, timeout, and command failures into exit code 1."""
 
     def fail_cleanup(**_kwargs: object) -> object:
         """Raise a subprocess operational error."""
@@ -1953,8 +2078,10 @@ def test_github_client_deletes_ref_with_atomic_push_lease(
     """Lease deletion should target the consumer repo without relying on a checkout."""
     calls: list[tuple[list[str], dict[str, str]]] = []
     tooling_root = tmp_path / "tooling"
+    git_executable = shutil.which("git")
+    assert git_executable is not None, "git is required for the isolated repository test"
     subprocess.run(  # noqa: S603 - initializes the isolated test repository
-        ["/usr/bin/git", "init", str(tooling_root)],
+        [git_executable, "init", str(tooling_root)],
         check=True,
         capture_output=True,
         text=True,
@@ -1972,6 +2099,18 @@ def test_github_client_deletes_ref_with_atomic_push_lease(
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr("prek_autoupdate.cleanup_prek_update_branches.subprocess.run", fake_run)
+    for key in [
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_7",
+        "GIT_CONFIG_VALUE_7",
+    ]:
+        monkeypatch.setenv(key, "inherited-value")
+    monkeypatch.setenv("UNRELATED_ENV", "preserved")
     client = cleanup.GithubClient(repository=REPOSITORY, token="secret-token")
     workflow_root = tmp_path / "workflow-root"
     workflow_root.mkdir()
@@ -1997,6 +2136,19 @@ def test_github_client_deletes_ref_with_atomic_push_lease(
     assert encoded_credential not in " ".join(command)
     assert environment["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
     assert environment["GIT_TERMINAL_PROMPT"] == "0"
+    assert environment["UNRELATED_ENV"] == "preserved"
+    assert (
+        not {
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_CONFIG_KEY_7",
+            "GIT_CONFIG_VALUE_7",
+        }
+        & environment.keys()
+    )
     header = environment["GIT_CONFIG_VALUE_0"]
     prefix = "AUTHORIZATION: basic "
     assert hmac.compare_digest(header[: len(prefix)], prefix)
