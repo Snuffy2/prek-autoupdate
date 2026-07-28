@@ -958,6 +958,44 @@ def test_reopen_and_protect_allows_new_revision_on_same_owned_pull() -> None:
     assert client.reopened_prs == [18]
 
 
+def test_reopen_and_protect_rejects_same_head_reclose() -> None:
+    """Compensation should reject an independently reclosed unchanged head."""
+    original = {
+        **_workflow_pull(number=18, head_sha="same-sha", changed_files=1),
+        "state": "closed",
+    }
+    identity = cleanup._close_identity(original)
+    assert identity is not None
+    reclosed = {
+        **_workflow_pull(
+            number=18,
+            head_sha="same-sha",
+            changed_files=1,
+            updated_at="2026-07-27T12:05:00Z",
+        ),
+        "state": "closed",
+    }
+    client = FakeCleanupClient(open_pulls=[], closed_pulls=[reclosed])
+
+    cleanup._reopen_and_protect(
+        client=client,
+        pulls=frozenset({identity}),
+        branch_name=WORKFLOW_BRANCH,
+        protected_branches=set(),
+        result=cleanup.CleanupResult(),
+        policy=cleanup.OwnershipPolicy(
+            REPOSITORY,
+            WORKFLOW_BRANCH,
+            WORKFLOW_BRANCH,
+            WORKFLOW_LABEL,
+            WORKFLOW_AUTHOR,
+            WORKFLOW_BODY_MARKER,
+        ),
+    )
+
+    assert client.reopened_prs == []
+
+
 @pytest.mark.parametrize(
     "current",
     [

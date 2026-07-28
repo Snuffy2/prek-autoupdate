@@ -775,10 +775,16 @@ def _pull_can_be_compensated(
     current = _close_identity(pull)
     return (
         current is not None
-        and current.number == identity.number
-        and current.head_ref == identity.head_ref
-        and current.base_ref == identity.base_ref
         and _pull_owned_by_policy(pull, policy=policy)
+        and (
+            current == identity
+            or (
+                current.number == identity.number
+                and current.head_ref == identity.head_ref
+                and current.base_ref == identity.base_ref
+                and current.head_sha != identity.head_sha
+            )
+        )
     )
 
 
