@@ -56,6 +56,7 @@ class FakeCleanupClient:
         self.pull_details = {} if pull_details is None else pull_details
         self.get_pull_calls: dict[int, int] = {}
         self.closed_prs: list[int] = []
+        self.reopened_prs: list[int] = []
         self.deleted_refs: list[str] = []
 
     def list_pulls(self, *, state: str) -> list[dict[str, object]]:
@@ -71,6 +72,10 @@ class FakeCleanupClient:
         if self.fail_on_close:
             raise AssertionError(f"Unexpected close for PR {pull_number}")
         self.closed_prs.append(pull_number)
+
+    def reopen_pull(self, pull_number: int) -> None:
+        """Record a reopened pull request."""
+        self.reopened_prs.append(pull_number)
 
     def get_pull(self, pull_number: int) -> dict[str, object]:
         """Return fake pull request details."""
@@ -228,6 +233,77 @@ def test_cleanup_script_closes_pull_when_changed_file_matches_current_base() -> 
     assert client.deleted_refs == [f"heads/{WORKFLOW_BRANCH}"]
     assert result.closed_prs == [18]
     assert result.deleted_branches == [WORKFLOW_BRANCH]
+
+
+def test_cleanup_script_reopens_obsolete_pull_when_base_moves_before_close() -> None:
+    """Cleanup should compensate when the base moves immediately before close."""
+    pull = _workflow_pull(number=18, changed_files=1)
+
+    class MovingBaseOnCloseClient(FakeCleanupClient):
+        """Fake client whose base ref moves as the pull is closed."""
+
+        def close_pull(self, pull_number: int) -> None:
+            """Record the close and move the base before post-close validation."""
+            super().close_pull(pull_number)
+            self.ref_shas["heads/main"] = "new-base-sha"
+
+    client = MovingBaseOnCloseClient(
+        open_pulls=[pull],
+        closed_pulls=[],
+        pull_files={18: [{"filename": "prek.toml"}]},
+        ref_shas={"heads/main": "base-sha"},
+        tree_entries={
+            "sha": {"prek.toml": ("100644", "blob", "shared-blob")},
+            "base-sha": {"prek.toml": ("100644", "blob", "shared-blob")},
+        },
+    )
+
+    result = _cleanup(
+        client,
+        keep_latest_open_pr=True,
+        close_obsolete_prs=True,
+    )
+
+    assert client.closed_prs == [18]
+    assert client.reopened_prs == [18]
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+    assert result.deleted_branches == []
+
+
+def test_cleanup_script_propagates_reopen_failure_after_revision_moves() -> None:
+    """Cleanup should expose a failed compensation instead of claiming success."""
+    pull = _workflow_pull(number=18, changed_files=0)
+
+    class FailedReopenClient(FakeCleanupClient):
+        """Fake client whose head moves on close and cannot be reopened."""
+
+        def close_pull(self, pull_number: int) -> None:
+            """Record the close and expose a moved head to revalidation."""
+            super().close_pull(pull_number)
+            self.pull_details[pull_number] = [
+                _workflow_pull(number=pull_number, head_sha="new-sha", changed_files=1)
+            ]
+
+        def reopen_pull(self, pull_number: int) -> None:
+            """Raise the compensation failure."""
+            raise RuntimeError(f"Could not reopen PR {pull_number}")
+
+    client = FailedReopenClient(
+        open_pulls=[pull],
+        closed_pulls=[],
+        pull_details={18: [pull, pull]},
+    )
+
+    with pytest.raises(RuntimeError, match="Could not reopen PR 18"):
+        _cleanup(
+            client,
+            keep_latest_open_pr=True,
+            close_obsolete_prs=True,
+        )
+
+    assert client.closed_prs == [18]
+    assert client.deleted_refs == []
 
 
 def test_cleanup_script_closes_pull_when_rename_matches_current_base() -> None:
@@ -461,11 +537,16 @@ def test_cleanup_script_preserves_open_non_workflow_pr_branches() -> None:
     assert result.deleted_branches == []
 
 
-def test_cleanup_script_preserves_human_prs_with_matching_label_and_prefix() -> None:
-    """Cleanup script should not mutate human PRs that share labels and prefixes."""
+def test_cleanup_script_preserves_prs_that_fail_ownership_checks() -> None:
+    """Cleanup script should not mutate PRs that fail workflow ownership checks."""
     client = FakeCleanupClient(
         open_pulls=[
             _workflow_pull(number=13, ref=f"{WORKFLOW_BRANCH}-manual-fix", author="maintainer"),
+            _workflow_pull(
+                number=15,
+                ref=f"{WORKFLOW_BRANCH}-other-workflow",
+                label="other-workflow",
+            ),
         ],
         closed_pulls=[
             _workflow_pull(
@@ -520,7 +601,7 @@ def test_github_headers_include_json_content_type() -> None:
     assert headers["Content-Type"] == "application/json"
 
 
-def test_github_client_closes_and_gets_pull(
+def test_github_client_closes_reopens_and_gets_pull(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GitHub client should use the pull endpoint for mutations and details."""
@@ -541,12 +622,18 @@ def test_github_client_closes_and_gets_pull(
     monkeypatch.setattr(client, "_request", fake_request)
 
     client.close_pull(18)
+    client.reopen_pull(18)
     assert client.get_pull(18) == pull
     assert calls == [
         (
             "PATCH",
             "https://api.github.com/repos/o/r/pulls/18",
             {"state": "closed"},
+        ),
+        (
+            "PATCH",
+            "https://api.github.com/repos/o/r/pulls/18",
+            {"state": "open"},
         ),
         ("GET", "https://api.github.com/repos/o/r/pulls/18", None),
     ]

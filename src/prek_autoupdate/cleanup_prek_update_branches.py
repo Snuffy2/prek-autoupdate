@@ -37,6 +37,16 @@ class CleanupResult:
     deleted_branches: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class PullComparisonSnapshot:
+    """Pull request revisions used to decide that a pull is obsolete."""
+
+    head_sha: str
+    base_ref: str
+    base_sha: str
+    changed_files: int
+
+
 class CleanupClient(Protocol):
     """GitHub operations needed by the cleanup routine."""
 
@@ -56,6 +66,9 @@ class CleanupClient(Protocol):
 
     def close_pull(self, pull_number: int) -> None:
         """Close a pull request by number."""
+
+    def reopen_pull(self, pull_number: int) -> None:
+        """Reopen a pull request by number."""
 
     def delete_ref(self, ref: str) -> None:
         """Delete a git ref by name."""
@@ -109,6 +122,16 @@ class GithubClient:
         """
         url = f"{GITHUB_API_URL}/repos/{self.repository}/pulls/{pull_number}"
         self._request("PATCH", url, payload={"state": "closed"})
+
+    def reopen_pull(self, pull_number: int) -> None:
+        """Reopen a pull request.
+
+        Args:
+            pull_number: Pull request number to reopen.
+
+        """
+        url = f"{GITHUB_API_URL}/repos/{self.repository}/pulls/{pull_number}"
+        self._request("PATCH", url, payload={"state": "open"})
 
     def get_pull(self, pull_number: int) -> dict[str, object]:
         """Get a pull request.
@@ -388,11 +411,16 @@ def _close_obsolete_pull(
     branches_to_delete: set[str],
 ) -> bool:
     """Close an obsolete workflow pull request and queue its branch deletion."""
-    if not enabled or not _pull_is_obsolete(client, pull):
+    snapshot = _obsolete_pull_snapshot(client, pull) if enabled else None
+    if snapshot is None:
         return False
 
     pull_number = _pull_number(pull)
     client.close_pull(pull_number)
+    if not _pull_matches_snapshot(client, pull_number, snapshot):
+        client.reopen_pull(pull_number)
+        return True
+
     result.closed_prs.append(pull_number)
     if _is_branch_head_sha_match(
         client=client,
@@ -405,42 +433,56 @@ def _close_obsolete_pull(
 
 def _pull_is_obsolete(client: CleanupClient, pull: Mapping[str, object]) -> bool:
     """Return whether a pull request has no changes unique to its current base."""
+    return _obsolete_pull_snapshot(client, pull) is not None
+
+
+def _obsolete_pull_snapshot(
+    client: CleanupClient, pull: Mapping[str, object]
+) -> PullComparisonSnapshot | None:
+    """Return the stable revisions proving a pull has no changes unique to its base."""
     pull_number = _pull_number(pull)
     details = client.get_pull(pull_number)
     changed_files = _pull_changed_files(details)
     head_sha = _pull_head_sha(details)
     base_ref = _pull_base_ref(details)
     if head_sha is None or base_ref is None:
-        return False
-    if changed_files == 0:
-        refreshed = client.get_pull(pull_number)
-        return (
-            _pull_head_sha(refreshed) == head_sha
-            and _pull_base_ref(refreshed) == base_ref
-            and _pull_changed_files(refreshed) == 0
-        )
-
+        return None
     base_sha = client.get_ref_sha(ref=f"heads/{base_ref}")
     if base_sha is None:
-        return False
+        return None
+    snapshot = PullComparisonSnapshot(head_sha, base_ref, base_sha, changed_files)
+    if changed_files == 0:
+        return snapshot if _pull_matches_snapshot(client, pull_number, snapshot) else None
 
     files = client.list_pull_files(pull_number)
     if len(files) != changed_files:
-        return False
+        return None
     paths = _pull_file_paths(files)
     head_entries = client.get_tree_entries(paths=paths, ref=head_sha)
     base_entries = client.get_tree_entries(paths=paths, ref=base_sha)
     if not paths or head_entries is None or base_entries is None:
-        return False
+        return None
 
-    refreshed = client.get_pull(pull_number)
-    revisions_unchanged = (
-        _pull_head_sha(refreshed) == head_sha
-        and _pull_base_ref(refreshed) == base_ref
-        and _pull_changed_files(refreshed) == changed_files
-        and client.get_ref_sha(ref=f"heads/{base_ref}") == base_sha
+    return (
+        snapshot
+        if head_entries == base_entries and _pull_matches_snapshot(client, pull_number, snapshot)
+        else None
     )
-    return revisions_unchanged and head_entries == base_entries
+
+
+def _pull_matches_snapshot(
+    client: CleanupClient,
+    pull_number: int,
+    snapshot: PullComparisonSnapshot,
+) -> bool:
+    """Return whether pull and base revisions still match a comparison snapshot."""
+    refreshed = client.get_pull(pull_number)
+    return (
+        _pull_head_sha(refreshed) == snapshot.head_sha
+        and _pull_base_ref(refreshed) == snapshot.base_ref
+        and _pull_changed_files(refreshed) == snapshot.changed_files
+        and client.get_ref_sha(ref=f"heads/{snapshot.base_ref}") == snapshot.base_sha
+    )
 
 
 def _pull_file_paths(files: Sequence[Mapping[str, object]]) -> set[str]:
