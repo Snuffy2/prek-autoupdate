@@ -11,6 +11,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -23,6 +24,7 @@ GITHUB_API_URL = "https://api.github.com"
 HTTP_NO_CONTENT = 204
 HTTP_NOT_FOUND = 404
 GIT_PUSH_TIMEOUT_SECONDS = 30
+TOOLING_ROOT = Path(__file__).resolve().parents[2]
 LOGGER = logging.getLogger(__name__)
 
 
@@ -53,7 +55,7 @@ class PullComparisonSnapshot:
 
 @dataclass(frozen=True)
 class CompensatablePull:
-    """Exact closed pull revision that cleanup may safely reopen."""
+    """Exact closed pull revision that cleanup may immediately reopen."""
 
     number: int
     head_sha: str
@@ -68,7 +70,19 @@ class BranchDeletion:
     """A branch deletion bound to an expected revision."""
 
     expected_sha: str
-    compensatable_pulls: frozenset[CompensatablePull] = frozenset()
+    pull_numbers: frozenset[int] = frozenset()
+
+
+@dataclass(frozen=True)
+class OwnershipPolicy:
+    """Workflow ownership attributes required before mutation."""
+
+    repository: str
+    branch: str
+    branch_prefix: str
+    label_name: str
+    author_login: str | None
+    body_marker: str | None
 
 
 class DeleteRefOutcome(Enum):
@@ -88,8 +102,8 @@ class CleanupClient(Protocol):
     def get_pull(self, pull_number: int) -> dict[str, object]:
         """Get a pull request by number."""
 
-    def list_pull_files(self, pull_number: int) -> list[dict[str, object]]:
-        """List files changed by a pull request."""
+    def compare_files(self, *, base_sha: str, head_sha: str) -> list[dict[str, object]]:
+        """List files from an immutable commit comparison."""
 
     def get_tree_entries(
         self, *, paths: set[str], ref: str
@@ -184,29 +198,39 @@ class GithubClient:
             raise TypeError(f"Expected a pull request object from {url}")
         return payload
 
-    def list_pull_files(self, pull_number: int) -> list[dict[str, object]]:
-        """List files changed by a pull request.
+    def compare_files(self, *, base_sha: str, head_sha: str) -> list[dict[str, object]]:
+        """List files from an immutable commit comparison.
 
         Args:
-            pull_number: Pull request number to retrieve files for.
+            base_sha: Captured base commit SHA.
+            head_sha: Captured head commit SHA.
 
         Returns:
             Changed file objects from GitHub.
 
         """
-        files: list[dict[str, object]] = []
-        url: str | None = (
-            f"{GITHUB_API_URL}/repos/{self.repository}/pulls/{pull_number}/files?per_page=100"
-        )
-        while url is not None:
-            payload, link_header = self._request("GET", url)
-            if not isinstance(payload, list):
-                raise TypeError(f"Expected pull request file list from {url}")
-            for file in payload:
-                if not isinstance(file, dict):
-                    raise TypeError(f"Expected pull request file object from {url}")
-                files.append(file)
-            url = _next_link(link_header)
+        safe_base = quote(base_sha, safe="")
+        safe_head = quote(head_sha, safe="")
+        url = f"{GITHUB_API_URL}/repos/{self.repository}/compare/{safe_base}...{safe_head}"
+        payload, _ = self._request("GET", url)
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected comparison object from {url}")
+        base_commit = payload.get("base_commit")
+        if base_commit is not None and (
+            not isinstance(base_commit, dict) or base_commit.get("sha") != base_sha
+        ):
+            raise TypeError(f"Expected comparison base SHA from {url}")
+        commits = payload.get("commits")
+        if commits is not None and (
+            not isinstance(commits, list)
+            or not commits
+            or not isinstance(commits[-1], dict)
+            or commits[-1].get("sha") != head_sha
+        ):
+            raise TypeError(f"Expected comparison head SHA from {url}")
+        files = payload.get("files")
+        if not isinstance(files, list) or not all(isinstance(file, dict) for file in files):
+            raise TypeError(f"Expected comparison file list from {url}")
         return files
 
     def get_tree_entries(
@@ -277,6 +301,8 @@ class GithubClient:
         remote_url = f"https://github.com/{self.repository}.git"
         command = [
             "git",
+            "-C",
+            str(TOOLING_ROOT),
             "push",
             remote_url,
             f"--force-with-lease={full_ref}:{expected_sha}",
@@ -397,6 +423,9 @@ def cleanup_update_branches(
 
     """
     result = CleanupResult()
+    policy = OwnershipPolicy(
+        repository, branch, branch_prefix, label_name, author_login, body_marker
+    )
     open_pulls = client.list_pulls(state="open")
     workflow_open_pulls = _workflow_pulls(
         open_pulls,
@@ -421,40 +450,27 @@ def cleanup_update_branches(
     )
     for pull in workflow_open_pulls:
         pull_number = _pull_number(pull)
-        head_ref = _head_ref(pull)
 
         if _close_obsolete_pull(
             client=client,
             pull=pull,
-            repository=repository,
+            policy=policy,
             enabled=close_obsolete_prs,
             result=result,
-            branches_to_delete=branches_to_delete,
             protected_branches=protected_branches,
         ):
             continue
 
-        if pull_number in {keep_pr_number, latest_open_pr_number}:
-            protected_branches.add(head_ref)
-            continue
-
-        if not close_stale_prs:
-            protected_branches.add(head_ref)
-            continue
-
-        client.close_pull(pull_number)
-        result.closed_prs.append(pull_number)
-        if (
-            head_sha := _matching_branch_head_sha(client=client, pull=pull, repository=repository)
-        ) is not None:
-            _queue_branch_deletion(
-                client=client,
-                branches_to_delete=branches_to_delete,
-                protected_branches=protected_branches,
-                result=result,
-                branch_name=head_ref,
-                deletion=BranchDeletion(head_sha),
-            )
+        _handle_stale_open_pull(
+            client=client,
+            pull=pull,
+            keep=pull_number in {keep_pr_number, latest_open_pr_number},
+            close_stale_prs=close_stale_prs,
+            policy=policy,
+            result=result,
+            branches_to_delete=branches_to_delete,
+            protected_branches=protected_branches,
+        )
 
     if delete_stale_branches or delete_merged_branches:
         for pull in _workflow_pulls(
@@ -478,12 +494,10 @@ def cleanup_update_branches(
                 is not None
             ):
                 _queue_branch_deletion(
-                    client=client,
                     branches_to_delete=branches_to_delete,
                     protected_branches=protected_branches,
-                    result=result,
                     branch_name=_head_ref(pull),
-                    deletion=BranchDeletion(head_sha),
+                    deletion=BranchDeletion(head_sha, frozenset({_pull_number(pull)})),
                 )
 
     _delete_queued_branches(
@@ -491,36 +505,66 @@ def cleanup_update_branches(
         branches_to_delete=branches_to_delete,
         protected_branches=protected_branches,
         result=result,
+        policy=policy,
     )
 
     return result
 
 
-def _queue_branch_deletion(
+def _handle_stale_open_pull(
     *,
     client: CleanupClient,
+    pull: Mapping[str, object],
+    keep: bool,
+    close_stale_prs: bool,
+    policy: OwnershipPolicy,
+    result: CleanupResult,
     branches_to_delete: dict[str, BranchDeletion],
     protected_branches: set[str],
-    result: CleanupResult,
+) -> None:
+    """Preserve or close a stale open workflow pull after ownership refresh."""
+    pull_number = _pull_number(pull)
+    head_ref = _head_ref(pull)
+    if keep or not close_stale_prs:
+        protected_branches.add(head_ref)
+        return
+    if not _pull_owned_by_policy(client.get_pull(pull_number), policy=policy):
+        protected_branches.add(head_ref)
+        return
+    closed_pull = client.close_pull(pull_number)
+    if closed_pull.get("state") != "closed" or not _pull_owned_by_policy(
+        closed_pull, policy=policy
+    ):
+        protected_branches.add(head_ref)
+        return
+    result.closed_prs.append(pull_number)
+    head_sha = _matching_branch_head_sha(client=client, pull=pull, repository=policy.repository)
+    if head_sha is not None:
+        _queue_branch_deletion(
+            branches_to_delete=branches_to_delete,
+            protected_branches=protected_branches,
+            branch_name=head_ref,
+            deletion=BranchDeletion(head_sha, frozenset({pull_number})),
+        )
+
+
+def _queue_branch_deletion(
+    *,
+    branches_to_delete: dict[str, BranchDeletion],
+    protected_branches: set[str],
     branch_name: str,
     deletion: BranchDeletion,
 ) -> None:
-    """Queue a compatible lease deletion or compensate conflicting candidates."""
+    """Queue compatible closed-PR evidence or protect on conflict."""
     existing = branches_to_delete.get(branch_name)
     if existing is None:
         branches_to_delete[branch_name] = deletion
         return
-    affected_pulls = existing.compensatable_pulls | deletion.compensatable_pulls
+    pull_numbers = existing.pull_numbers | deletion.pull_numbers
     if existing.expected_sha == deletion.expected_sha:
-        branches_to_delete[branch_name] = BranchDeletion(existing.expected_sha, affected_pulls)
+        branches_to_delete[branch_name] = BranchDeletion(existing.expected_sha, pull_numbers)
         return
-    _reopen_and_protect(
-        client=client,
-        pulls=affected_pulls,
-        branch_name=branch_name,
-        protected_branches=protected_branches,
-        result=result,
-    )
+    protected_branches.add(branch_name)
     branches_to_delete.pop(branch_name)
 
 
@@ -562,78 +606,61 @@ def _delete_queued_branches(
     branches_to_delete: dict[str, BranchDeletion],
     protected_branches: set[str],
     result: CleanupResult,
+    policy: OwnershipPolicy,
 ) -> None:
     """Delete only branches that still match their validated revision."""
     for branch_name in sorted(branches_to_delete):
         if branch_name in protected_branches:
             continue
         deletion = branches_to_delete[branch_name]
-        try:
-            current_sha = client.get_ref_sha(ref=f"heads/{branch_name}")
-        except HTTPError, URLError, TimeoutError, TypeError:
-            _reopen_and_protect(
-                client=client,
-                pulls=deletion.compensatable_pulls,
+        if not all(
+            _closed_pull_still_owned(
+                client.get_pull(pull_number),
+                pull_number=pull_number,
                 branch_name=branch_name,
-                protected_branches=protected_branches,
-                result=result,
+                expected_sha=deletion.expected_sha,
+                policy=policy,
             )
-            raise
-        if current_sha != deletion.expected_sha:
-            _reopen_and_protect(
-                client=client,
-                pulls=deletion.compensatable_pulls,
-                branch_name=branch_name,
-                protected_branches=protected_branches,
-                result=result,
-            )
+            for pull_number in deletion.pull_numbers
+        ):
+            protected_branches.add(branch_name)
             continue
-        try:
-            outcome = client.delete_ref(f"heads/{branch_name}", expected_sha=deletion.expected_sha)
-        except HTTPError, URLError, TimeoutError, TypeError, subprocess.SubprocessError:
-            _reopen_and_protect(
-                client=client,
-                pulls=deletion.compensatable_pulls,
-                branch_name=branch_name,
-                protected_branches=protected_branches,
-                result=result,
-            )
-            raise
+        current_sha = client.get_ref_sha(ref=f"heads/{branch_name}")
+        if current_sha != deletion.expected_sha:
+            continue
+        outcome = client.delete_ref(f"heads/{branch_name}", expected_sha=deletion.expected_sha)
         if outcome is DeleteRefOutcome.DELETED:
             result.deleted_branches.append(branch_name)
         elif outcome is DeleteRefOutcome.LEASE_REJECTED:
-            _reopen_and_protect(
-                client=client,
-                pulls=deletion.compensatable_pulls,
-                branch_name=branch_name,
-                protected_branches=protected_branches,
-                result=result,
-            )
+            protected_branches.add(branch_name)
 
 
 def _close_obsolete_pull(
     *,
     client: CleanupClient,
     pull: Mapping[str, object],
-    repository: str,
+    policy: OwnershipPolicy,
     enabled: bool,
     result: CleanupResult,
-    branches_to_delete: dict[str, BranchDeletion],
     protected_branches: set[str],
 ) -> bool:
-    """Close an obsolete workflow pull request and queue its branch deletion."""
+    """Close an obsolete pull and protect its branch until a later cleanup."""
     snapshot = _obsolete_pull_snapshot(client, pull) if enabled else None
     if snapshot is None:
         return False
 
     pull_number = _pull_number(pull)
+    refreshed_before_close = client.get_pull(pull_number)
+    if not _pull_owned_by_policy(refreshed_before_close, policy=policy):
+        protected_branches.add(snapshot.head_ref)
+        return True
     try:
         closed_pull = client.close_pull(pull_number)
         close_identity = _close_identity(closed_pull)
     except HTTPError, URLError, TimeoutError, TypeError:
         protected_branches.add(snapshot.head_ref)
         raise
-    if close_identity is None:
+    if close_identity is None or not _pull_owned_by_policy(closed_pull, policy=policy):
         protected_branches.add(snapshot.head_ref)
         LOGGER.warning(
             "PR #%s close response lacked a safe mutation identity; preserving its branch.",
@@ -645,7 +672,7 @@ def _close_obsolete_pull(
             client, pull_number, snapshot, required_state="closed"
         )
         branch_matches = (
-            _same_repo_head_ref(pull, repository=repository) == snapshot.head_ref
+            _same_repo_head_ref(pull, repository=policy.repository) == snapshot.head_ref
             and client.get_ref_sha(ref=f"heads/{snapshot.head_ref}") == snapshot.head_sha
         )
     except HTTPError, URLError, TimeoutError, TypeError:
@@ -668,14 +695,7 @@ def _close_obsolete_pull(
         return True
 
     result.closed_prs.append(pull_number)
-    _queue_branch_deletion(
-        client=client,
-        branches_to_delete=branches_to_delete,
-        protected_branches=protected_branches,
-        result=result,
-        branch_name=snapshot.head_ref,
-        deletion=BranchDeletion(snapshot.head_sha, frozenset({close_identity})),
-    )
+    protected_branches.add(snapshot.head_ref)
     return True
 
 
@@ -731,7 +751,7 @@ def _obsolete_pull_snapshot(
     if changed_files == 0:
         return snapshot if _pull_matches_snapshot(client, pull_number, snapshot) else None
 
-    files = client.list_pull_files(pull_number)
+    files = client.compare_files(base_sha=base_sha, head_sha=head_sha)
     if len(files) != changed_files:
         return None
     paths = _pull_file_paths(files)
@@ -891,6 +911,37 @@ def _is_workflow_pull(
 
     head_ref = _same_repo_head_ref(pull, repository=repository)
     return head_ref is not None and (head_ref == branch or head_ref.startswith(branch_prefix))
+
+
+def _pull_owned_by_policy(pull: Mapping[str, object], *, policy: OwnershipPolicy) -> bool:
+    """Return whether refreshed pull data still satisfies workflow ownership."""
+    return _is_workflow_pull(
+        pull,
+        repository=policy.repository,
+        branch=policy.branch,
+        branch_prefix=policy.branch_prefix,
+        label_name=policy.label_name,
+        author_login=policy.author_login,
+        body_marker=policy.body_marker,
+    )
+
+
+def _closed_pull_still_owned(
+    pull: Mapping[str, object],
+    *,
+    pull_number: int,
+    branch_name: str,
+    expected_sha: str,
+    policy: OwnershipPolicy,
+) -> bool:
+    """Return whether a closed deletion candidate remains owned and unchanged."""
+    return (
+        pull.get("state") == "closed"
+        and _pull_number(pull) == pull_number
+        and _pull_head_ref(pull) == branch_name
+        and _pull_head_sha(pull) == expected_sha
+        and _pull_owned_by_policy(pull, policy=policy)
+    )
 
 
 def _head_ref(pull: Mapping[str, object]) -> str:

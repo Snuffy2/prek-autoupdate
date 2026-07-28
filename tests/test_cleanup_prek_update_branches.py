@@ -31,7 +31,7 @@ class FakeCleanupClient:
         open_pulls: list[dict[str, object]],
         closed_pulls: list[dict[str, object]],
         fail_on_close: bool = False,
-        pull_files: dict[int, list[dict[str, object]]] | None = None,
+        comparison_files: (dict[tuple[str, str], list[dict[str, object]]] | None) = None,
         ref_shas: dict[str, str | None] | None = None,
         tree_entries: (dict[str, dict[str, tuple[str, str, str] | None] | None] | None) = None,
         pull_details: dict[int, list[dict[str, object]]] | None = None,
@@ -42,7 +42,7 @@ class FakeCleanupClient:
             open_pulls: Pull requests to return for open PR lookups.
             closed_pulls: Pull requests to return for closed PR lookups.
             fail_on_close: Whether closing a PR should fail the test.
-            pull_files: Optional fake PR number -> changed file objects map.
+            comparison_files: Optional comparison SHA pair -> changed files map.
             ref_shas: Optional fake branch ref -> SHA map.
             tree_entries: Optional fake ref -> path-to-tree-entry map.
             pull_details: Optional successive PR detail responses by number.
@@ -51,7 +51,7 @@ class FakeCleanupClient:
         self.open_pulls = open_pulls
         self.closed_pulls = closed_pulls
         self.fail_on_close = fail_on_close
-        self.pull_files = {} if pull_files is None else pull_files
+        self.comparison_files = {} if comparison_files is None else comparison_files
         self.ref_shas = {} if ref_shas is None else ref_shas
         self.tree_entries = {} if tree_entries is None else tree_entries
         self.pull_details = {} if pull_details is None else pull_details
@@ -59,6 +59,7 @@ class FakeCleanupClient:
         self.pull_states: dict[int, str] = {
             cleanup._pull_number(pull): "open" for pull in open_pulls
         }
+        self.pull_states.update({cleanup._pull_number(pull): "closed" for pull in closed_pulls})
         self.close_responses: dict[int, dict[str, object]] = {}
         self.closed_prs: list[int] = []
         self.reopened_prs: list[int] = []
@@ -99,7 +100,11 @@ class FakeCleanupClient:
             self.get_pull_calls[pull_number] = call + 1
             pull = responses[min(call, len(responses) - 1)]
         else:
-            pull = next(pull for pull in self.open_pulls if pull["number"] == pull_number)
+            pull = next(
+                pull
+                for pull in [*self.open_pulls, *self.closed_pulls]
+                if pull["number"] == pull_number
+            )
         refreshed = {**pull, "state": self.pull_states[pull_number]}
         if (
             refreshed["state"] == "closed"
@@ -109,9 +114,9 @@ class FakeCleanupClient:
             refreshed["updated_at"] = self.close_responses[pull_number]["updated_at"]
         return refreshed
 
-    def list_pull_files(self, pull_number: int) -> list[dict[str, object]]:
-        """Return fake changed files for a pull request."""
-        return self.pull_files.get(pull_number, [])
+    def compare_files(self, *, base_sha: str, head_sha: str) -> list[dict[str, object]]:
+        """Return fake files for an immutable comparison."""
+        return self.comparison_files.get((base_sha, head_sha), [])
 
     def get_tree_entries(
         self, *, paths: set[str], ref: str
@@ -212,9 +217,9 @@ def test_cleanup_script_closes_kept_obsolete_pull_request() -> None:
     )
 
     assert client.closed_prs == [18]
-    assert client.deleted_refs == [f"heads/{WORKFLOW_BRANCH}"]
+    assert client.deleted_refs == []
     assert result.closed_prs == [18]
-    assert result.deleted_branches == [WORKFLOW_BRANCH]
+    assert result.deleted_branches == []
 
 
 def test_cleanup_script_preserves_kept_pull_request_with_changes() -> None:
@@ -223,7 +228,7 @@ def test_cleanup_script_preserves_kept_pull_request_with_changes() -> None:
         open_pulls=[_workflow_pull(number=18, changed_files=1)],
         closed_pulls=[],
         fail_on_close=True,
-        pull_files={18: [{"filename": "prek.toml"}]},
+        comparison_files={("base-sha", "sha"): [{"filename": "prek.toml"}]},
         ref_shas={"heads/main": "base-sha"},
         tree_entries={
             "sha": {"prek.toml": ("100644", "blob", "head-blob")},
@@ -247,7 +252,7 @@ def test_cleanup_script_closes_pull_when_changed_file_matches_current_base() -> 
     client = FakeCleanupClient(
         open_pulls=[_workflow_pull(number=18, changed_files=1)],
         closed_pulls=[],
-        pull_files={18: [{"filename": "prek.toml"}]},
+        comparison_files={("base-sha", "sha"): [{"filename": "prek.toml"}]},
         ref_shas={"heads/main": "base-sha"},
         tree_entries={
             "sha": {"prek.toml": ("100644", "blob", "shared-blob")},
@@ -262,9 +267,9 @@ def test_cleanup_script_closes_pull_when_changed_file_matches_current_base() -> 
     )
 
     assert client.closed_prs == [18]
-    assert client.deleted_refs == [f"heads/{WORKFLOW_BRANCH}"]
+    assert client.deleted_refs == []
     assert result.closed_prs == [18]
-    assert result.deleted_branches == [WORKFLOW_BRANCH]
+    assert result.deleted_branches == []
 
 
 def test_cleanup_script_reopens_obsolete_pull_when_base_moves_before_close() -> None:
@@ -283,7 +288,7 @@ def test_cleanup_script_reopens_obsolete_pull_when_base_moves_before_close() -> 
     client = MovingBaseOnCloseClient(
         open_pulls=[pull],
         closed_pulls=[],
-        pull_files={18: [{"filename": "prek.toml"}]},
+        comparison_files={("base-sha", "sha"): [{"filename": "prek.toml"}]},
         ref_shas={"heads/main": "base-sha"},
         tree_entries={
             "sha": {"prek.toml": ("100644", "blob", "shared-blob")},
@@ -355,6 +360,85 @@ def test_cleanup_script_preserves_when_close_identity_is_incomplete() -> None:
     assert result.deleted_branches == []
 
 
+def test_cleanup_script_rechecks_label_before_obsolete_close() -> None:
+    """Cleanup should not close a PR whose ownership label was removed."""
+    pull = _workflow_pull(number=18, changed_files=0)
+    without_label = _workflow_pull(number=18, changed_files=0, label="other")
+    client = FakeCleanupClient(
+        open_pulls=[pull],
+        closed_pulls=[],
+        pull_details={18: [pull, pull, without_label]},
+    )
+
+    result = _cleanup(client, close_obsolete_prs=True)
+
+    assert client.closed_prs == []
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+
+
+def test_cleanup_script_rechecks_label_before_stale_close() -> None:
+    """Cleanup should preserve a stale PR whose ownership label was removed."""
+    pull = _workflow_pull(number=18)
+    without_label = _workflow_pull(number=18, label="other")
+    client = FakeCleanupClient(
+        open_pulls=[pull],
+        closed_pulls=[],
+        pull_details={18: [without_label]},
+    )
+
+    result = _cleanup(client)
+
+    assert client.closed_prs == []
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+
+
+def test_cleanup_script_rejects_close_response_without_body_marker() -> None:
+    """Cleanup should not accept a close response that lost workflow ownership."""
+    pull = _workflow_pull(number=18, changed_files=0)
+
+    class RemovedBodyOnCloseClient(FakeCleanupClient):
+        """Fake client whose close response has no workflow marker."""
+
+        def close_pull(self, pull_number: int) -> dict[str, object]:
+            """Return a closed payload with independently changed body text."""
+            response = super().close_pull(pull_number)
+            response["body"] = "Changed by another actor"
+            return response
+
+    client = RemovedBodyOnCloseClient(open_pulls=[pull], closed_pulls=[])
+
+    result = _cleanup(client, close_obsolete_prs=True)
+
+    assert client.closed_prs == [18]
+    assert client.reopened_prs == []
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+
+
+def test_cleanup_script_rejects_stale_close_response_without_body_marker() -> None:
+    """Cleanup should reject stale-close evidence that lost workflow ownership."""
+    pull = _workflow_pull(number=18)
+
+    class RemovedBodyOnCloseClient(FakeCleanupClient):
+        """Fake client whose close response has no workflow marker."""
+
+        def close_pull(self, pull_number: int) -> dict[str, object]:
+            """Return a closed payload with independently changed body text."""
+            response = super().close_pull(pull_number)
+            response["body"] = "Changed by another actor"
+            return response
+
+    client = RemovedBodyOnCloseClient(open_pulls=[pull], closed_pulls=[])
+
+    result = _cleanup(client)
+
+    assert client.closed_prs == [18]
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+
+
 def test_cleanup_script_protects_compensated_branch_from_closed_listing() -> None:
     """A reopened pull branch should survive an eventually consistent closed listing."""
     pull = _workflow_pull(number=18, changed_files=1)
@@ -371,7 +455,7 @@ def test_cleanup_script_protects_compensated_branch_from_closed_listing() -> Non
     client = MovingBaseOnCloseClient(
         open_pulls=[pull],
         closed_pulls=[pull],
-        pull_files={18: [{"filename": "prek.toml"}]},
+        comparison_files={("base-sha", "sha"): [{"filename": "prek.toml"}]},
         ref_shas={"heads/main": "base-sha"},
         tree_entries={
             "sha": {"prek.toml": ("100644", "blob", "shared-blob")},
@@ -424,8 +508,8 @@ def test_cleanup_script_reopens_when_head_moves_after_post_close_snapshot() -> N
     assert result.deleted_branches == []
 
 
-def test_cleanup_script_reopens_when_head_moves_before_final_delete() -> None:
-    """Final deletion should compensate when a just-closed pull head advances."""
+def test_cleanup_script_defers_obsolete_branch_deletion() -> None:
+    """A just-closed obsolete pull branch should be protected until a later run."""
     pull = _workflow_pull(number=18, changed_files=0)
 
     class MovingHeadBeforeDeleteClient(FakeCleanupClient):
@@ -451,9 +535,9 @@ def test_cleanup_script_reopens_when_head_moves_before_final_delete() -> None:
         close_obsolete_prs=True,
     )
 
-    assert client.reopened_prs == [18]
+    assert client.reopened_prs == []
     assert client.deleted_refs == []
-    assert result.closed_prs == []
+    assert result.closed_prs == [18]
     assert result.deleted_branches == []
 
 
@@ -467,9 +551,8 @@ def test_cleanup_script_reopens_when_head_moves_before_final_delete() -> None:
 def test_cleanup_script_does_not_reopen_concurrently_changed_pull(
     updated_at: str,
     merged_at: str | None,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Concurrent close updates and merges should block compensation reopening."""
+    """Deferred deletion should avoid later same-run compensation races."""
     pull = _workflow_pull(number=18, changed_files=0)
 
     class ConcurrentTransitionClient(FakeCleanupClient):
@@ -503,14 +586,12 @@ def test_cleanup_script_does_not_reopen_concurrently_changed_pull(
 
     client = ConcurrentTransitionClient(open_pulls=[pull], closed_pulls=[])
 
-    with caplog.at_level("WARNING"):
-        result = _cleanup(client, close_obsolete_prs=True)
+    result = _cleanup(client, close_obsolete_prs=True)
 
     assert client.reopened_prs == []
     assert client.deleted_refs == []
-    assert result.closed_prs == []
+    assert result.closed_prs == [18]
     assert result.deleted_branches == []
-    assert "changed after cleanup closed it" in caplog.text
 
 
 def test_cleanup_script_reopens_all_shared_head_pulls_on_final_mismatch() -> None:
@@ -537,9 +618,9 @@ def test_cleanup_script_reopens_all_shared_head_pulls_on_final_mismatch() -> Non
 
     result = _cleanup(client, close_obsolete_prs=True)
 
-    assert client.reopened_prs == [18, 19]
+    assert client.reopened_prs == []
     assert client.deleted_refs == []
-    assert result.closed_prs == []
+    assert result.closed_prs == [18, 19]
     assert result.deleted_branches == []
 
 
@@ -566,10 +647,26 @@ def test_cleanup_script_compensates_conflicting_shared_head_candidates() -> None
 
     result = _cleanup(client, close_obsolete_prs=True)
 
-    assert client.reopened_prs == [18, 19]
+    assert client.reopened_prs == []
     assert client.deleted_refs == []
-    assert result.closed_prs == []
+    assert result.closed_prs == [18, 19]
     assert result.deleted_branches == []
+
+
+def test_conflicting_branch_deletion_evidence_protects_branch() -> None:
+    """Conflicting expected revisions should cancel a queued deletion."""
+    branches_to_delete = {WORKFLOW_BRANCH: cleanup.BranchDeletion("old-sha", frozenset({18}))}
+    protected_branches: set[str] = set()
+
+    cleanup._queue_branch_deletion(
+        branches_to_delete=branches_to_delete,
+        protected_branches=protected_branches,
+        branch_name=WORKFLOW_BRANCH,
+        deletion=cleanup.BranchDeletion("new-sha", frozenset({19})),
+    )
+
+    assert branches_to_delete == {}
+    assert protected_branches == {WORKFLOW_BRANCH}
 
 
 def test_cleanup_script_preserves_on_post_close_validation_error() -> None:
@@ -672,11 +769,11 @@ def test_cleanup_script_compensates_final_ref_lookup_error() -> None:
 
     client = FailingFinalLookupClient(open_pulls=[pull], closed_pulls=[])
 
-    with pytest.raises(URLError, match="lookup failed"):
-        _cleanup(client, close_obsolete_prs=True)
+    result = _cleanup(client, close_obsolete_prs=True)
 
-    assert client.reopened_prs == [18]
+    assert client.reopened_prs == []
     assert client.deleted_refs == []
+    assert result.closed_prs == [18]
 
 
 def test_cleanup_script_compensates_final_ref_lookup_timeout() -> None:
@@ -698,11 +795,11 @@ def test_cleanup_script_compensates_final_ref_lookup_timeout() -> None:
 
     client = TimedOutFinalLookupClient(open_pulls=[pull], closed_pulls=[])
 
-    with pytest.raises(TimeoutError, match="final lookup timed out"):
-        _cleanup(client, close_obsolete_prs=True)
+    result = _cleanup(client, close_obsolete_prs=True)
 
-    assert client.reopened_prs == [18]
+    assert client.reopened_prs == []
     assert client.deleted_refs == []
+    assert result.closed_prs == [18]
 
 
 def test_cleanup_script_compensates_delete_timeout() -> None:
@@ -720,11 +817,11 @@ def test_cleanup_script_compensates_delete_timeout() -> None:
 
     client = TimedOutDeleteClient(open_pulls=[pull], closed_pulls=[])
 
-    with pytest.raises(TimeoutError, match="delete timed out"):
-        _cleanup(client, close_obsolete_prs=True)
+    result = _cleanup(client, close_obsolete_prs=True)
 
-    assert client.reopened_prs == [18]
+    assert client.reopened_prs == []
     assert client.deleted_refs == []
+    assert result.closed_prs == [18]
 
 
 def test_cleanup_script_does_not_claim_rejected_lease_deletion() -> None:
@@ -741,6 +838,55 @@ def test_cleanup_script_does_not_claim_rejected_lease_deletion() -> None:
             return cleanup.DeleteRefOutcome.LEASE_REJECTED
 
     client = RejectedLeaseClient(open_pulls=[], closed_pulls=[pull])
+
+    result = _cleanup(client)
+
+    assert client.deleted_refs == []
+    assert result.deleted_branches == []
+
+
+def test_reopen_and_protect_removes_compensated_pull_from_result() -> None:
+    """Compensation should reopen an unchanged close and retract its result."""
+    pull = {
+        **_workflow_pull(number=18, changed_files=0),
+        "state": "closed",
+        "updated_at": "2026-07-27T12:00:00Z",
+    }
+    identity = cleanup._close_identity(pull)
+    assert identity is not None
+    client = FakeCleanupClient(open_pulls=[], closed_pulls=[pull])
+    result = cleanup.CleanupResult(closed_prs=[18])
+    protected_branches: set[str] = set()
+
+    cleanup._reopen_and_protect(
+        client=client,
+        pulls=frozenset({identity}),
+        branch_name=WORKFLOW_BRANCH,
+        protected_branches=protected_branches,
+        result=result,
+    )
+
+    assert client.reopened_prs == [18]
+    assert result.closed_prs == []
+    assert protected_branches == {WORKFLOW_BRANCH}
+
+
+def test_cleanup_script_preserves_closed_branch_that_moves_before_delete() -> None:
+    """Cleanup should preserve a closed PR branch that moves before deletion."""
+    pull = _workflow_pull(number=7, merged_at="2026-05-28T00:00:00Z")
+
+    class MovingHeadClient(FakeCleanupClient):
+        """Fake client whose branch moves after candidate validation."""
+
+        head_ref_calls = 0
+
+        def get_ref_sha(self, *, ref: str) -> str | None:
+            """Return a moved SHA at the final deletion check."""
+            assert ref == f"heads/{WORKFLOW_BRANCH}"
+            self.head_ref_calls += 1
+            return "sha" if self.head_ref_calls == 1 else "new-sha"
+
+    client = MovingHeadClient(open_pulls=[], closed_pulls=[pull])
 
     result = _cleanup(client)
 
@@ -786,8 +932,8 @@ def test_cleanup_script_closes_pull_when_rename_matches_current_base() -> None:
     client = FakeCleanupClient(
         open_pulls=[_workflow_pull(number=18, changed_files=1)],
         closed_pulls=[],
-        pull_files={
-            18: [
+        comparison_files={
+            ("base-sha", "sha"): [
                 {
                     "filename": "prek.toml",
                     "previous_filename": ".pre-commit-config.yaml",
@@ -956,6 +1102,26 @@ def test_cleanup_script_deletes_closed_unmerged_workflow_branches_with_sha_match
 
     assert client.deleted_refs == [f"heads/{stale_branch}"]
     assert result.deleted_branches == [stale_branch]
+
+
+def test_cleanup_script_rechecks_ownership_before_closed_branch_deletion() -> None:
+    """A removed ownership label should block a closed branch lease deletion."""
+    pull = _workflow_pull(number=7)
+    without_label = _workflow_pull(number=7, label="other")
+    client = FakeCleanupClient(
+        open_pulls=[],
+        closed_pulls=[pull],
+        pull_details={7: [without_label]},
+    )
+
+    result = _cleanup(
+        client,
+        delete_stale_branches=True,
+        delete_merged_branches=False,
+    )
+
+    assert client.deleted_refs == []
+    assert result.deleted_branches == []
 
 
 def test_cleanup_script_protects_open_branch_when_stale_closing_is_disabled() -> None:
@@ -1181,52 +1347,60 @@ def test_github_client_rejects_invalid_pull_list(
         client.list_pulls(state="open")
 
 
-def test_github_client_lists_pull_files_across_pages(
+def test_github_client_gets_files_from_immutable_comparison(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """GitHub client should follow pagination when listing pull request files."""
+    """GitHub client should validate commit evidence from the compare endpoint."""
     calls: list[str] = []
-    next_url = "https://api.github.com/repositories/1/pulls/18/files?per_page=100&page=2"
 
-    def fake_request(method: str, url: str) -> tuple[object, str | None]:
-        """Return two fake pages of pull request files."""
+    def fake_request(method: str, url: str) -> tuple[object, None]:
+        """Return an immutable comparison payload."""
         assert method == "GET"
         calls.append(url)
-        if len(calls) == 1:
-            return [{"filename": "prek.toml"}], f'<{next_url}>; rel="next"'
-        return [{"filename": "README.md"}], None
+        return {
+            "base_commit": {"sha": "base#sha"},
+            "commits": [{"sha": "head#sha"}],
+            "files": [{"filename": "prek.toml"}],
+        }, None
 
     client = cleanup.GithubClient(repository=REPOSITORY, token="token")
     monkeypatch.setattr(client, "_request", fake_request)
 
-    assert client.list_pull_files(18) == [
-        {"filename": "prek.toml"},
-        {"filename": "README.md"},
+    assert client.compare_files(base_sha="base#sha", head_sha="head#sha") == [
+        {"filename": "prek.toml"}
     ]
     assert calls == [
-        "https://api.github.com/repos/o/r/pulls/18/files?per_page=100",
-        next_url,
+        "https://api.github.com/repos/o/r/compare/base%23sha...head%23sha",
     ]
 
 
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
-        ({}, "Expected pull request file list"),
-        ([None], "Expected pull request file object"),
+        ([], "Expected comparison object"),
+        ({}, "Expected comparison file list"),
+        ({"files": [None]}, "Expected comparison file list"),
+        (
+            {"base_commit": {"sha": "wrong"}, "files": []},
+            "Expected comparison base SHA",
+        ),
+        (
+            {"commits": [{"sha": "wrong"}], "files": []},
+            "Expected comparison head SHA",
+        ),
     ],
 )
-def test_github_client_rejects_invalid_pull_file_list(
+def test_github_client_rejects_invalid_comparison(
     monkeypatch: pytest.MonkeyPatch,
     payload: object,
     message: str,
 ) -> None:
-    """GitHub client should reject malformed pull files responses."""
+    """GitHub client should reject malformed or mismatched comparisons."""
     client = cleanup.GithubClient(repository=REPOSITORY, token="token")
     monkeypatch.setattr(client, "_request", lambda *_args: (payload, None))
 
     with pytest.raises(TypeError, match=message):
-        client.list_pull_files(18)
+        client.compare_files(base_sha="base-sha", head_sha="head-sha")
 
 
 def test_github_client_gets_tree_entry_identities(
@@ -1364,6 +1538,30 @@ def test_pull_is_not_obsolete_without_comparison_refs(
     assert not cleanup._pull_is_obsolete(client, details)
 
 
+@pytest.mark.parametrize(
+    ("pull", "ref_shas"),
+    [
+        (_workflow_pull(number=18, repository="fork/r"), {}),
+        (_workflow_pull(number=18), {f"heads/{WORKFLOW_BRANCH}": None}),
+    ],
+)
+def test_matching_branch_head_sha_requires_same_repo_existing_ref(
+    pull: dict[str, object],
+    ref_shas: dict[str, str | None],
+) -> None:
+    """Branch matching should reject fork heads and absent branch refs."""
+    client = FakeCleanupClient(open_pulls=[], closed_pulls=[], ref_shas=ref_shas)
+
+    assert (
+        cleanup._matching_branch_head_sha(
+            client=client,
+            pull=pull,
+            repository=REPOSITORY,
+        )
+        is None
+    )
+
+
 def test_pull_is_not_obsolete_when_changed_file_list_is_empty() -> None:
     """Obsolete detection should not infer equality from a missing file list."""
     pull = _workflow_pull(number=18, changed_files=1)
@@ -1382,11 +1580,43 @@ def test_pull_is_not_obsolete_when_file_listing_is_incomplete() -> None:
     client = FakeCleanupClient(
         open_pulls=[pull],
         closed_pulls=[],
-        pull_files={18: [{"filename": "prek.toml"}]},
+        comparison_files={("base-sha", "sha"): [{"filename": "prek.toml"}]},
         ref_shas={"heads/main": "base-sha"},
     )
 
     assert not cleanup._pull_is_obsolete(client, pull)
+
+
+def test_obsolete_comparison_ignores_mutable_pull_file_aba_state() -> None:
+    """Obsolete evidence should use only the captured base/head commit pair."""
+    pull = _workflow_pull(number=18, changed_files=1)
+
+    class ImmutableComparisonClient(FakeCleanupClient):
+        """Fake client that rejects access to mutable PR file state."""
+
+        comparisons: tuple[tuple[str, str], ...] = ()
+
+        def compare_files(self, *, base_sha: str, head_sha: str) -> list[dict[str, object]]:
+            """Record the immutable comparison requested by cleanup."""
+            self.comparisons = (*self.comparisons, (base_sha, head_sha))
+            return [{"filename": "prek.toml"}]
+
+        def list_pull_files(self, _pull_number: int) -> list[dict[str, object]]:
+            """Fail if obsolete detection regresses to mutable PR file state."""
+            raise AssertionError("Mutable PR file state must not be read")
+
+    client = ImmutableComparisonClient(
+        open_pulls=[pull],
+        closed_pulls=[],
+        ref_shas={"heads/main": "base-sha"},
+        tree_entries={
+            "sha": {"prek.toml": ("100644", "blob", "shared")},
+            "base-sha": {"prek.toml": ("100644", "blob", "shared")},
+        },
+    )
+
+    assert cleanup._pull_is_obsolete(client, pull)
+    assert client.comparisons == (("base-sha", "sha"),)
 
 
 def test_pull_is_not_obsolete_when_head_changes_during_comparison() -> None:
@@ -1396,7 +1626,7 @@ def test_pull_is_not_obsolete_when_head_changes_during_comparison() -> None:
     client = FakeCleanupClient(
         open_pulls=[pull],
         closed_pulls=[],
-        pull_files={18: [{"filename": "prek.toml"}]},
+        comparison_files={("base-sha", "sha"): [{"filename": "prek.toml"}]},
         ref_shas={"heads/main": "base-sha"},
         tree_entries={
             "sha": {"prek.toml": ("100644", "blob", "shared")},
@@ -1424,7 +1654,7 @@ def test_pull_is_not_obsolete_when_tree_entry_identity_differs(
     client = FakeCleanupClient(
         open_pulls=[pull],
         closed_pulls=[],
-        pull_files={18: [{"filename": "prek.toml"}]},
+        comparison_files={("base-sha", "sha"): [{"filename": "prek.toml"}]},
         ref_shas={"heads/main": "base-sha"},
         tree_entries={
             "sha": {"prek.toml": head_entry},
@@ -1441,7 +1671,7 @@ def test_pull_is_not_obsolete_when_tree_is_truncated() -> None:
     client = FakeCleanupClient(
         open_pulls=[pull],
         closed_pulls=[],
-        pull_files={18: [{"filename": "prek.toml"}]},
+        comparison_files={("base-sha", "sha"): [{"filename": "prek.toml"}]},
         ref_shas={"heads/main": "base-sha"},
         tree_entries={"sha": None},
     )
@@ -1465,7 +1695,7 @@ def test_pull_is_not_obsolete_when_base_moves_during_comparison() -> None:
     client = MovingBaseClient(
         open_pulls=[pull],
         closed_pulls=[],
-        pull_files={18: [{"filename": "prek.toml"}]},
+        comparison_files={("base-sha", "sha"): [{"filename": "prek.toml"}]},
         ref_shas={"heads/main": "base-sha"},
         tree_entries={
             "sha": {"prek.toml": ("100644", "blob", "shared")},
@@ -1603,12 +1833,22 @@ def test_github_client_deletes_ref_with_atomic_push_lease(
 ) -> None:
     """Lease deletion should target the consumer repo without relying on a checkout."""
     calls: list[tuple[list[str], dict[str, str]]] = []
+    tooling_root = tmp_path / "tooling"
+    subprocess.run(  # noqa: S603 - initializes the isolated test repository
+        ["/usr/bin/git", "init", str(tooling_root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.setattr(cleanup, "TOOLING_ROOT", tooling_root)
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         """Record the lease-guarded git invocation."""
         environment = kwargs["env"]
         assert isinstance(environment, dict)
         assert kwargs["timeout"] == cleanup.GIT_PUSH_TIMEOUT_SECONDS
+        assert command[1:3] == ["-C", str(tooling_root)]
+        assert (tooling_root / ".git").is_dir()
         calls.append((command, environment))
         return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -1626,6 +1866,8 @@ def test_github_client_deletes_ref_with_atomic_push_lease(
     command, environment = calls[0]
     assert command == [
         "git",
+        "-C",
+        str(tooling_root),
         "push",
         "https://github.com/o/r.git",
         "--force-with-lease=refs/heads/feature#1:expected-sha",
