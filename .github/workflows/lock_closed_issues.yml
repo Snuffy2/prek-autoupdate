@@ -1,8 +1,8 @@
-name: 'Lock Closed Issues'
+name: "Lock Closed Issues"
 
 on:
   schedule:
-    - cron: '0 6 * * *'
+    - cron: "0 6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -19,7 +19,7 @@ jobs:
       - name: Lock closed issues
         uses: dessant/lock-threads@v6
         with:
-          issue-inactive-days: '7'
-          issue-lock-reason: 'resolved'
-          process-only: 'issues'
+          issue-inactive-days: "7"
+          issue-lock-reason: "resolved"
+          process-only: "issues"
           log-output: true

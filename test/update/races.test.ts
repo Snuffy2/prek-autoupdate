@@ -1,0 +1,526 @@
+import { execFile } from "node:child_process";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const installPrek = vi.hoisted(() => vi.fn<() => Promise<string>>());
+vi.mock("../../src/prek/index.js", () => ({ installPrek }));
+
+import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
+import { BODY_MARKER, runUpdate } from "../../src/update/index.js";
+
+const exec = promisify(execFile);
+const cleanups: string[] = [];
+const originalPath = process.env.PATH;
+
+afterEach(async () => {
+  process.env.PATH = originalPath;
+  delete process.env.TEST_GIT_LOG;
+  delete process.env.TEST_GIT_REMOTE;
+  delete process.env.TEST_GIT_FAIL_PUSH;
+  installPrek.mockReset();
+  await Promise.all(
+    cleanups
+      .splice(0)
+      .map((entry) => rm(entry, { recursive: true, force: true })),
+  );
+});
+
+describe("update publication races", () => {
+  it("lease-deletes the exact pushed SHA after a definite create failure", async () => {
+    const harness = await makeHarness();
+    harness.create.mockRejectedValue(
+      Object.assign(new Error("bad"), { status: 422 }),
+    );
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /lease-rolled back/u,
+    );
+    expect(await pushes(harness.log)).toEqual([
+      expect.stringContaining(
+        "--force-with-lease=refs/heads/chore/prek-updates:",
+      ),
+      expect.stringMatching(
+        /:refs\/heads\/chore\/prek-updates .*--force-with-lease=refs\/heads\/chore\/prek-updates:[0-9a-f]{40}/u,
+      ),
+    ]);
+    expect(harness.update).not.toHaveBeenCalled();
+  });
+
+  it("preserves the pushed branch when create has an ambiguous outcome", async () => {
+    const harness = await makeHarness();
+    harness.create.mockRejectedValue(
+      Object.assign(new Error("timeout"), { status: 504 }),
+    );
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /ambiguous outcome/u,
+    );
+    expect(await pushes(harness.log)).toHaveLength(1);
+    expect(harness.update).not.toHaveBeenCalled();
+  });
+
+  it("recovers one exact ambiguous create result, labels it, and proves it", async () => {
+    const harness = await makeHarness();
+    harness.create.mockRejectedValue(
+      Object.assign(new Error("timeout"), { status: 504 }),
+    );
+    harness.paginate.mockResolvedValueOnce([]).mockImplementation(async () => [
+      mergePull(harness.pull, {
+        number: 77,
+        head: {
+          ...harness.pull.head,
+          sha: await remoteSha(harness.remote),
+        },
+      }),
+    ]);
+    harness.get.mockImplementation(async () => ({
+      data: mergePull(harness.pull, {
+        number: 77,
+        head: {
+          ...harness.pull.head,
+          sha: await remoteSha(harness.remote),
+        },
+      }),
+      headers: { etag: '"created"' },
+    }));
+
+    await expect(runUpdate(harness.execution)).resolves.toEqual({
+      operation: "created",
+      pullRequestNumber: 77,
+    });
+    expect(harness.addLabels).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issue_number: 77,
+        labels: ["dependencies"],
+      }),
+    );
+    expect(await pushes(harness.log)).toHaveLength(1);
+  });
+
+  it.each(["nonexact", "multiple"] as const)(
+    "preserves an ambiguous create with %s recovery candidates without labeling",
+    async (variant) => {
+      const harness = await makeHarness();
+      harness.create.mockRejectedValue(
+        Object.assign(new Error("timeout"), { status: 504 }),
+      );
+      harness.paginate
+        .mockResolvedValueOnce([])
+        .mockImplementation(async () => {
+          const exact = mergePull(harness.pull, {
+            number: 77,
+            head: {
+              ...harness.pull.head,
+              sha: await remoteSha(harness.remote),
+            },
+          });
+          return variant === "multiple"
+            ? [exact, mergePull(exact, { number: 78 })]
+            : [mergePull(exact, { body: "not the requested body" })];
+        });
+
+      await expect(runUpdate(harness.execution)).rejects.toThrow(
+        /ambiguous outcome/u,
+      );
+      expect(harness.addLabels).not.toHaveBeenCalled();
+      expect(harness.get).not.toHaveBeenCalled();
+      expect(await pushes(harness.log)).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ["label loss", { labels: [] }],
+    ["body loss", { body: "human edit" }],
+    ["state loss", { state: "closed" }],
+    ["base loss", { base: { ref: "other" } }],
+    [
+      "head loss",
+      { head: { ref: "other", repo: { full_name: "owner/repo" }, sha: "OLD" } },
+    ],
+  ])(
+    "does not push or patch after pre-push %s",
+    async (_name, changed) => {
+      const harness = await makeHarness({ existing: true });
+      harness.get.mockResolvedValueOnce({
+        data: mergePull(harness.pull, changed),
+        headers: { etag: '"before"' },
+      });
+
+      await expect(runUpdate(harness.execution)).rejects.toThrow(
+        /changed after initial observation/u,
+      );
+      expect(await pushes(harness.log)).toEqual([]);
+      expect(harness.update).not.toHaveBeenCalled();
+    },
+    15_000,
+  );
+
+  it("does not push or patch when the observed branch ref disappears before push", async () => {
+    const harness = await makeHarness({ existing: true, refLossAt: 2 });
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(/missing/u);
+    expect(await pushes(harness.log)).toEqual([]);
+    expect(harness.update).not.toHaveBeenCalled();
+  });
+
+  it("rolls post-push proof loss back to the exact observed SHA without patching", async () => {
+    const harness = await makeHarness({ existing: true, loseAfterPush: true });
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /lease-rolled back/u,
+    );
+    const observedPushes = await pushes(harness.log);
+    expect(observedPushes).toHaveLength(2);
+    expect(observedPushes[1]).toContain(
+      `${harness.oldSha}:refs/heads/chore/prek-updates`,
+    );
+    expect(observedPushes[1]).toMatch(
+      /--force-with-lease=refs\/heads\/chore\/prek-updates:[0-9a-f]{40}/u,
+    );
+    expect(harness.update).not.toHaveBeenCalled();
+  });
+
+  it("reports partial state when the post-push rollback lease fails", async () => {
+    const harness = await makeHarness({ existing: true, loseAfterPush: true });
+    process.env.TEST_GIT_FAIL_PUSH = "2";
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /rollback also failed.*preserved/u,
+    );
+    expect(await pushes(harness.log)).toHaveLength(2);
+    expect(harness.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["before the run", 1],
+    ["during the run", 2],
+  ])(
+    "prevents mutation when the base ref drifts %s",
+    async (_name, driftAt) => {
+      const harness = await makeHarness({ baseDriftAt: driftAt });
+
+      await expect(runUpdate(harness.execution)).rejects.toThrow(
+        /base branch changed/u,
+      );
+      expect(await pushes(harness.log)).toEqual([]);
+      expect(harness.create).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe("no-change close compensation", () => {
+  it("returns a closed result without leaking the pull request number", async () => {
+    const harness = await makeHarness({ existing: true, noChange: true });
+    await expect(runUpdate(harness.execution)).resolves.toEqual({
+      operation: "closed",
+    });
+  });
+
+  it("preserves the branch and refuses reopen when close response loses identity", async () => {
+    const harness = await makeHarness({ existing: true, noChange: true });
+    harness.update.mockResolvedValueOnce({
+      data: mergePull(harness.pull, {
+        state: "closed",
+        body: "changed",
+        closed_at: "2026-07-28T00:00:01Z",
+      }),
+      headers: { etag: '"close"' },
+    });
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /unexpected pull request after close/u,
+    );
+    expect(await pushes(harness.log)).toEqual([]);
+    expect(harness.update).toHaveBeenCalledTimes(1);
+  });
+
+  it("reopens only the exact unchanged close event with its ETag after delete failure", async () => {
+    const harness = await makeHarness({ existing: true, noChange: true });
+    process.env.TEST_GIT_FAIL_PUSH = "1";
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /was compensated/u,
+    );
+    expect(harness.update).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        state: "open",
+        headers: { "If-Match": '"close"' },
+      }),
+    );
+  });
+
+  it.each([
+    ["changed timestamp", { updated_at: "2026-07-28T00:00:02Z" }],
+    ["changed closed_at", { closed_at: "2026-07-28T00:00:02Z" }],
+    ["changed ownership", { labels: [] }],
+  ])("never reopens after %s", async (_name, changed) => {
+    const harness = await makeHarness({ existing: true, noChange: true });
+    process.env.TEST_GIT_FAIL_PUSH = "1";
+    harness.get
+      .mockResolvedValueOnce({
+        data: harness.pull,
+        headers: { etag: '"before"' },
+      })
+      .mockResolvedValueOnce({
+        data: mergePull(harness.pull, {
+          state: "closed",
+          closed_at: "2026-07-28T00:00:01Z",
+          ...changed,
+        }),
+        headers: { etag: '"close"' },
+      });
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /was not reopened/u,
+    );
+    expect(harness.update).toHaveBeenCalledTimes(1);
+  });
+});
+
+interface HarnessOptions {
+  existing?: boolean;
+  noChange?: boolean;
+  loseAfterPush?: boolean;
+  baseDriftAt?: number;
+  refLossAt?: number;
+}
+
+async function makeHarness(options: HarnessOptions = {}) {
+  const root = await mkdtemp(path.join(tmpdir(), "prek-update-race-"));
+  cleanups.push(root);
+  const workspace = path.join(root, "workspace");
+  const remote = path.join(root, "remote.git");
+  const bin = path.join(root, "bin");
+  const log = path.join(root, "git.log");
+  await exec("git", ["init", "-b", "main", workspace]);
+  await exec("git", ["-C", workspace, "config", "user.name", "Test"]);
+  await exec("git", [
+    "-C",
+    workspace,
+    "config",
+    "user.email",
+    "test@example.com",
+  ]);
+  await writeFile(path.join(workspace, "prek.toml"), "base\n");
+  await exec("git", ["-C", workspace, "add", "."]);
+  await exec("git", ["-C", workspace, "commit", "-m", "base"]);
+  const baseSha = (
+    await exec("git", ["-C", workspace, "rev-parse", "HEAD"])
+  ).stdout.trim();
+  await exec("git", ["init", "--bare", remote]);
+  await exec("git", ["-C", workspace, "push", remote, "main"]);
+  let oldSha = "";
+  if (options.existing) {
+    await exec("git", [
+      "-C",
+      workspace,
+      "branch",
+      "chore/prek-updates",
+      baseSha,
+    ]);
+    await exec("git", ["-C", workspace, "push", remote, "chore/prek-updates"]);
+    oldSha = baseSha;
+  }
+  await installGitProxy(bin);
+  process.env.PATH = `${bin}:${originalPath}`;
+  process.env.TEST_GIT_LOG = log;
+  process.env.TEST_GIT_REMOTE = remote;
+
+  const prek = path.join(root, "prek");
+  await writeFile(
+    prek,
+    options.noChange
+      ? "#!/bin/sh\nexit 0\n"
+      : "#!/bin/sh\nprintf 'updated\\n' > prek.toml\n",
+  );
+  await chmod(prek, 0o755);
+  installPrek.mockResolvedValue(prek);
+
+  const pull = ownedPull(oldSha);
+  const create = vi.fn();
+  let closedPull: ReturnType<typeof ownedPull> | undefined;
+  const update = vi.fn(
+    async ({
+      state,
+      body,
+      title,
+    }: {
+      state?: string;
+      body?: string;
+      title?: string;
+    }) => {
+      const data = mergePull(pull, {
+        state: state ?? pull.state,
+        body: body ?? pull.body,
+        title: title ?? pull.title,
+        head: {
+          ...pull.head,
+          sha: state === undefined ? await remoteSha(remote) : pull.head.sha,
+        },
+        updated_at:
+          state === "closed" ? "2026-07-28T00:00:01Z" : pull.updated_at,
+        closed_at: state === "closed" ? "2026-07-28T00:00:01Z" : pull.closed_at,
+      });
+      if (state === "closed") closedPull = data;
+      return { data, headers: { etag: '"close"' } };
+    },
+  );
+  let getCalls = 0;
+  const get = vi.fn(async () => {
+    getCalls += 1;
+    const currentSha = await remoteSha(remote);
+    const data =
+      closedPull ??
+      (options.loseAfterPush && getCalls > 1
+        ? mergePull(pull, {
+            labels: [],
+            head: { ...pull.head, sha: currentSha },
+          })
+        : mergePull(pull, { head: { ...pull.head, sha: currentSha } }));
+    return { data, headers: { etag: '"close"' } };
+  });
+  let baseChecks = 0;
+  let updateRefChecks = 0;
+  const getRef = vi.fn(async ({ ref }: { ref: string }) => {
+    if (ref === "heads/main") {
+      baseChecks += 1;
+      return {
+        data: {
+          object: {
+            sha:
+              baseChecks >= (options.baseDriftAt ?? Infinity)
+                ? "DRIFT"
+                : baseSha,
+          },
+        },
+      };
+    }
+    if (!options.existing) {
+      throw Object.assign(new Error("missing"), { status: 404 });
+    }
+    updateRefChecks += 1;
+    if (updateRefChecks >= (options.refLossAt ?? Infinity)) {
+      throw Object.assign(new Error("missing"), { status: 404 });
+    }
+    return { data: { object: { sha: await remoteSha(remote) } } };
+  });
+  const paginate = vi.fn(async () => (options.existing ? [pull] : []));
+  const addLabels = vi.fn();
+  const client = {
+    paginate,
+    rest: {
+      git: { getRef },
+      issues: { addLabels },
+      pulls: { create, get, list: vi.fn(), update },
+    },
+  } as unknown as GitHubClient;
+  const execution = {
+    client,
+    context: {
+      authenticatedLogin: "github-actions[bot]",
+      baseBranch: "main",
+      baseSha,
+      eventName: "schedule",
+      owner: "owner",
+      repository: "repo",
+      repositoryFullName: "owner/repo",
+      workspace,
+    },
+    inputs: {
+      addPaths: ["prek.toml"],
+      branchPrefix: "chore/prek-",
+      commitMessage: "update",
+      cooldownDays: "7",
+      label: "dependencies",
+      prTitle: "Update",
+      token: "token",
+      updateBranch: "chore/prek-updates",
+      updateDay: 1,
+    },
+  } satisfies ActionExecution;
+  return {
+    addLabels,
+    create,
+    execution,
+    get,
+    log,
+    oldSha,
+    paginate,
+    pull,
+    remote,
+    update,
+  };
+}
+
+async function installGitProxy(directory: string): Promise<void> {
+  await exec("mkdir", ["-p", directory]);
+  const realGit = (await exec("which", ["git"])).stdout.trim();
+  await writeFile(
+    path.join(directory, "git"),
+    `#!/bin/sh
+args=""
+for arg in "$@"; do
+  [ "$arg" = "https://github.com/owner/repo.git" ] && arg="$TEST_GIT_REMOTE"
+  args="$args '$arg'"
+done
+case " $* " in
+  *" push "*)
+    printf '%s\\n' "$*" >> "$TEST_GIT_LOG"
+    count=$(wc -l < "$TEST_GIT_LOG" | tr -d ' ')
+    [ "$count" = "$TEST_GIT_FAIL_PUSH" ] && exit 1
+    ;;
+esac
+eval exec ${JSON.stringify(realGit)} "$args"
+`,
+  );
+  await chmod(path.join(directory, "git"), 0o755);
+}
+
+async function pushes(log: string): Promise<string[]> {
+  try {
+    const value = await (
+      await import("node:fs/promises")
+    ).readFile(log, "utf8");
+    return value.trim().split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function remoteSha(remote: string): Promise<string> {
+  return (
+    await exec("git", [
+      "--git-dir",
+      remote,
+      "rev-parse",
+      "refs/heads/chore/prek-updates",
+    ])
+  ).stdout.trim();
+}
+
+function mergePull(
+  pull: ReturnType<typeof ownedPull>,
+  changed: Record<string, unknown>,
+): ReturnType<typeof ownedPull> {
+  return { ...pull, ...changed } as ReturnType<typeof ownedPull>;
+}
+
+function ownedPull(sha: string) {
+  return {
+    base: { ref: "main" },
+    body: BODY_MARKER,
+    closed_at: null,
+    head: { ref: "chore/prek-updates", repo: { full_name: "owner/repo" }, sha },
+    labels: [{ name: "dependencies" }],
+    number: 42,
+    state: "open",
+    title: "Update",
+    updated_at: "2026-07-28T00:00:01Z",
+    user: { login: "github-actions[bot]" },
+  };
+}
