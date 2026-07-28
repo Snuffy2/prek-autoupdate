@@ -46,6 +46,12 @@ class CleanupClient(Protocol):
     def get_pull(self, pull_number: int) -> dict[str, object]:
         """Get a pull request by number."""
 
+    def list_pull_files(self, pull_number: int) -> list[dict[str, object]]:
+        """List files changed by a pull request."""
+
+    def get_file_sha(self, *, path: str, ref: str) -> str | None:
+        """Return a file's blob SHA at a git ref."""
+
     def close_pull(self, pull_number: int) -> None:
         """Close a pull request by number."""
 
@@ -117,6 +123,58 @@ class GithubClient:
         if not isinstance(payload, dict):
             raise TypeError(f"Expected a pull request object from {url}")
         return payload
+
+    def list_pull_files(self, pull_number: int) -> list[dict[str, object]]:
+        """List files changed by a pull request.
+
+        Args:
+            pull_number: Pull request number to retrieve files for.
+
+        Returns:
+            Changed file objects from GitHub.
+
+        """
+        files: list[dict[str, object]] = []
+        url: str | None = (
+            f"{GITHUB_API_URL}/repos/{self.repository}/pulls/{pull_number}/files?per_page=100"
+        )
+        while url is not None:
+            payload, link_header = self._request("GET", url)
+            if not isinstance(payload, list):
+                raise TypeError(f"Expected pull request file list from {url}")
+            for file in payload:
+                if not isinstance(file, dict):
+                    raise TypeError(f"Expected pull request file object from {url}")
+                files.append(file)
+            url = _next_link(link_header)
+        return files
+
+    def get_file_sha(self, *, path: str, ref: str) -> str | None:
+        """Return a file's blob SHA at a git ref.
+
+        Args:
+            path: Repository-relative file path.
+            ref: Commit SHA or branch ref.
+
+        Returns:
+            Blob SHA, or None when the path does not exist at the ref.
+
+        """
+        safe_path = quote(path, safe="/")
+        safe_ref = quote(ref, safe="")
+        url = f"{GITHUB_API_URL}/repos/{self.repository}/contents/{safe_path}?ref={safe_ref}"
+        try:
+            payload, _ = self._request("GET", url)
+        except HTTPError as err:
+            if err.code == HTTP_NOT_FOUND:
+                return None
+            raise
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected a file object from {url}")
+        sha = payload.get("sha")
+        if not isinstance(sha, str):
+            raise TypeError(f"Expected a file blob SHA from {url}")
+        return sha
 
     def delete_ref(self, ref: str) -> None:
         """Delete a git ref if it exists.
@@ -214,7 +272,8 @@ def cleanup_update_branches(
         delete_stale_branches: Whether to delete stale workflow-owned branch refs.
         delete_merged_branches: Whether to delete branches from merged update PRs.
         keep_latest_open_pr: Whether to preserve the newest open workflow PR.
-        close_obsolete_prs: Whether to close workflow PRs with no changed files.
+        close_obsolete_prs: Whether to close workflow PRs with no changes unique to the
+            current base.
 
     Returns:
         Summary of cleanup actions.
@@ -311,7 +370,7 @@ def _close_obsolete_pull(
     branches_to_delete: set[str],
 ) -> bool:
     """Close an obsolete workflow pull request and queue its branch deletion."""
-    if not enabled or _pull_changed_files(client.get_pull(_pull_number(pull))) != 0:
+    if not enabled or not _pull_is_obsolete(client, pull):
         return False
 
     pull_number = _pull_number(pull)
@@ -324,6 +383,44 @@ def _close_obsolete_pull(
     ):
         branches_to_delete.add(_head_ref(pull))
     return True
+
+
+def _pull_is_obsolete(client: CleanupClient, pull: Mapping[str, object]) -> bool:
+    """Return whether a pull request has no changes unique to its current base."""
+    pull_number = _pull_number(pull)
+    details = client.get_pull(pull_number)
+    if _pull_changed_files(details) == 0:
+        return True
+
+    head_sha = _pull_head_sha(details)
+    base_ref = _pull_base_ref(details)
+    if head_sha is None or base_ref is None:
+        return False
+    base_sha = client.get_ref_sha(ref=f"heads/{base_ref}")
+    if base_sha is None:
+        return False
+
+    paths = _pull_file_paths(client.list_pull_files(pull_number))
+    return bool(paths) and all(
+        client.get_file_sha(path=path, ref=head_sha) == client.get_file_sha(path=path, ref=base_sha)
+        for path in paths
+    )
+
+
+def _pull_file_paths(files: Sequence[Mapping[str, object]]) -> set[str]:
+    """Return current and previous paths affected by pull request files."""
+    paths: set[str] = set()
+    for file in files:
+        filename = file.get("filename")
+        if not isinstance(filename, str):
+            raise TypeError("Pull request file is missing a filename")
+        paths.add(filename)
+        previous_filename = file.get("previous_filename")
+        if previous_filename is not None:
+            if not isinstance(previous_filename, str):
+                raise TypeError("Pull request file has an invalid previous filename")
+            paths.add(previous_filename)
+    return paths
 
 
 def _collect_protected_branches(
@@ -463,6 +560,15 @@ def _pull_head_sha(pull: Mapping[str, object]) -> str | None:
         return None
     sha = head.get("sha")
     return sha if isinstance(sha, str) else None
+
+
+def _pull_base_ref(pull: Mapping[str, object]) -> str | None:
+    """Return the pull request base branch ref."""
+    base = pull.get("base")
+    if not isinstance(base, dict):
+        return None
+    ref = base.get("ref")
+    return ref if isinstance(ref, str) else None
 
 
 def _is_branch_head_sha_match(

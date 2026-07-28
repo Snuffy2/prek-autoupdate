@@ -30,6 +30,8 @@ class FakeCleanupClient:
         open_pulls: list[dict[str, object]],
         closed_pulls: list[dict[str, object]],
         fail_on_close: bool = False,
+        file_shas: dict[tuple[str, str], str | None] | None = None,
+        pull_files: dict[int, list[dict[str, object]]] | None = None,
         ref_shas: dict[str, str | None] | None = None,
     ) -> None:
         """Initialize fake pull request state.
@@ -38,12 +40,16 @@ class FakeCleanupClient:
             open_pulls: Pull requests to return for open PR lookups.
             closed_pulls: Pull requests to return for closed PR lookups.
             fail_on_close: Whether closing a PR should fail the test.
+            file_shas: Optional fake ``(path, ref)`` -> blob SHA map.
+            pull_files: Optional fake PR number -> changed file objects map.
             ref_shas: Optional fake branch ref -> SHA map.
 
         """
         self.open_pulls = open_pulls
         self.closed_pulls = closed_pulls
         self.fail_on_close = fail_on_close
+        self.file_shas = {} if file_shas is None else file_shas
+        self.pull_files = {} if pull_files is None else pull_files
         self.ref_shas = {} if ref_shas is None else ref_shas
         self.closed_prs: list[int] = []
         self.deleted_refs: list[str] = []
@@ -66,6 +72,14 @@ class FakeCleanupClient:
         """Return fake pull request details."""
         return next(pull for pull in self.open_pulls if pull["number"] == pull_number)
 
+    def list_pull_files(self, pull_number: int) -> list[dict[str, object]]:
+        """Return fake changed files for a pull request."""
+        return self.pull_files.get(pull_number, [])
+
+    def get_file_sha(self, *, path: str, ref: str) -> str | None:
+        """Return a fake file blob SHA."""
+        return self.file_shas.get((path, ref))
+
     def delete_ref(self, ref: str) -> None:
         """Record a deleted git ref."""
         self.deleted_refs.append(ref)
@@ -84,6 +98,7 @@ def _workflow_pull(
     body: str = WORKFLOW_BODY_MARKER,
     repository: str = REPOSITORY,
     merged_at: str | None = None,
+    base_ref: str = "main",
     head_sha: str | None = "sha",
     changed_files: int | None = None,
 ) -> dict[str, object]:
@@ -92,6 +107,7 @@ def _workflow_pull(
         "number": number,
         "merged_at": merged_at,
         "body": body,
+        "base": {"ref": base_ref},
         "user": {"login": author},
         "head": {
             "ref": ref,
@@ -157,6 +173,12 @@ def test_cleanup_script_preserves_kept_pull_request_with_changes() -> None:
         open_pulls=[_workflow_pull(number=18, changed_files=1)],
         closed_pulls=[],
         fail_on_close=True,
+        pull_files={18: [{"filename": "prek.toml"}]},
+        ref_shas={"heads/main": "base-sha"},
+        file_shas={
+            ("prek.toml", "sha"): "head-blob",
+            ("prek.toml", "base-sha"): "base-blob",
+        },
     )
 
     result = _cleanup(
@@ -168,6 +190,80 @@ def test_cleanup_script_preserves_kept_pull_request_with_changes() -> None:
     assert client.deleted_refs == []
     assert result.closed_prs == []
     assert result.deleted_branches == []
+
+
+def test_cleanup_script_closes_pull_when_changed_file_matches_current_base() -> None:
+    """Push cleanup should close a PR whose patch is already present on the base."""
+    client = FakeCleanupClient(
+        open_pulls=[_workflow_pull(number=18, changed_files=1)],
+        closed_pulls=[],
+        pull_files={18: [{"filename": "prek.toml"}]},
+        ref_shas={"heads/main": "base-sha"},
+        file_shas={
+            ("prek.toml", "sha"): "shared-blob",
+            ("prek.toml", "base-sha"): "shared-blob",
+        },
+    )
+
+    result = _cleanup(
+        client,
+        keep_latest_open_pr=True,
+        close_obsolete_prs=True,
+    )
+
+    assert client.closed_prs == [18]
+    assert client.deleted_refs == [f"heads/{WORKFLOW_BRANCH}"]
+    assert result.closed_prs == [18]
+    assert result.deleted_branches == [WORKFLOW_BRANCH]
+
+
+def test_cleanup_script_closes_pull_when_rename_matches_current_base() -> None:
+    """Push cleanup should compare both paths from an already-applied rename."""
+    client = FakeCleanupClient(
+        open_pulls=[_workflow_pull(number=18, changed_files=1)],
+        closed_pulls=[],
+        pull_files={
+            18: [
+                {
+                    "filename": "prek.toml",
+                    "previous_filename": ".pre-commit-config.yaml",
+                }
+            ]
+        },
+        ref_shas={"heads/main": "base-sha"},
+        file_shas={
+            ("prek.toml", "sha"): "shared-blob",
+            ("prek.toml", "base-sha"): "shared-blob",
+        },
+    )
+
+    result = _cleanup(
+        client,
+        keep_latest_open_pr=True,
+        close_obsolete_prs=True,
+    )
+
+    assert client.closed_prs == [18]
+    assert result.closed_prs == [18]
+
+
+def test_cleanup_script_preserves_pull_when_current_base_cannot_be_resolved() -> None:
+    """Push cleanup should preserve a PR when its current base is unavailable."""
+    client = FakeCleanupClient(
+        open_pulls=[_workflow_pull(number=18, changed_files=1)],
+        closed_pulls=[],
+        fail_on_close=True,
+        ref_shas={"heads/main": None},
+    )
+
+    result = _cleanup(
+        client,
+        keep_latest_open_pr=True,
+        close_obsolete_prs=True,
+    )
+
+    assert client.closed_prs == []
+    assert result.closed_prs == []
 
 
 def test_cleanup_script_closes_stale_prs_and_deletes_workflow_branches() -> None:
@@ -443,6 +539,128 @@ def test_github_client_closes_and_gets_pull(
     ]
 
 
+def test_github_client_lists_pull_files_across_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub client should follow pagination when listing pull request files."""
+    calls: list[str] = []
+    next_url = "https://api.github.com/repositories/1/pulls/18/files?per_page=100&page=2"
+
+    def fake_request(method: str, url: str) -> tuple[object, str | None]:
+        """Return two fake pages of pull request files."""
+        assert method == "GET"
+        calls.append(url)
+        if len(calls) == 1:
+            return [{"filename": "prek.toml"}], f'<{next_url}>; rel="next"'
+        return [{"filename": "README.md"}], None
+
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    assert client.list_pull_files(18) == [
+        {"filename": "prek.toml"},
+        {"filename": "README.md"},
+    ]
+    assert calls == [
+        "https://api.github.com/repos/o/r/pulls/18/files?per_page=100",
+        next_url,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({}, "Expected pull request file list"),
+        ([None], "Expected pull request file object"),
+    ],
+)
+def test_github_client_rejects_invalid_pull_file_list(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: object,
+    message: str,
+) -> None:
+    """GitHub client should reject malformed pull files responses."""
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    monkeypatch.setattr(client, "_request", lambda *_args: (payload, None))
+
+    with pytest.raises(TypeError, match=message):
+        client.list_pull_files(18)
+
+
+def test_github_client_gets_file_sha_and_handles_missing_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub client should return blob SHAs and treat missing paths as absent."""
+    calls: list[str] = []
+
+    def fake_request(method: str, url: str) -> tuple[object, None]:
+        """Return a blob SHA or a GitHub missing-file response."""
+        assert method == "GET"
+        calls.append(url)
+        if "missing" in url:
+            raise HTTPError(
+                url=url,
+                code=404,
+                msg="Not Found",
+                hdrs=Message(),
+                fp=BytesIO(b'{"message": "Not Found"}'),
+            )
+        return {"sha": "blob-sha"}, None
+
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    assert client.get_file_sha(path="config/prek #1.toml", ref="head#1") == "blob-sha"
+    assert client.get_file_sha(path="missing.toml", ref="head#1") is None
+    assert calls == [
+        "https://api.github.com/repos/o/r/contents/config/prek%20%231.toml?ref=head%231",
+        "https://api.github.com/repos/o/r/contents/missing.toml?ref=head%231",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ([], "Expected a file object"),
+        ({"sha": None}, "Expected a file blob SHA"),
+    ],
+)
+def test_github_client_rejects_invalid_file_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: object,
+    message: str,
+) -> None:
+    """GitHub client should reject malformed file content responses."""
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    monkeypatch.setattr(client, "_request", lambda *_args: (payload, None))
+
+    with pytest.raises(TypeError, match=message):
+        client.get_file_sha(path="prek.toml", ref="sha")
+
+
+def test_github_client_propagates_non_missing_file_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub client should propagate file lookup errors other than 404."""
+    error = HTTPError(
+        url="https://api.github.com/repos/o/r/contents/prek.toml",
+        code=500,
+        msg="Server Error",
+        hdrs=Message(),
+        fp=BytesIO(b""),
+    )
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda *_args: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(HTTPError) as raised:
+        client.get_file_sha(path="prek.toml", ref="sha")
+    assert raised.value is error
+
+
 def test_github_client_rejects_invalid_pull_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -461,6 +679,50 @@ def test_pull_metadata_rejects_invalid_numeric_values() -> None:
 
     with pytest.raises(TypeError, match="valid changed file count"):
         cleanup._pull_changed_files({"changed_files": -1})
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        [{}],
+        [{"filename": "prek.toml", "previous_filename": 1}],
+    ],
+)
+def test_pull_file_paths_reject_invalid_names(
+    files: list[dict[str, object]],
+) -> None:
+    """Pull file path extraction should reject malformed API objects."""
+    with pytest.raises(TypeError, match="filename"):
+        cleanup._pull_file_paths(files)
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        _workflow_pull(number=18, head_sha=None, changed_files=1),
+        {**_workflow_pull(number=18, changed_files=1), "base": {}},
+        {**_workflow_pull(number=18, changed_files=1), "base": None},
+    ],
+)
+def test_pull_is_not_obsolete_without_comparison_refs(
+    details: dict[str, object],
+) -> None:
+    """Obsolete detection should preserve PRs without usable comparison refs."""
+    client = FakeCleanupClient(open_pulls=[details], closed_pulls=[])
+
+    assert not cleanup._pull_is_obsolete(client, details)
+
+
+def test_pull_is_not_obsolete_when_changed_file_list_is_empty() -> None:
+    """Obsolete detection should not infer equality from a missing file list."""
+    pull = _workflow_pull(number=18, changed_files=1)
+    client = FakeCleanupClient(
+        open_pulls=[pull],
+        closed_pulls=[],
+        ref_shas={"heads/main": "base-sha"},
+    )
+
+    assert not cleanup._pull_is_obsolete(client, pull)
 
 
 def test_main_logs_successful_cleanup(

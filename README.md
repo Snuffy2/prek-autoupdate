@@ -6,7 +6,8 @@ Reusable GitHub Actions workflow for opening and maintaining `prek auto-update` 
 
 - Runs `prek auto-update --cooldown-days <days>`.
 - Opens or updates one PR on `chore/prek-updates`.
-- Checks the existing update PR after pushes to `main`, closing it when it is no longer needed.
+- Checks the existing update PR after pushes to `main`, closing it when its changes are
+  already present on the current base.
 - Closes duplicate stale workflow-owned PRs.
 - Deletes stale and merged workflow-owned update branches.
 
@@ -35,7 +36,7 @@ jobs:
       update-day: "1"
 ```
 
-Keep the `push` trigger so changes landing on `main` check whether an existing workflow-owned update PR still changes any files. This covers upstream syncs and similar workflows that may make the PR unnecessary. Push runs do not call `prek auto-update`, create a PR, or update a still-needed PR; cleanup only closes a PR with no changed files and safely deletes its branch.
+Keep the `push` trigger so changes landing on `main` check whether an existing workflow-owned update PR still contributes unique file content. This covers upstream syncs and similar workflows that may make the PR unnecessary. Push runs do not call `prek auto-update`, create a PR, or update a still-needed PR; cleanup closes a PR only when GitHub reports no changed files or every path affected by the PR already matches the current base, then safely deletes its branch.
 
 Run the caller workflow daily so stale PR and branch cleanup happens every night. Scheduled runs only call `prek auto-update` on `update-day`, and manual runs always check for updates.
 This normal path does not need `actions: write`.

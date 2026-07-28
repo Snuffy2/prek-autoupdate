@@ -12,7 +12,7 @@ This repository maintains the reusable `prek` autoupdate workflow and its cleanu
 ## Source Of Truth Rules
 
 - Keep consuming-repo YAML examples thin: schedule plus `jobs.<job>.uses`.
-- Keep the caller example's `push` trigger for `main` aligned with the reusable workflow's cleanup-only reconciliation path. Pushes must not run `prek auto-update`, create a PR, or update a still-needed PR; cleanup may close only a workflow-owned PR whose current detail reports zero changed files.
+- Keep the caller example's `push` trigger for `main` aligned with the reusable workflow's cleanup-only reconciliation path. Pushes must not run `prek auto-update`, create a PR, or update a still-needed PR; cleanup may close only a workflow-owned PR whose current detail reports zero changed files or whose affected paths are proven identical at the PR head and current base.
 - Do not copy the cleanup script back into downstream repos. Fix it here and update callers to use this repo.
 - Treat `.github/workflows/prek_autoupdate.yml` and `README.md` as a public API. Renaming inputs or changing defaults requires docs in the same change.
 - Do not request `actions: write`; no active workflow path needs it.
