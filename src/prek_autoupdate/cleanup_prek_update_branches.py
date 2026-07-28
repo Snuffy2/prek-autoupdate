@@ -28,7 +28,7 @@ class CleanupResult:
     """Result of cleaning workflow-owned pull requests and branches.
 
     Attributes:
-        closed_prs: Pull request numbers closed as stale.
+        closed_prs: Pull request numbers closed during cleanup.
         deleted_branches: Branch names deleted from the repository.
 
     """
@@ -42,6 +42,9 @@ class CleanupClient(Protocol):
 
     def list_pulls(self, *, state: str) -> list[dict[str, object]]:
         """List pull requests by state."""
+
+    def get_pull(self, pull_number: int) -> dict[str, object]:
+        """Get a pull request by number."""
 
     def close_pull(self, pull_number: int) -> None:
         """Close a pull request by number."""
@@ -98,6 +101,22 @@ class GithubClient:
         """
         url = f"{GITHUB_API_URL}/repos/{self.repository}/pulls/{pull_number}"
         self._request("PATCH", url, payload={"state": "closed"})
+
+    def get_pull(self, pull_number: int) -> dict[str, object]:
+        """Get a pull request.
+
+        Args:
+            pull_number: Pull request number to retrieve.
+
+        Returns:
+            Pull request object from GitHub.
+
+        """
+        url = f"{GITHUB_API_URL}/repos/{self.repository}/pulls/{pull_number}"
+        payload, _ = self._request("GET", url)
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected a pull request object from {url}")
+        return payload
 
     def delete_ref(self, ref: str) -> None:
         """Delete a git ref if it exists.
@@ -178,8 +197,9 @@ def cleanup_update_branches(
     delete_merged_branches: bool,
     delete_stale_branches: bool = False,
     keep_latest_open_pr: bool = False,
+    close_obsolete_prs: bool = False,
 ) -> CleanupResult:
-    """Clean workflow-owned stale pull requests and branches.
+    """Clean workflow-owned stale or obsolete pull requests and branches.
 
     Args:
         client: GitHub client with list, close, and delete methods.
@@ -194,6 +214,7 @@ def cleanup_update_branches(
         delete_stale_branches: Whether to delete stale workflow-owned branch refs.
         delete_merged_branches: Whether to delete branches from merged update PRs.
         keep_latest_open_pr: Whether to preserve the newest open workflow PR.
+        close_obsolete_prs: Whether to close workflow PRs with no changed files.
 
     Returns:
         Summary of cleanup actions.
@@ -225,6 +246,16 @@ def cleanup_update_branches(
     for pull in workflow_open_pulls:
         pull_number = _pull_number(pull)
         head_ref = _head_ref(pull)
+
+        if _close_obsolete_pull(
+            client=client,
+            pull=pull,
+            repository=repository,
+            enabled=close_obsolete_prs,
+            result=result,
+            branches_to_delete=branches_to_delete,
+        ):
+            continue
 
         if pull_number in {keep_pr_number, latest_open_pr_number}:
             protected_branches.add(head_ref)
@@ -268,6 +299,31 @@ def cleanup_update_branches(
         result.deleted_branches.append(branch_name)
 
     return result
+
+
+def _close_obsolete_pull(
+    *,
+    client: CleanupClient,
+    pull: Mapping[str, object],
+    repository: str,
+    enabled: bool,
+    result: CleanupResult,
+    branches_to_delete: set[str],
+) -> bool:
+    """Close an obsolete workflow pull request and queue its branch deletion."""
+    if not enabled or _pull_changed_files(client.get_pull(_pull_number(pull))) != 0:
+        return False
+
+    pull_number = _pull_number(pull)
+    client.close_pull(pull_number)
+    result.closed_prs.append(pull_number)
+    if _is_branch_head_sha_match(
+        client=client,
+        pull=pull,
+        repository=repository,
+    ):
+        branches_to_delete.add(_head_ref(pull))
+    return True
 
 
 def _collect_protected_branches(
@@ -444,6 +500,14 @@ def _pull_number(pull: Mapping[str, object]) -> int:
     raise TypeError("Pull request is missing a numeric number")
 
 
+def _pull_changed_files(pull: Mapping[str, object]) -> int:
+    """Return the pull request's changed file count."""
+    changed_files = pull.get("changed_files")
+    if type(changed_files) is not int or changed_files < 0:
+        raise TypeError("Pull request is missing a valid changed file count")
+    return changed_files
+
+
 def _github_headers(token: str) -> dict[str, str]:
     """Build GitHub API request headers.
 
@@ -525,6 +589,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--keep-pr-number", type=int)
     parser.add_argument("--keep-latest-open-pr", action="store_true")
     parser.add_argument("--close-stale-prs", action="store_true")
+    parser.add_argument("--close-obsolete-prs", action="store_true")
     parser.add_argument("--delete-stale-branches", action="store_true")
     parser.add_argument("--delete-merged-branches", action="store_true")
     return parser.parse_args(argv)
@@ -560,6 +625,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             keep_pr_number=args.keep_pr_number,
             keep_latest_open_pr=args.keep_latest_open_pr,
             close_stale_prs=args.close_stale_prs,
+            close_obsolete_prs=args.close_obsolete_prs,
             delete_stale_branches=args.delete_stale_branches,
             delete_merged_branches=args.delete_merged_branches,
         )
@@ -571,7 +637,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             err,
         )
         return 1
-    LOGGER.info("Closed stale PRs: %s", result.closed_prs or "none")
+    LOGGER.info("Closed PRs: %s", result.closed_prs or "none")
     LOGGER.info("Deleted branches: %s", result.deleted_branches or "none")
     return 0
 
