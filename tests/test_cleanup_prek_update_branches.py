@@ -5,11 +5,15 @@ from __future__ import annotations
 import base64
 import hmac
 import subprocess
+from typing import TYPE_CHECKING
 from urllib.error import URLError
 
 import pytest
 
 import prek_autoupdate.cleanup_prek_update_branches as cleanup
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 WORKFLOW_BRANCH = "chore/prek-updates"
 WORKFLOW_LABEL = "dependencies"
@@ -102,13 +106,16 @@ class FakeCleanupClient:
             return None
         return {path: entries.get(path) for path in paths}
 
-    def delete_ref(self, ref: str, *, expected_sha: str) -> bool:
+    def delete_ref(self, ref: str, *, expected_sha: str) -> cleanup.DeleteRefOutcome:
         """Record a lease-guarded deleted git ref."""
-        if self.get_ref_sha(ref=ref) != expected_sha:
-            return False
+        current_sha = self.get_ref_sha(ref=ref)
+        if current_sha is None:
+            return cleanup.DeleteRefOutcome.ALREADY_ABSENT
+        if current_sha != expected_sha:
+            return cleanup.DeleteRefOutcome.LEASE_REJECTED
         self.deleted_refs.append(ref)
         self.ref_shas[ref] = None
-        return True
+        return cleanup.DeleteRefOutcome.DELETED
 
     def get_ref_sha(self, *, ref: str) -> str | None:
         """Return a fake branch SHA."""
@@ -496,6 +503,56 @@ def test_cleanup_script_compensates_post_close_validation_error() -> None:
     assert client.deleted_refs == []
 
 
+def test_cleanup_script_compensates_ambiguous_close_timeout() -> None:
+    """A close timeout should attempt reopen before propagating."""
+    pull = _workflow_pull(number=18, changed_files=0)
+
+    class TimedOutCloseClient(FakeCleanupClient):
+        """Fake client whose close times out after recording the mutation."""
+
+        def close_pull(self, pull_number: int) -> None:
+            """Record the possibly completed close and time out."""
+            super().close_pull(pull_number)
+            raise TimeoutError("close timed out")
+
+    client = TimedOutCloseClient(open_pulls=[pull], closed_pulls=[])
+
+    with pytest.raises(TimeoutError, match="close timed out"):
+        _cleanup(client, close_obsolete_prs=True)
+
+    assert client.reopened_prs == [18]
+    assert client.deleted_refs == []
+
+
+def test_cleanup_script_compensates_post_close_validation_timeout() -> None:
+    """A post-close timeout should reopen before propagating."""
+    pull = _workflow_pull(number=18, changed_files=0)
+
+    class TimedOutPostCloseClient(FakeCleanupClient):
+        """Fake client whose post-close pull refresh times out."""
+
+        closed = False
+
+        def close_pull(self, pull_number: int) -> None:
+            """Record the close before enabling the timeout."""
+            super().close_pull(pull_number)
+            self.closed = True
+
+        def get_pull(self, pull_number: int) -> dict[str, object]:
+            """Time out after the close mutation."""
+            if self.closed:
+                raise TimeoutError("validation timed out")
+            return super().get_pull(pull_number)
+
+    client = TimedOutPostCloseClient(open_pulls=[pull], closed_pulls=[])
+
+    with pytest.raises(TimeoutError, match="validation timed out"):
+        _cleanup(client, close_obsolete_prs=True)
+
+    assert client.reopened_prs == [18]
+    assert client.deleted_refs == []
+
+
 def test_cleanup_script_compensates_final_ref_lookup_error() -> None:
     """A final ref lookup error should reopen before propagating."""
     pull = _workflow_pull(number=18, changed_files=0)
@@ -522,6 +579,54 @@ def test_cleanup_script_compensates_final_ref_lookup_error() -> None:
     assert client.deleted_refs == []
 
 
+def test_cleanup_script_compensates_final_ref_lookup_timeout() -> None:
+    """A final ref timeout should reopen before propagating."""
+    pull = _workflow_pull(number=18, changed_files=0)
+
+    class TimedOutFinalLookupClient(FakeCleanupClient):
+        """Fake client whose final expected-SHA lookup times out."""
+
+        head_ref_calls = 0
+
+        def get_ref_sha(self, *, ref: str) -> str | None:
+            """Time out on the second head lookup."""
+            if ref == f"heads/{WORKFLOW_BRANCH}":
+                self.head_ref_calls += 1
+                if self.head_ref_calls > 1:
+                    raise TimeoutError("final lookup timed out")
+            return super().get_ref_sha(ref=ref)
+
+    client = TimedOutFinalLookupClient(open_pulls=[pull], closed_pulls=[])
+
+    with pytest.raises(TimeoutError, match="final lookup timed out"):
+        _cleanup(client, close_obsolete_prs=True)
+
+    assert client.reopened_prs == [18]
+    assert client.deleted_refs == []
+
+
+def test_cleanup_script_compensates_delete_timeout() -> None:
+    """A deletion timeout should reopen the just-closed pull and propagate."""
+    pull = _workflow_pull(number=18, changed_files=0)
+
+    class TimedOutDeleteClient(FakeCleanupClient):
+        """Fake client whose branch deletion times out."""
+
+        def delete_ref(self, ref: str, *, expected_sha: str) -> cleanup.DeleteRefOutcome:
+            """Time out while deleting the expected workflow branch."""
+            assert ref == f"heads/{WORKFLOW_BRANCH}"
+            assert expected_sha == "sha"
+            raise TimeoutError("delete timed out")
+
+    client = TimedOutDeleteClient(open_pulls=[pull], closed_pulls=[])
+
+    with pytest.raises(TimeoutError, match="delete timed out"):
+        _cleanup(client, close_obsolete_prs=True)
+
+    assert client.reopened_prs == [18]
+    assert client.deleted_refs == []
+
+
 def test_cleanup_script_does_not_claim_rejected_lease_deletion() -> None:
     """A lease rejection should not be reported as a deleted branch."""
     pull = _workflow_pull(number=7, merged_at="2026-05-28T00:00:00Z")
@@ -529,11 +634,11 @@ def test_cleanup_script_does_not_claim_rejected_lease_deletion() -> None:
     class RejectedLeaseClient(FakeCleanupClient):
         """Fake client whose atomic deletion lease is rejected."""
 
-        def delete_ref(self, ref: str, *, expected_sha: str) -> bool:
+        def delete_ref(self, ref: str, *, expected_sha: str) -> cleanup.DeleteRefOutcome:
             """Report a rejected lease without recording deletion."""
             assert ref == f"heads/{WORKFLOW_BRANCH}"
             assert expected_sha == "sha"
-            return False
+            return cleanup.DeleteRefOutcome.LEASE_REJECTED
 
     client = RejectedLeaseClient(open_pulls=[], closed_pulls=[pull])
 
@@ -1099,6 +1204,13 @@ def test_pull_metadata_rejects_invalid_numeric_values() -> None:
         cleanup._pull_changed_files({"changed_files": -1})
 
 
+@pytest.mark.parametrize("pull", [{"head": None}, {"head": {}}])
+def test_head_ref_rejects_malformed_heads(pull: dict[str, object]) -> None:
+    """Pull head extraction should reject malformed API objects."""
+    with pytest.raises(TypeError, match="missing a head ref"):
+        cleanup._head_ref(pull)
+
+
 @pytest.mark.parametrize(
     "files",
     [
@@ -1325,27 +1437,35 @@ def test_main_returns_failure_for_github_request_errors(
 
 def test_github_client_deletes_ref_with_atomic_push_lease(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    """Delete calls should use an expected-SHA lease without exposing the token."""
+    """Lease deletion should target the consumer repo without relying on a checkout."""
     calls: list[tuple[list[str], dict[str, str]]] = []
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         """Record the lease-guarded git invocation."""
         environment = kwargs["env"]
         assert isinstance(environment, dict)
+        assert kwargs["timeout"] == cleanup.GIT_PUSH_TIMEOUT_SECONDS
         calls.append((command, environment))
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr("prek_autoupdate.cleanup_prek_update_branches.subprocess.run", fake_run)
     client = cleanup.GithubClient(repository=REPOSITORY, token="secret-token")
+    workflow_root = tmp_path / "workflow-root"
+    workflow_root.mkdir()
+    monkeypatch.chdir(workflow_root)
 
-    assert client.delete_ref("heads/feature#1", expected_sha="expected-sha")
+    assert (
+        client.delete_ref("heads/feature#1", expected_sha="expected-sha")
+        is cleanup.DeleteRefOutcome.DELETED
+    )
 
     command, environment = calls[0]
     assert command == [
         "git",
         "push",
-        "origin",
+        "https://github.com/o/r.git",
         "--force-with-lease=refs/heads/feature#1:expected-sha",
         ":refs/heads/feature#1",
     ]
@@ -1353,6 +1473,7 @@ def test_github_client_deletes_ref_with_atomic_push_lease(
     encoded_credential = base64.b64encode(b"x-access-token:secret-token").decode()
     assert encoded_credential not in " ".join(command)
     assert environment["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
     header = environment["GIT_CONFIG_VALUE_0"]
     prefix = "AUTHORIZATION: basic "
     assert hmac.compare_digest(header[: len(prefix)], prefix)
@@ -1373,4 +1494,43 @@ def test_github_client_reports_rejected_delete_lease(
     client = cleanup.GithubClient(repository=REPOSITORY, token="token")
     monkeypatch.setattr(client, "get_ref_sha", lambda **_kwargs: "moved-sha")
 
-    assert not client.delete_ref("heads/feature", expected_sha="expected-sha")
+    assert (
+        client.delete_ref("heads/feature", expected_sha="expected-sha")
+        is cleanup.DeleteRefOutcome.LEASE_REJECTED
+    )
+
+
+def test_github_client_reports_absent_ref_after_push_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timeout followed by a missing ref should be idempotent success."""
+
+    def time_out(*_args: object, **_kwargs: object) -> None:
+        """Raise a bounded git push timeout."""
+        raise subprocess.TimeoutExpired(["git", "push"], 30)
+
+    monkeypatch.setattr("prek_autoupdate.cleanup_prek_update_branches.subprocess.run", time_out)
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    monkeypatch.setattr(client, "get_ref_sha", lambda **_kwargs: None)
+
+    assert (
+        client.delete_ref("heads/feature", expected_sha="expected-sha")
+        is cleanup.DeleteRefOutcome.ALREADY_ABSENT
+    )
+
+
+def test_github_client_propagates_push_timeout_when_ref_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An uncertain timeout should propagate while the expected ref remains."""
+
+    def time_out(*_args: object, **_kwargs: object) -> None:
+        """Raise a bounded git push timeout."""
+        raise subprocess.TimeoutExpired(["git", "push"], 30)
+
+    monkeypatch.setattr("prek_autoupdate.cleanup_prek_update_branches.subprocess.run", time_out)
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    monkeypatch.setattr(client, "get_ref_sha", lambda **_kwargs: "expected-sha")
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        client.delete_ref("heads/feature", expected_sha="expected-sha")

@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
 GITHUB_API_URL = "https://api.github.com"
 HTTP_NO_CONTENT = 204
 HTTP_NOT_FOUND = 404
+GIT_PUSH_TIMEOUT_SECONDS = 30
 LOGGER = logging.getLogger(__name__)
 
 
@@ -57,6 +59,14 @@ class BranchDeletion:
     reopen_prs: frozenset[int] = frozenset()
 
 
+class DeleteRefOutcome(Enum):
+    """Outcome of an atomic ref deletion attempt."""
+
+    DELETED = auto()
+    ALREADY_ABSENT = auto()
+    LEASE_REJECTED = auto()
+
+
 class CleanupClient(Protocol):
     """GitHub operations needed by the cleanup routine."""
 
@@ -80,7 +90,7 @@ class CleanupClient(Protocol):
     def reopen_pull(self, pull_number: int) -> None:
         """Reopen a pull request by number."""
 
-    def delete_ref(self, ref: str, *, expected_sha: str) -> bool:
+    def delete_ref(self, ref: str, *, expected_sha: str) -> DeleteRefOutcome:
         """Delete a git ref only when it still has the expected SHA."""
 
     def get_ref_sha(self, *, ref: str) -> str | None:
@@ -227,7 +237,7 @@ class GithubClient:
             entries[path] = (mode, entry_type, sha)
         return entries
 
-    def delete_ref(self, ref: str, *, expected_sha: str) -> bool:
+    def delete_ref(self, ref: str, *, expected_sha: str) -> DeleteRefOutcome:
         """Atomically delete a git ref when it still has the expected SHA.
 
         Args:
@@ -235,7 +245,7 @@ class GithubClient:
             expected_sha: SHA required by the force-with-lease deletion.
 
         Returns:
-            True when the ref was deleted, or False when it moved or was absent.
+            Explicit deletion, already-absent, or rejected-lease outcome.
 
         """
         full_ref = f"refs/{ref}"
@@ -246,26 +256,40 @@ class GithubClient:
                 "GIT_CONFIG_COUNT": "1",
                 "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
                 "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic_credential}",
+                "GIT_TERMINAL_PROMPT": "0",
             }
         )
+        remote_url = f"https://github.com/{self.repository}.git"
         command = [
             "git",
             "push",
-            "origin",
+            remote_url,
             f"--force-with-lease={full_ref}:{expected_sha}",
             f":{full_ref}",
         ]
-        completed = subprocess.run(  # noqa: S603 - arguments are a fixed git invocation
-            command,
-            check=False,
-            capture_output=True,
-            env=environment,
-            text=True,
-        )
+        try:
+            completed = subprocess.run(  # noqa: S603 - fixed git with validated repo/ref
+                command,
+                check=False,
+                capture_output=True,
+                env=environment,
+                text=True,
+                timeout=GIT_PUSH_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            current_sha = self.get_ref_sha(ref=ref)
+            if current_sha is None:
+                return DeleteRefOutcome.ALREADY_ABSENT
+            if current_sha != expected_sha:
+                return DeleteRefOutcome.LEASE_REJECTED
+            raise
         if completed.returncode == 0:
-            return True
-        if self.get_ref_sha(ref=ref) != expected_sha:
-            return False
+            return DeleteRefOutcome.DELETED
+        current_sha = self.get_ref_sha(ref=ref)
+        if current_sha is None:
+            return DeleteRefOutcome.ALREADY_ABSENT
+        if current_sha != expected_sha:
+            return DeleteRefOutcome.LEASE_REJECTED
         raise subprocess.CalledProcessError(
             completed.returncode,
             command,
@@ -515,7 +539,7 @@ def _delete_queued_branches(
         deletion = branches_to_delete[branch_name]
         try:
             current_sha = client.get_ref_sha(ref=f"heads/{branch_name}")
-        except HTTPError, URLError, TypeError:
+        except HTTPError, URLError, TimeoutError, TypeError:
             _reopen_and_protect(
                 client=client,
                 pull_numbers=deletion.reopen_prs,
@@ -533,9 +557,20 @@ def _delete_queued_branches(
                 result=result,
             )
             continue
-        if client.delete_ref(f"heads/{branch_name}", expected_sha=deletion.expected_sha):
+        try:
+            outcome = client.delete_ref(f"heads/{branch_name}", expected_sha=deletion.expected_sha)
+        except HTTPError, URLError, TimeoutError, TypeError, subprocess.SubprocessError:
+            _reopen_and_protect(
+                client=client,
+                pull_numbers=deletion.reopen_prs,
+                branch_name=branch_name,
+                protected_branches=protected_branches,
+                result=result,
+            )
+            raise
+        if outcome is DeleteRefOutcome.DELETED:
             result.deleted_branches.append(branch_name)
-        else:
+        elif outcome is DeleteRefOutcome.LEASE_REJECTED:
             _reopen_and_protect(
                 client=client,
                 pull_numbers=deletion.reopen_prs,
@@ -561,7 +596,12 @@ def _close_obsolete_pull(
         return False
 
     pull_number = _pull_number(pull)
-    client.close_pull(pull_number)
+    try:
+        client.close_pull(pull_number)
+    except HTTPError, URLError, TimeoutError:
+        client.reopen_pull(pull_number)
+        protected_branches.add(snapshot.head_ref)
+        raise
     try:
         snapshot_matches = _pull_matches_snapshot(
             client, pull_number, snapshot, required_state="closed"
@@ -570,7 +610,7 @@ def _close_obsolete_pull(
             _same_repo_head_ref(pull, repository=repository) == snapshot.head_ref
             and client.get_ref_sha(ref=f"heads/{snapshot.head_ref}") == snapshot.head_sha
         )
-    except HTTPError, URLError, TypeError:
+    except HTTPError, URLError, TimeoutError, TypeError:
         client.reopen_pull(pull_number)
         protected_branches.add(snapshot.head_ref)
         raise
