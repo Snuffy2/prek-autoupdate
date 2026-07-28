@@ -230,12 +230,10 @@ class GithubClient:
         if not isinstance(payload, dict):
             raise TypeError(f"Expected comparison object from {url}")
         base_commit = payload.get("base_commit")
-        if base_commit is not None and (
-            not isinstance(base_commit, dict) or base_commit.get("sha") != base_sha
-        ):
+        if not isinstance(base_commit, dict) or base_commit.get("sha") != base_sha:
             raise TypeError(f"Expected comparison base SHA from {url}")
         commits = payload.get("commits")
-        if commits is not None and (
+        if (
             not isinstance(commits, list)
             or not commits
             or not isinstance(commits[-1], dict)
@@ -266,7 +264,10 @@ class GithubClient:
         payload, _ = self._request("GET", url)
         if not isinstance(payload, dict):
             raise TypeError(f"Expected a Git tree object from {url}")
-        if payload.get("truncated") is True:
+        truncated = payload.get("truncated")
+        if not isinstance(truncated, bool):
+            raise TypeError(f"Expected a Git tree truncated flag from {url}")
+        if truncated:
             return None
         tree = payload.get("tree")
         if not isinstance(tree, list):

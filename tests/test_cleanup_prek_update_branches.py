@@ -124,7 +124,7 @@ class FakeCleanupClient:
         self, *, paths: set[str], ref: str
     ) -> dict[str, tuple[str, str, str] | None] | None:
         """Return fake Git tree entries."""
-        self.tree_requests.append((paths, ref))
+        self.tree_requests.append((set(paths), ref))
         entries = self.tree_entries.get(ref, {})
         if entries is None:
             return None
@@ -1656,14 +1656,41 @@ def test_github_client_gets_files_from_immutable_comparison(
     ("payload", "message"),
     [
         ([], "Expected comparison object"),
-        ({}, "Expected comparison file list"),
-        ({"files": [None]}, "Expected comparison file list"),
+        ({}, "Expected comparison base SHA"),
         (
-            {"base_commit": {"sha": "wrong"}, "files": []},
+            {"base_commit": {"sha": "base-sha"}, "files": []},
+            "Expected comparison head SHA",
+        ),
+        (
+            {
+                "base_commit": {"sha": "base-sha"},
+                "commits": [],
+                "files": [],
+            },
+            "Expected comparison head SHA",
+        ),
+        (
+            {
+                "base_commit": {"sha": "base-sha"},
+                "commits": [{"sha": "head-sha"}],
+                "files": [None],
+            },
+            "Expected comparison file list",
+        ),
+        (
+            {
+                "base_commit": {"sha": "wrong"},
+                "commits": [{"sha": "head-sha"}],
+                "files": [],
+            },
             "Expected comparison base SHA",
         ),
         (
-            {"commits": [{"sha": "wrong"}], "files": []},
+            {
+                "base_commit": {"sha": "base-sha"},
+                "commits": [{"sha": "wrong"}],
+                "files": [],
+            },
             "Expected comparison head SHA",
         ),
     ],
@@ -1725,10 +1752,15 @@ def test_github_client_gets_tree_entry_identities(
     ("payload", "message"),
     [
         ([], "Expected a Git tree object"),
-        ({}, "Expected a Git tree list"),
-        ({"tree": [None]}, "Expected a Git tree entry"),
+        ({}, "Expected a Git tree truncated flag"),
+        ({"truncated": None, "tree": []}, "Expected a Git tree truncated flag"),
+        ({"truncated": False}, "Expected a Git tree list"),
+        ({"truncated": False, "tree": [None]}, "Expected a Git tree entry"),
         (
-            {"tree": [{"path": "prek.toml", "mode": "100644", "type": "blob"}]},
+            {
+                "truncated": False,
+                "tree": [{"path": "prek.toml", "mode": "100644", "type": "blob"}],
+            },
             "Expected a complete Git tree entry",
         ),
     ],
@@ -2172,6 +2204,7 @@ def test_github_client_deletes_ref_with_atomic_push_lease(
     assert "secret-token" not in " ".join(command)
     encoded_credential = base64.b64encode(b"x-access-token:secret-token").decode()
     assert encoded_credential not in " ".join(command)
+    assert environment["GIT_CONFIG_COUNT"] == "1"
     assert environment["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
     assert environment["GIT_TERMINAL_PROMPT"] == "0"
     assert environment["UNRELATED_ENV"] == "preserved"
