@@ -341,6 +341,71 @@ def test_cleanup_script_protects_compensated_branch_from_closed_listing() -> Non
     assert result.deleted_branches == []
 
 
+def test_cleanup_script_reopens_when_head_moves_after_post_close_snapshot() -> None:
+    """A moved head should compensate even when a closed listing advertises it."""
+    pull = _workflow_pull(number=18, changed_files=0)
+    moved = _workflow_pull(number=18, head_sha="new-sha")
+
+    class MovingHeadAfterSnapshotClient(FakeCleanupClient):
+        """Fake client whose branch moves before the immediate head check."""
+
+        def get_ref_sha(self, *, ref: str) -> str | None:
+            """Return the moved SHA for the PR head branch."""
+            if ref == f"heads/{WORKFLOW_BRANCH}":
+                return "new-sha"
+            return super().get_ref_sha(ref=ref)
+
+    client = MovingHeadAfterSnapshotClient(
+        open_pulls=[pull],
+        closed_pulls=[moved],
+    )
+
+    result = _cleanup(
+        client,
+        keep_latest_open_pr=True,
+        close_obsolete_prs=True,
+        delete_stale_branches=True,
+    )
+
+    assert client.reopened_prs == [18]
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+    assert result.deleted_branches == []
+
+
+def test_cleanup_script_reopens_when_head_moves_before_final_delete() -> None:
+    """Final deletion should compensate when a just-closed pull head advances."""
+    pull = _workflow_pull(number=18, changed_files=0)
+
+    class MovingHeadBeforeDeleteClient(FakeCleanupClient):
+        """Fake client whose branch moves after its immediate validation."""
+
+        head_ref_calls = 0
+
+        def get_ref_sha(self, *, ref: str) -> str | None:
+            """Move the head on the final pre-delete lookup."""
+            if ref == f"heads/{WORKFLOW_BRANCH}":
+                self.head_ref_calls += 1
+                return "sha" if self.head_ref_calls == 1 else "new-sha"
+            return super().get_ref_sha(ref=ref)
+
+    client = MovingHeadBeforeDeleteClient(
+        open_pulls=[pull],
+        closed_pulls=[],
+    )
+
+    result = _cleanup(
+        client,
+        keep_latest_open_pr=True,
+        close_obsolete_prs=True,
+    )
+
+    assert client.reopened_prs == [18]
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+    assert result.deleted_branches == []
+
+
 def test_cleanup_script_propagates_reopen_failure_after_revision_moves() -> None:
     """Cleanup should expose a failed compensation instead of claiming success."""
     pull = _workflow_pull(number=18, changed_files=0)
@@ -706,6 +771,31 @@ def test_github_client_closes_reopens_and_gets_pull(
             {"state": "open"},
         ),
         ("GET", "https://api.github.com/repos/o/r/pulls/18", None),
+    ]
+
+
+def test_github_client_lists_pulls_across_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub client should paginate pulls and ignore malformed list items."""
+    calls: list[str] = []
+    next_url = "https://api.github.com/repositories/1/pulls?state=open&page=2"
+
+    def fake_request(method: str, url: str) -> tuple[object, str | None]:
+        """Return two fake pages of pull requests."""
+        assert method == "GET"
+        calls.append(url)
+        if len(calls) == 1:
+            return [{"number": 1}, None], f'<{next_url}>; rel="next"'
+        return [{"number": 2}], None
+
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    assert client.list_pulls(state="open") == [{"number": 1}, {"number": 2}]
+    assert calls == [
+        "https://api.github.com/repos/o/r/pulls?state=open&per_page=100",
+        next_url,
     ]
 
 

@@ -42,9 +42,18 @@ class PullComparisonSnapshot:
     """Pull request revisions used to decide that a pull is obsolete."""
 
     head_sha: str
+    head_ref: str
     base_ref: str
     base_sha: str
     changed_files: int
+
+
+@dataclass(frozen=True)
+class BranchDeletion:
+    """A branch deletion bound to an expected revision."""
+
+    expected_sha: str
+    reopen_pr: int | None = None
 
 
 class CleanupClient(Protocol):
@@ -338,7 +347,7 @@ def cleanup_update_branches(
         repository=repository,
         branch_prefix=branch_prefix,
     )
-    branches_to_delete: set[str] = set()
+    branches_to_delete: dict[str, BranchDeletion] = {}
 
     latest_open_pr_number = (
         max(workflow_open_pull_numbers, default=None) if keep_latest_open_pr else None
@@ -368,12 +377,10 @@ def cleanup_update_branches(
 
         client.close_pull(pull_number)
         result.closed_prs.append(pull_number)
-        if _is_branch_head_sha_match(
-            client=client,
-            pull=pull,
-            repository=repository,
-        ):
-            branches_to_delete.add(head_ref)
+        if (
+            head_sha := _matching_branch_head_sha(client=client, pull=pull, repository=repository)
+        ) is not None:
+            branches_to_delete.setdefault(head_ref, BranchDeletion(head_sha))
 
     if delete_stale_branches or delete_merged_branches:
         for pull in _workflow_pulls(
@@ -387,19 +394,47 @@ def cleanup_update_branches(
         ):
             is_stale = pull.get("merged_at") is None
             should_delete = delete_stale_branches if is_stale else delete_merged_branches
-            if should_delete and _is_branch_head_sha_match(
-                client=client,
-                pull=pull,
-                repository=repository,
+            if (
+                should_delete
+                and (
+                    head_sha := _matching_branch_head_sha(
+                        client=client, pull=pull, repository=repository
+                    )
+                )
+                is not None
             ):
-                branches_to_delete.add(_head_ref(pull))
+                branches_to_delete.setdefault(_head_ref(pull), BranchDeletion(head_sha))
 
-    branches_to_delete -= protected_branches
-    for branch_name in sorted(branches_to_delete):
-        client.delete_ref(f"heads/{branch_name}")
-        result.deleted_branches.append(branch_name)
+    _delete_queued_branches(
+        client=client,
+        branches_to_delete=branches_to_delete,
+        protected_branches=protected_branches,
+        result=result,
+    )
 
     return result
+
+
+def _delete_queued_branches(
+    *,
+    client: CleanupClient,
+    branches_to_delete: dict[str, BranchDeletion],
+    protected_branches: set[str],
+    result: CleanupResult,
+) -> None:
+    """Delete only branches that still match their validated revision."""
+    for branch_name in sorted(branches_to_delete):
+        if branch_name in protected_branches:
+            continue
+        deletion = branches_to_delete[branch_name]
+        if client.get_ref_sha(ref=f"heads/{branch_name}") != deletion.expected_sha:
+            if deletion.reopen_pr is not None:
+                client.reopen_pull(deletion.reopen_pr)
+                result.closed_prs.remove(deletion.reopen_pr)
+                protected_branches.add(branch_name)
+            continue
+        client.delete_ref(f"heads/{branch_name}")
+        result.deleted_branches.append(branch_name)
 
 
 def _close_obsolete_pull(
@@ -409,7 +444,7 @@ def _close_obsolete_pull(
     repository: str,
     enabled: bool,
     result: CleanupResult,
-    branches_to_delete: set[str],
+    branches_to_delete: dict[str, BranchDeletion],
     protected_branches: set[str],
 ) -> bool:
     """Close an obsolete workflow pull request and queue its branch deletion."""
@@ -424,13 +459,16 @@ def _close_obsolete_pull(
         protected_branches.add(_head_ref(pull))
         return True
 
-    result.closed_prs.append(pull_number)
-    if _is_branch_head_sha_match(
-        client=client,
-        pull=pull,
-        repository=repository,
+    if (
+        _same_repo_head_ref(pull, repository=repository) != snapshot.head_ref
+        or client.get_ref_sha(ref=f"heads/{snapshot.head_ref}") != snapshot.head_sha
     ):
-        branches_to_delete.add(_head_ref(pull))
+        client.reopen_pull(pull_number)
+        protected_branches.add(snapshot.head_ref)
+        return True
+
+    result.closed_prs.append(pull_number)
+    branches_to_delete[snapshot.head_ref] = BranchDeletion(snapshot.head_sha, reopen_pr=pull_number)
     return True
 
 
@@ -447,13 +485,14 @@ def _obsolete_pull_snapshot(
     details = client.get_pull(pull_number)
     changed_files = _pull_changed_files(details)
     head_sha = _pull_head_sha(details)
+    head_ref = _pull_head_ref(details)
     base_ref = _pull_base_ref(details)
-    if head_sha is None or base_ref is None:
+    if head_sha is None or head_ref is None or base_ref is None:
         return None
     base_sha = client.get_ref_sha(ref=f"heads/{base_ref}")
     if base_sha is None:
         return None
-    snapshot = PullComparisonSnapshot(head_sha, base_ref, base_sha, changed_files)
+    snapshot = PullComparisonSnapshot(head_sha, head_ref, base_ref, base_sha, changed_files)
     if changed_files == 0:
         return snapshot if _pull_matches_snapshot(client, pull_number, snapshot) else None
 
@@ -485,6 +524,7 @@ def _pull_matches_snapshot(
     return (
         (required_state is None or refreshed.get("state") == required_state)
         and _pull_head_sha(refreshed) == snapshot.head_sha
+        and _pull_head_ref(refreshed) == snapshot.head_ref
         and _pull_base_ref(refreshed) == snapshot.base_ref
         and _pull_changed_files(refreshed) == snapshot.changed_files
         and client.get_ref_sha(ref=f"heads/{snapshot.base_ref}") == snapshot.base_sha
@@ -646,6 +686,15 @@ def _pull_head_sha(pull: Mapping[str, object]) -> str | None:
     return sha if isinstance(sha, str) else None
 
 
+def _pull_head_ref(pull: Mapping[str, object]) -> str | None:
+    """Return the pull request head ref when present."""
+    head = pull.get("head")
+    if not isinstance(head, dict):
+        return None
+    ref = head.get("ref")
+    return ref if isinstance(ref, str) else None
+
+
 def _pull_base_ref(pull: Mapping[str, object]) -> str | None:
     """Return the pull request base branch ref."""
     base = pull.get("base")
@@ -655,21 +704,21 @@ def _pull_base_ref(pull: Mapping[str, object]) -> str | None:
     return ref if isinstance(ref, str) else None
 
 
-def _is_branch_head_sha_match(
+def _matching_branch_head_sha(
     *,
     client: CleanupClient,
     pull: Mapping[str, object],
     repository: str,
-) -> bool:
-    """Return whether the current branch SHA still points to the PR head."""
+) -> str | None:
+    """Return the PR head SHA when the same-repo branch still points to it."""
     head_ref = _same_repo_head_ref(pull, repository=repository)
     if head_ref is None:
-        return False
+        return None
     branch_sha = client.get_ref_sha(ref=f"heads/{head_ref}")
     if branch_sha is None:
-        return False
+        return None
     pull_head_sha = _pull_head_sha(pull)
-    return pull_head_sha is not None and branch_sha == pull_head_sha
+    return pull_head_sha if branch_sha == pull_head_sha else None
 
 
 def _pull_number(pull: Mapping[str, object]) -> int:
