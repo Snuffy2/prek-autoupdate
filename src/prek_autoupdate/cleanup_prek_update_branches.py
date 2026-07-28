@@ -49,8 +49,10 @@ class CleanupClient(Protocol):
     def list_pull_files(self, pull_number: int) -> list[dict[str, object]]:
         """List files changed by a pull request."""
 
-    def get_file_sha(self, *, path: str, ref: str) -> str | None:
-        """Return a file's blob SHA at a git ref."""
+    def get_tree_entries(
+        self, *, paths: set[str], ref: str
+    ) -> dict[str, tuple[str, str, str] | None] | None:
+        """Return Git tree entry identities for paths at a git ref."""
 
     def close_pull(self, pull_number: int) -> None:
         """Close a pull request by number."""
@@ -149,32 +151,48 @@ class GithubClient:
             url = _next_link(link_header)
         return files
 
-    def get_file_sha(self, *, path: str, ref: str) -> str | None:
-        """Return a file's blob SHA at a git ref.
+    def get_tree_entries(
+        self, *, paths: set[str], ref: str
+    ) -> dict[str, tuple[str, str, str] | None] | None:
+        """Return Git tree entry identities for paths at a git ref.
 
         Args:
-            path: Repository-relative file path.
-            ref: Commit SHA or branch ref.
+            paths: Repository-relative paths to retrieve.
+            ref: Commit SHA.
 
         Returns:
-            Blob SHA, or None when the path does not exist at the ref.
+            Path-to-entry mapping, with None for absent paths, or None when the
+            recursive tree is truncated.
 
         """
-        safe_path = quote(path, safe="/")
         safe_ref = quote(ref, safe="")
-        url = f"{GITHUB_API_URL}/repos/{self.repository}/contents/{safe_path}?ref={safe_ref}"
-        try:
-            payload, _ = self._request("GET", url)
-        except HTTPError as err:
-            if err.code == HTTP_NOT_FOUND:
-                return None
-            raise
+        url = f"{GITHUB_API_URL}/repos/{self.repository}/git/trees/{safe_ref}?recursive=1"
+        payload, _ = self._request("GET", url)
         if not isinstance(payload, dict):
-            raise TypeError(f"Expected a file object from {url}")
-        sha = payload.get("sha")
-        if not isinstance(sha, str):
-            raise TypeError(f"Expected a file blob SHA from {url}")
-        return sha
+            raise TypeError(f"Expected a Git tree object from {url}")
+        if payload.get("truncated") is True:
+            return None
+        tree = payload.get("tree")
+        if not isinstance(tree, list):
+            raise TypeError(f"Expected a Git tree list from {url}")
+        entries: dict[str, tuple[str, str, str] | None] = dict.fromkeys(paths)
+        for item in tree:
+            if not isinstance(item, dict):
+                raise TypeError(f"Expected a Git tree entry from {url}")
+            path = item.get("path")
+            if path not in paths:
+                continue
+            mode = item.get("mode")
+            entry_type = item.get("type")
+            sha = item.get("sha")
+            if (
+                not isinstance(mode, str)
+                or not isinstance(entry_type, str)
+                or not isinstance(sha, str)
+            ):
+                raise TypeError(f"Expected a complete Git tree entry from {url}")
+            entries[path] = (mode, entry_type, sha)
+        return entries
 
     def delete_ref(self, ref: str) -> None:
         """Delete a git ref if it exists.
@@ -389,22 +407,40 @@ def _pull_is_obsolete(client: CleanupClient, pull: Mapping[str, object]) -> bool
     """Return whether a pull request has no changes unique to its current base."""
     pull_number = _pull_number(pull)
     details = client.get_pull(pull_number)
-    if _pull_changed_files(details) == 0:
-        return True
-
+    changed_files = _pull_changed_files(details)
     head_sha = _pull_head_sha(details)
     base_ref = _pull_base_ref(details)
     if head_sha is None or base_ref is None:
         return False
+    if changed_files == 0:
+        refreshed = client.get_pull(pull_number)
+        return (
+            _pull_head_sha(refreshed) == head_sha
+            and _pull_base_ref(refreshed) == base_ref
+            and _pull_changed_files(refreshed) == 0
+        )
+
     base_sha = client.get_ref_sha(ref=f"heads/{base_ref}")
     if base_sha is None:
         return False
 
-    paths = _pull_file_paths(client.list_pull_files(pull_number))
-    return bool(paths) and all(
-        client.get_file_sha(path=path, ref=head_sha) == client.get_file_sha(path=path, ref=base_sha)
-        for path in paths
+    files = client.list_pull_files(pull_number)
+    if len(files) != changed_files:
+        return False
+    paths = _pull_file_paths(files)
+    head_entries = client.get_tree_entries(paths=paths, ref=head_sha)
+    base_entries = client.get_tree_entries(paths=paths, ref=base_sha)
+    if not paths or head_entries is None or base_entries is None:
+        return False
+
+    refreshed = client.get_pull(pull_number)
+    revisions_unchanged = (
+        _pull_head_sha(refreshed) == head_sha
+        and _pull_base_ref(refreshed) == base_ref
+        and _pull_changed_files(refreshed) == changed_files
+        and client.get_ref_sha(ref=f"heads/{base_ref}") == base_sha
     )
+    return revisions_unchanged and head_entries == base_entries
 
 
 def _pull_file_paths(files: Sequence[Mapping[str, object]]) -> set[str]:
