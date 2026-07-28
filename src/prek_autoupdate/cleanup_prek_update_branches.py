@@ -70,7 +70,18 @@ class BranchDeletion:
     """A branch deletion bound to an expected revision."""
 
     expected_sha: str
-    pull_numbers: frozenset[int] = frozenset()
+    candidates: frozenset[ClosedPullCandidate] = frozenset()
+
+
+@dataclass(frozen=True)
+class ClosedPullCandidate:
+    """Exact closed-listing identity required for branch deletion."""
+
+    number: int
+    head_ref: str
+    head_sha: str
+    updated_at: str
+    merged: bool
 
 
 @dataclass(frozen=True)
@@ -483,8 +494,10 @@ def cleanup_update_branches(
         ):
             is_stale = pull.get("merged_at") is None
             should_delete = delete_stale_branches if is_stale else delete_merged_branches
+            candidate = _closed_deletion_identity(pull)
             if (
                 should_delete
+                and candidate is not None
                 and (
                     head_sha := _matching_branch_head_sha(
                         client=client, pull=pull, repository=repository
@@ -496,7 +509,7 @@ def cleanup_update_branches(
                     branches_to_delete=branches_to_delete,
                     protected_branches=protected_branches,
                     branch_name=_head_ref(pull),
-                    deletion=BranchDeletion(head_sha, frozenset({_pull_number(pull)})),
+                    deletion=BranchDeletion(head_sha, frozenset({candidate})),
                 )
 
     _delete_queued_branches(
@@ -559,9 +572,9 @@ def _queue_branch_deletion(
     if existing is None:
         branches_to_delete[branch_name] = deletion
         return
-    pull_numbers = existing.pull_numbers | deletion.pull_numbers
+    candidates = existing.candidates | deletion.candidates
     if existing.expected_sha == deletion.expected_sha:
-        branches_to_delete[branch_name] = BranchDeletion(existing.expected_sha, pull_numbers)
+        branches_to_delete[branch_name] = BranchDeletion(existing.expected_sha, candidates)
         return
     protected_branches.add(branch_name)
     branches_to_delete.pop(branch_name)
@@ -614,13 +627,11 @@ def _delete_queued_branches(
         deletion = branches_to_delete[branch_name]
         if not all(
             _closed_pull_still_owned(
-                client.get_pull(pull_number),
-                pull_number=pull_number,
-                branch_name=branch_name,
-                expected_sha=deletion.expected_sha,
+                client.get_pull(candidate.number),
+                candidate=candidate,
                 policy=policy,
             )
-            for pull_number in deletion.pull_numbers
+            for candidate in deletion.candidates
         ):
             protected_branches.add(branch_name)
             continue
@@ -940,20 +951,40 @@ def _pull_owned_by_policy(pull: Mapping[str, object], *, policy: OwnershipPolicy
     )
 
 
+def _closed_deletion_identity(
+    pull: Mapping[str, object],
+) -> ClosedPullCandidate | None:
+    """Return an exact identity for a closed-listing deletion candidate."""
+    number = pull.get("number")
+    head_ref = _pull_head_ref(pull)
+    head_sha = _pull_head_sha(pull)
+    updated_at = pull.get("updated_at")
+    if (
+        type(number) is not int
+        or head_ref is None
+        or head_sha is None
+        or not isinstance(updated_at, str)
+    ):
+        return None
+    return ClosedPullCandidate(
+        number,
+        head_ref,
+        head_sha,
+        updated_at,
+        pull.get("merged_at") is not None,
+    )
+
+
 def _closed_pull_still_owned(
     pull: Mapping[str, object],
     *,
-    pull_number: int,
-    branch_name: str,
-    expected_sha: str,
+    candidate: ClosedPullCandidate,
     policy: OwnershipPolicy,
 ) -> bool:
     """Return whether a closed deletion candidate remains owned and unchanged."""
     return (
         pull.get("state") == "closed"
-        and _pull_number(pull) == pull_number
-        and _pull_head_ref(pull) == branch_name
-        and _pull_head_sha(pull) == expected_sha
+        and _closed_deletion_identity(pull) == candidate
         and _pull_owned_by_policy(pull, policy=policy)
     )
 

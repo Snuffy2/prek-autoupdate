@@ -155,11 +155,13 @@ def _workflow_pull(
     base_ref: str = "main",
     head_sha: str | None = "sha",
     changed_files: int | None = None,
+    updated_at: str = "2026-07-27T12:00:00Z",
 ) -> dict[str, object]:
     """Return a fake workflow pull request object."""
     pull: dict[str, object] = {
         "number": number,
         "merged_at": merged_at,
+        "updated_at": updated_at,
         "body": body,
         "base": {"ref": base_ref},
         "user": {"login": author},
@@ -659,25 +661,36 @@ def test_cleanup_script_compensates_conflicting_shared_head_candidates() -> None
 
 def test_conflicting_branch_deletion_evidence_protects_branch() -> None:
     """Conflicting expected revisions should cancel a queued deletion."""
-    branches_to_delete = {WORKFLOW_BRANCH: cleanup.BranchDeletion("old-sha", frozenset({18}))}
+    candidates = [
+        cleanup._closed_deletion_identity(_workflow_pull(number=number, head_sha=head_sha))
+        for number, head_sha in [(18, "old-sha"), (19, "old-sha"), (20, "new-sha")]
+    ]
+    assert all(candidate is not None for candidate in candidates)
+    candidate_18, candidate_19, candidate_20 = candidates
+    assert candidate_18 is not None
+    assert candidate_19 is not None
+    assert candidate_20 is not None
+    branches_to_delete = {
+        WORKFLOW_BRANCH: cleanup.BranchDeletion("old-sha", frozenset({candidate_18}))
+    }
     protected_branches: set[str] = set()
 
     cleanup._queue_branch_deletion(
         branches_to_delete=branches_to_delete,
         protected_branches=protected_branches,
         branch_name=WORKFLOW_BRANCH,
-        deletion=cleanup.BranchDeletion("old-sha", frozenset({19})),
+        deletion=cleanup.BranchDeletion("old-sha", frozenset({candidate_19})),
     )
 
     assert branches_to_delete == {
-        WORKFLOW_BRANCH: cleanup.BranchDeletion("old-sha", frozenset({18, 19}))
+        WORKFLOW_BRANCH: cleanup.BranchDeletion("old-sha", frozenset({candidate_18, candidate_19}))
     }
 
     cleanup._queue_branch_deletion(
         branches_to_delete=branches_to_delete,
         protected_branches=protected_branches,
         branch_name=WORKFLOW_BRANCH,
-        deletion=cleanup.BranchDeletion("new-sha", frozenset({20})),
+        deletion=cleanup.BranchDeletion("new-sha", frozenset({candidate_20})),
     )
 
     assert branches_to_delete == {}
@@ -1133,6 +1146,61 @@ def test_cleanup_script_rechecks_ownership_before_closed_branch_deletion() -> No
     assert result.deleted_branches == []
 
 
+def test_cleanup_script_blocks_reclosed_candidate_with_new_updated_at() -> None:
+    """A reopen/interact/reclose ABA transition should block branch deletion."""
+    listed = _workflow_pull(number=7, updated_at="2026-07-27T12:00:00Z")
+    reclosed = _workflow_pull(number=7, updated_at="2026-07-27T12:05:00Z")
+    client = FakeCleanupClient(
+        open_pulls=[],
+        closed_pulls=[listed],
+        pull_details={7: [reclosed]},
+    )
+
+    result = _cleanup(
+        client,
+        delete_stale_branches=True,
+        delete_merged_branches=False,
+    )
+
+    assert client.deleted_refs == []
+    assert result.deleted_branches == []
+
+
+@pytest.mark.parametrize(
+    ("listed_merged_at", "refreshed_merged_at", "deletion_mode"),
+    [
+        (None, "2026-07-27T12:05:00Z", "stale"),
+        ("2026-07-27T12:00:00Z", None, "merged"),
+    ],
+)
+def test_cleanup_script_blocks_changed_merge_classification(
+    listed_merged_at: str | None,
+    refreshed_merged_at: str | None,
+    deletion_mode: str,
+) -> None:
+    """A stale/merged classification transition should block deletion."""
+    listed = _workflow_pull(number=7, merged_at=listed_merged_at)
+    refreshed = _workflow_pull(
+        number=7,
+        merged_at=refreshed_merged_at,
+        updated_at="2026-07-27T12:05:00Z",
+    )
+    client = FakeCleanupClient(
+        open_pulls=[],
+        closed_pulls=[listed],
+        pull_details={7: [refreshed]},
+    )
+
+    result = _cleanup(
+        client,
+        delete_stale_branches=deletion_mode == "stale",
+        delete_merged_branches=deletion_mode == "merged",
+    )
+
+    assert client.deleted_refs == []
+    assert result.deleted_branches == []
+
+
 @pytest.mark.parametrize("open_pull_number", [7, 8])
 def test_cleanup_script_rechecks_any_open_pr_before_branch_deletion(
     open_pull_number: int,
@@ -1532,6 +1600,9 @@ def test_github_client_rejects_invalid_pull_payload(
 
 def test_pull_metadata_rejects_invalid_numeric_values() -> None:
     """Pull metadata helpers should reject invalid number and file counts."""
+    pull_number = 18
+    assert cleanup._pull_number({"number": str(pull_number)}) == pull_number
+
     with pytest.raises(TypeError, match="numeric number"):
         cleanup._pull_number({"number": None})
 
