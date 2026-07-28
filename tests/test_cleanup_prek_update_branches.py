@@ -83,6 +83,7 @@ class FakeCleanupClient:
         response = {
             **pull,
             "state": "closed",
+            "changed_files": pull.get("changed_files", 0),
             "updated_at": "2026-07-27T12:00:00Z",
         }
         self.close_responses[pull_number] = response
@@ -106,12 +107,11 @@ class FakeCleanupClient:
                 if pull["number"] == pull_number
             )
         refreshed = {**pull, "state": self.pull_states[pull_number]}
-        if (
-            refreshed["state"] == "closed"
-            and "updated_at" not in refreshed
-            and pull_number in self.close_responses
-        ):
-            refreshed["updated_at"] = self.close_responses[pull_number]["updated_at"]
+        if refreshed["state"] == "closed" and pull_number in self.close_responses:
+            refreshed.setdefault(
+                "changed_files", self.close_responses[pull_number]["changed_files"]
+            )
+            refreshed.setdefault("updated_at", self.close_responses[pull_number]["updated_at"])
         return refreshed
 
     def compare_files(self, *, base_sha: str, head_sha: str) -> list[dict[str, object]]:
@@ -337,7 +337,10 @@ def test_cleanup_script_preserves_pull_when_post_close_state_is_open() -> None:
     assert result.deleted_branches == []
 
 
-def test_cleanup_script_preserves_when_close_identity_is_incomplete() -> None:
+@pytest.mark.parametrize("cleanup_mode", ["stale", "obsolete"])
+def test_cleanup_script_preserves_when_close_identity_is_incomplete(
+    cleanup_mode: str,
+) -> None:
     """Cleanup should not reopen or delete without close mutation evidence."""
     pull = _workflow_pull(number=18, changed_files=0)
 
@@ -352,7 +355,7 @@ def test_cleanup_script_preserves_when_close_identity_is_incomplete() -> None:
 
     client = IncompleteCloseResponseClient(open_pulls=[pull], closed_pulls=[])
 
-    result = _cleanup(client, close_obsolete_prs=True)
+    result = _cleanup(client, close_obsolete_prs=cleanup_mode == "obsolete")
 
     assert client.reopened_prs == []
     assert client.deleted_refs == []
@@ -412,7 +415,7 @@ def test_cleanup_script_rejects_close_response_without_body_marker() -> None:
     result = _cleanup(client, close_obsolete_prs=True)
 
     assert client.closed_prs == [18]
-    assert client.reopened_prs == []
+    assert client.reopened_prs == [18]
     assert client.deleted_refs == []
     assert result.closed_prs == []
 
@@ -435,6 +438,7 @@ def test_cleanup_script_rejects_stale_close_response_without_body_marker() -> No
     result = _cleanup(client)
 
     assert client.closed_prs == [18]
+    assert client.reopened_prs == [18]
     assert client.deleted_refs == []
     assert result.closed_prs == []
 
@@ -662,7 +666,18 @@ def test_conflicting_branch_deletion_evidence_protects_branch() -> None:
         branches_to_delete=branches_to_delete,
         protected_branches=protected_branches,
         branch_name=WORKFLOW_BRANCH,
-        deletion=cleanup.BranchDeletion("new-sha", frozenset({19})),
+        deletion=cleanup.BranchDeletion("old-sha", frozenset({19})),
+    )
+
+    assert branches_to_delete == {
+        WORKFLOW_BRANCH: cleanup.BranchDeletion("old-sha", frozenset({18, 19}))
+    }
+
+    cleanup._queue_branch_deletion(
+        branches_to_delete=branches_to_delete,
+        protected_branches=protected_branches,
+        branch_name=WORKFLOW_BRANCH,
+        deletion=cleanup.BranchDeletion("new-sha", frozenset({20})),
     )
 
     assert branches_to_delete == {}
@@ -993,12 +1008,9 @@ def test_cleanup_script_closes_stale_prs_and_deletes_workflow_branches() -> None
     result = _cleanup(client)
 
     assert client.closed_prs == [10, 9]
-    assert client.deleted_refs == [
-        f"heads/{WORKFLOW_BRANCH}",
-        f"heads/{WORKFLOW_BRANCH}-old",
-    ]
+    assert client.deleted_refs == []
     assert result.closed_prs == [10, 9]
-    assert result.deleted_branches == [WORKFLOW_BRANCH, f"{WORKFLOW_BRANCH}-old"]
+    assert result.deleted_branches == []
 
 
 def test_cleanup_script_keeps_active_update_branch() -> None:
@@ -1040,12 +1052,9 @@ def test_cleanup_script_can_keep_latest_open_workflow_pr() -> None:
     result = _cleanup(client, keep_latest_open_pr=True)
 
     assert client.closed_prs == [17]
-    assert client.deleted_refs == [
-        f"heads/{WORKFLOW_BRANCH}-merged",
-        f"heads/{WORKFLOW_BRANCH}-old",
-    ]
+    assert client.deleted_refs == [f"heads/{WORKFLOW_BRANCH}-merged"]
     assert result.closed_prs == [17]
-    assert result.deleted_branches == [f"{WORKFLOW_BRANCH}-merged", f"{WORKFLOW_BRANCH}-old"]
+    assert result.deleted_branches == [f"{WORKFLOW_BRANCH}-merged"]
 
 
 def test_cleanup_script_checks_all_closed_pulls_for_merged_workflow_branches() -> None:
@@ -1113,6 +1122,38 @@ def test_cleanup_script_rechecks_ownership_before_closed_branch_deletion() -> No
         closed_pulls=[pull],
         pull_details={7: [without_label]},
     )
+
+    result = _cleanup(
+        client,
+        delete_stale_branches=True,
+        delete_merged_branches=False,
+    )
+
+    assert client.deleted_refs == []
+    assert result.deleted_branches == []
+
+
+@pytest.mark.parametrize("open_pull_number", [7, 8])
+def test_cleanup_script_rechecks_any_open_pr_before_branch_deletion(
+    open_pull_number: int,
+) -> None:
+    """A reopened or different open PR on the ref should block deletion."""
+    closed_pull = _workflow_pull(number=7)
+    newly_open_pull = _workflow_pull(number=open_pull_number)
+
+    class OpenRaceClient(FakeCleanupClient):
+        """Fake client that exposes an open PR only at final deletion."""
+
+        open_list_calls = 0
+
+        def list_pulls(self, *, state: str) -> list[dict[str, object]]:
+            """Return the racing open PR after initial enumeration."""
+            if state == "open":
+                self.open_list_calls += 1
+                return [] if self.open_list_calls == 1 else [newly_open_pull]
+            return super().list_pulls(state=state)
+
+    client = OpenRaceClient(open_pulls=[], closed_pulls=[closed_pull])
 
     result = _cleanup(
         client,
@@ -1902,6 +1943,43 @@ def test_github_client_reports_rejected_delete_lease(
         client.delete_ref("heads/feature", expected_sha="expected-sha")
         is cleanup.DeleteRefOutcome.LEASE_REJECTED
     )
+
+
+def test_github_client_reports_absent_ref_after_failed_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed push followed by a missing ref should be idempotent success."""
+    monkeypatch.setattr(
+        "prek_autoupdate.cleanup_prek_update_branches.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(["git", "push"], 1, "", "failed"),
+    )
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    monkeypatch.setattr(client, "get_ref_sha", lambda **_kwargs: None)
+
+    assert (
+        client.delete_ref("heads/feature", expected_sha="expected-sha")
+        is cleanup.DeleteRefOutcome.ALREADY_ABSENT
+    )
+
+
+def test_github_client_propagates_failed_push_when_ref_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed deletion should propagate while the expected ref remains."""
+    monkeypatch.setattr(
+        "prek_autoupdate.cleanup_prek_update_branches.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["git", "push"], 1, "output", "failed"
+        ),
+    )
+    client = cleanup.GithubClient(repository=REPOSITORY, token="token")
+    monkeypatch.setattr(client, "get_ref_sha", lambda **_kwargs: "expected-sha")
+
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        client.delete_ref("heads/feature", expected_sha="expected-sha")
+
+    assert exc_info.value.output == "output"
+    assert exc_info.value.stderr == "failed"
 
 
 @pytest.mark.parametrize(

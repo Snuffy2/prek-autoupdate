@@ -468,7 +468,6 @@ def cleanup_update_branches(
             close_stale_prs=close_stale_prs,
             policy=policy,
             result=result,
-            branches_to_delete=branches_to_delete,
             protected_branches=protected_branches,
         )
 
@@ -519,7 +518,6 @@ def _handle_stale_open_pull(
     close_stale_prs: bool,
     policy: OwnershipPolicy,
     result: CleanupResult,
-    branches_to_delete: dict[str, BranchDeletion],
     protected_branches: set[str],
 ) -> None:
     """Preserve or close a stale open workflow pull after ownership refresh."""
@@ -532,20 +530,21 @@ def _handle_stale_open_pull(
         protected_branches.add(head_ref)
         return
     closed_pull = client.close_pull(pull_number)
-    if closed_pull.get("state") != "closed" or not _pull_owned_by_policy(
-        closed_pull, policy=policy
-    ):
+    close_identity = _close_identity(closed_pull)
+    if close_identity is None:
         protected_branches.add(head_ref)
         return
-    result.closed_prs.append(pull_number)
-    head_sha = _matching_branch_head_sha(client=client, pull=pull, repository=policy.repository)
-    if head_sha is not None:
-        _queue_branch_deletion(
-            branches_to_delete=branches_to_delete,
-            protected_branches=protected_branches,
+    if not _pull_owned_by_policy(closed_pull, policy=policy):
+        _reopen_and_protect(
+            client=client,
+            pulls=frozenset({close_identity}),
             branch_name=head_ref,
-            deletion=BranchDeletion(head_sha, frozenset({pull_number})),
+            protected_branches=protected_branches,
+            result=result,
         )
+        return
+    result.closed_prs.append(pull_number)
+    protected_branches.add(head_ref)
 
 
 def _queue_branch_deletion(
@@ -628,6 +627,12 @@ def _delete_queued_branches(
         current_sha = client.get_ref_sha(ref=f"heads/{branch_name}")
         if current_sha != deletion.expected_sha:
             continue
+        if any(
+            _same_repo_head_ref(pull, repository=policy.repository) == branch_name
+            for pull in client.list_pulls(state="open")
+        ):
+            protected_branches.add(branch_name)
+            continue
         outcome = client.delete_ref(f"heads/{branch_name}", expected_sha=deletion.expected_sha)
         if outcome is DeleteRefOutcome.DELETED:
             result.deleted_branches.append(branch_name)
@@ -660,11 +665,20 @@ def _close_obsolete_pull(
     except HTTPError, URLError, TimeoutError, TypeError:
         protected_branches.add(snapshot.head_ref)
         raise
-    if close_identity is None or not _pull_owned_by_policy(closed_pull, policy=policy):
+    if close_identity is None:
         protected_branches.add(snapshot.head_ref)
         LOGGER.warning(
             "PR #%s close response lacked a safe mutation identity; preserving its branch.",
             pull_number,
+        )
+        return True
+    if not _pull_owned_by_policy(closed_pull, policy=policy):
+        _reopen_and_protect(
+            client=client,
+            pulls=frozenset({close_identity}),
+            branch_name=snapshot.head_ref,
+            protected_branches=protected_branches,
+            result=result,
         )
         return True
     try:
