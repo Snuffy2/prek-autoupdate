@@ -203,7 +203,6 @@ jobs:
             --label-name "${label_name}"
             --author-login 'github-actions[bot]'
             --body-marker "${BODY_MARKER}"
-            --close-stale-prs
             --delete-stale-branches
             --delete-merged-branches
           )
@@ -216,6 +215,8 @@ jobs:
 
           if [[ "${EVENT_NAME}" == "push" ]]; then
             args+=(--close-obsolete-prs)
+          else
+            args+=(--close-stale-prs)
           fi
 
           python tooling/src/prek_autoupdate/cleanup_prek_update_branches.py "${args[@]}"

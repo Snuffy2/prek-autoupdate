@@ -42,10 +42,10 @@ def _step(job_name: str, step_name: str) -> dict[str, Any]:
 def test_push_only_reconciles_obsolete_pull_requests() -> None:
     """Pushes should reconcile the PR without running prek auto-update."""
     update_day = _step("update-hooks", "Check update day")
-    assert (
-        'if [[ "${{ github.event_name }}" == "workflow_dispatch" || '
-        '( "${{ github.event_name }}" == "schedule"' in update_day["run"]
+    event_conditions = re.findall(
+        r'\$\{\{ github\.event_name \}\}" == "([^"]+)"', update_day["run"]
     )
+    assert event_conditions == ["workflow_dispatch", "schedule"]
 
     update_steps = WORKFLOW["jobs"]["update-hooks"]["steps"]
     gated_steps = [step for step in update_steps if step["name"] != "Check update day"]
@@ -54,8 +54,19 @@ def test_push_only_reconciles_obsolete_pull_requests() -> None:
 
     cleanup = _step("cleanup", "Close stale prek update PRs")
     assert cleanup["env"]["EVENT_NAME"] == "${{ github.event_name }}"
-    assert 'if [[ "${EVENT_NAME}" == "push" ]]; then' in cleanup["run"]
-    assert "args+=(--close-obsolete-prs)" in cleanup["run"]
+    push_cleanup = (
+        'if [[ "${EVENT_NAME}" == "push" ]]; then\n'
+        "  args+=(--close-obsolete-prs)\n"
+        "else\n"
+        "  args+=(--close-stale-prs)\n"
+        "fi"
+    )
+    assert push_cleanup in cleanup["run"]
+    unconditional_args = cleanup["run"].split(
+        'if [[ "${EVENT_NAME}" == "push" ]]; then', maxsplit=1
+    )[0]
+    assert "--close-stale-prs" not in unconditional_args
+    assert "--close-obsolete-prs" not in unconditional_args
 
 
 def test_deprecated_dispatch_workflows_input_is_accepted_but_ignored() -> None:
