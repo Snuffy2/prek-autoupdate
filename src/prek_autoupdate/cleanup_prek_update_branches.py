@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
@@ -19,7 +21,6 @@ if TYPE_CHECKING:
 GITHUB_API_URL = "https://api.github.com"
 HTTP_NO_CONTENT = 204
 HTTP_NOT_FOUND = 404
-HTTP_UNPROCESSABLE_CONTENT = 422
 LOGGER = logging.getLogger(__name__)
 
 
@@ -53,7 +54,7 @@ class BranchDeletion:
     """A branch deletion bound to an expected revision."""
 
     expected_sha: str
-    reopen_pr: int | None = None
+    reopen_prs: frozenset[int] = frozenset()
 
 
 class CleanupClient(Protocol):
@@ -79,8 +80,8 @@ class CleanupClient(Protocol):
     def reopen_pull(self, pull_number: int) -> None:
         """Reopen a pull request by number."""
 
-    def delete_ref(self, ref: str) -> None:
-        """Delete a git ref by name."""
+    def delete_ref(self, ref: str, *, expected_sha: str) -> bool:
+        """Delete a git ref only when it still has the expected SHA."""
 
     def get_ref_sha(self, *, ref: str) -> str | None:
         """Return the current SHA for a git ref."""
@@ -226,24 +227,51 @@ class GithubClient:
             entries[path] = (mode, entry_type, sha)
         return entries
 
-    def delete_ref(self, ref: str) -> None:
-        """Delete a git ref if it exists.
+    def delete_ref(self, ref: str, *, expected_sha: str) -> bool:
+        """Atomically delete a git ref when it still has the expected SHA.
 
         Args:
             ref: Ref path such as ``heads/branch-name``.
+            expected_sha: SHA required by the force-with-lease deletion.
+
+        Returns:
+            True when the ref was deleted, or False when it moved or was absent.
 
         """
-        safe_ref = quote(ref, safe="/")
-        url = f"{GITHUB_API_URL}/repos/{self.repository}/git/refs/{safe_ref}"
-        try:
-            self._request("DELETE", url)
-        except HTTPError as err:
-            if err.code == HTTP_NOT_FOUND or (
-                err.code == HTTP_UNPROCESSABLE_CONTENT and _is_missing_ref_error(err)
-            ):
-                LOGGER.info("Ref %s was already deleted.", ref)
-                return
-            raise
+        full_ref = f"refs/{ref}"
+        basic_credential = base64.b64encode(f"x-access-token:{self.token}".encode()).decode()
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+                "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic_credential}",
+            }
+        )
+        command = [
+            "git",
+            "push",
+            "origin",
+            f"--force-with-lease={full_ref}:{expected_sha}",
+            f":{full_ref}",
+        ]
+        completed = subprocess.run(  # noqa: S603 - arguments are a fixed git invocation
+            command,
+            check=False,
+            capture_output=True,
+            env=environment,
+            text=True,
+        )
+        if completed.returncode == 0:
+            return True
+        if self.get_ref_sha(ref=ref) != expected_sha:
+            return False
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            command,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
 
     def get_ref_sha(self, *, ref: str) -> str | None:
         """Return the SHA for a git ref, or None when missing."""
@@ -380,7 +408,14 @@ def cleanup_update_branches(
         if (
             head_sha := _matching_branch_head_sha(client=client, pull=pull, repository=repository)
         ) is not None:
-            branches_to_delete.setdefault(head_ref, BranchDeletion(head_sha))
+            _queue_branch_deletion(
+                client=client,
+                branches_to_delete=branches_to_delete,
+                protected_branches=protected_branches,
+                result=result,
+                branch_name=head_ref,
+                deletion=BranchDeletion(head_sha),
+            )
 
     if delete_stale_branches or delete_merged_branches:
         for pull in _workflow_pulls(
@@ -403,7 +438,14 @@ def cleanup_update_branches(
                 )
                 is not None
             ):
-                branches_to_delete.setdefault(_head_ref(pull), BranchDeletion(head_sha))
+                _queue_branch_deletion(
+                    client=client,
+                    branches_to_delete=branches_to_delete,
+                    protected_branches=protected_branches,
+                    result=result,
+                    branch_name=_head_ref(pull),
+                    deletion=BranchDeletion(head_sha),
+                )
 
     _delete_queued_branches(
         client=client,
@@ -413,6 +455,50 @@ def cleanup_update_branches(
     )
 
     return result
+
+
+def _queue_branch_deletion(
+    *,
+    client: CleanupClient,
+    branches_to_delete: dict[str, BranchDeletion],
+    protected_branches: set[str],
+    result: CleanupResult,
+    branch_name: str,
+    deletion: BranchDeletion,
+) -> None:
+    """Queue a compatible lease deletion or compensate conflicting candidates."""
+    existing = branches_to_delete.get(branch_name)
+    if existing is None:
+        branches_to_delete[branch_name] = deletion
+        return
+    affected_prs = existing.reopen_prs | deletion.reopen_prs
+    if existing.expected_sha == deletion.expected_sha:
+        branches_to_delete[branch_name] = BranchDeletion(existing.expected_sha, affected_prs)
+        return
+    _reopen_and_protect(
+        client=client,
+        pull_numbers=affected_prs,
+        branch_name=branch_name,
+        protected_branches=protected_branches,
+        result=result,
+    )
+    branches_to_delete.pop(branch_name)
+
+
+def _reopen_and_protect(
+    *,
+    client: CleanupClient,
+    pull_numbers: frozenset[int],
+    branch_name: str,
+    protected_branches: set[str],
+    result: CleanupResult,
+) -> None:
+    """Reopen compensatable pulls and protect their shared head branch."""
+    for pull_number in sorted(pull_numbers):
+        client.reopen_pull(pull_number)
+        if pull_number in result.closed_prs:
+            result.closed_prs.remove(pull_number)
+    protected_branches.add(branch_name)
 
 
 def _delete_queued_branches(
@@ -427,14 +513,36 @@ def _delete_queued_branches(
         if branch_name in protected_branches:
             continue
         deletion = branches_to_delete[branch_name]
-        if client.get_ref_sha(ref=f"heads/{branch_name}") != deletion.expected_sha:
-            if deletion.reopen_pr is not None:
-                client.reopen_pull(deletion.reopen_pr)
-                result.closed_prs.remove(deletion.reopen_pr)
-                protected_branches.add(branch_name)
+        try:
+            current_sha = client.get_ref_sha(ref=f"heads/{branch_name}")
+        except HTTPError, URLError, TypeError:
+            _reopen_and_protect(
+                client=client,
+                pull_numbers=deletion.reopen_prs,
+                branch_name=branch_name,
+                protected_branches=protected_branches,
+                result=result,
+            )
+            raise
+        if current_sha != deletion.expected_sha:
+            _reopen_and_protect(
+                client=client,
+                pull_numbers=deletion.reopen_prs,
+                branch_name=branch_name,
+                protected_branches=protected_branches,
+                result=result,
+            )
             continue
-        client.delete_ref(f"heads/{branch_name}")
-        result.deleted_branches.append(branch_name)
+        if client.delete_ref(f"heads/{branch_name}", expected_sha=deletion.expected_sha):
+            result.deleted_branches.append(branch_name)
+        else:
+            _reopen_and_protect(
+                client=client,
+                pull_numbers=deletion.reopen_prs,
+                branch_name=branch_name,
+                protected_branches=protected_branches,
+                result=result,
+            )
 
 
 def _close_obsolete_pull(
@@ -454,21 +562,32 @@ def _close_obsolete_pull(
 
     pull_number = _pull_number(pull)
     client.close_pull(pull_number)
-    if not _pull_matches_snapshot(client, pull_number, snapshot, required_state="closed"):
+    try:
+        snapshot_matches = _pull_matches_snapshot(
+            client, pull_number, snapshot, required_state="closed"
+        )
+        branch_matches = (
+            _same_repo_head_ref(pull, repository=repository) == snapshot.head_ref
+            and client.get_ref_sha(ref=f"heads/{snapshot.head_ref}") == snapshot.head_sha
+        )
+    except HTTPError, URLError, TypeError:
         client.reopen_pull(pull_number)
-        protected_branches.add(_head_ref(pull))
-        return True
-
-    if (
-        _same_repo_head_ref(pull, repository=repository) != snapshot.head_ref
-        or client.get_ref_sha(ref=f"heads/{snapshot.head_ref}") != snapshot.head_sha
-    ):
+        protected_branches.add(snapshot.head_ref)
+        raise
+    if not snapshot_matches or not branch_matches:
         client.reopen_pull(pull_number)
         protected_branches.add(snapshot.head_ref)
         return True
 
     result.closed_prs.append(pull_number)
-    branches_to_delete[snapshot.head_ref] = BranchDeletion(snapshot.head_sha, reopen_pr=pull_number)
+    _queue_branch_deletion(
+        client=client,
+        branches_to_delete=branches_to_delete,
+        protected_branches=protected_branches,
+        result=result,
+        branch_name=snapshot.head_ref,
+        deletion=BranchDeletion(snapshot.head_sha, frozenset({pull_number})),
+    )
     return True
 
 
@@ -764,29 +883,6 @@ def _github_headers(token: str) -> dict[str, str]:
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "prek-autoupdate-cleanup",
     }
-
-
-def _is_missing_ref_error(err: HTTPError) -> bool:
-    """Return whether a GitHub 422 error reports a missing ref.
-
-    Args:
-        err: HTTP error from the GitHub API.
-
-    Returns:
-        True when the error body says the reference does not exist.
-
-    """
-    body = err.read().decode(errors="replace")
-    if not body:
-        return False
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        return "Reference does not exist" in body
-    if not isinstance(payload, dict):
-        return False
-    message = payload.get("message")
-    return isinstance(message, str) and "Reference does not exist" in message
 
 
 def _next_link(link_header: str | None) -> str | None:

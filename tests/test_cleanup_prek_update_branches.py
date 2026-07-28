@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-from email.message import Message
-from io import BytesIO
-from typing import TYPE_CHECKING
-from urllib.error import HTTPError, URLError
+import base64
+import hmac
+import subprocess
+from urllib.error import URLError
 
 import pytest
 
 import prek_autoupdate.cleanup_prek_update_branches as cleanup
-
-if TYPE_CHECKING:
-    from urllib.request import Request
 
 WORKFLOW_BRANCH = "chore/prek-updates"
 WORKFLOW_LABEL = "dependencies"
@@ -105,9 +102,13 @@ class FakeCleanupClient:
             return None
         return {path: entries.get(path) for path in paths}
 
-    def delete_ref(self, ref: str) -> None:
-        """Record a deleted git ref."""
+    def delete_ref(self, ref: str, *, expected_sha: str) -> bool:
+        """Record a lease-guarded deleted git ref."""
+        if self.get_ref_sha(ref=ref) != expected_sha:
+            return False
         self.deleted_refs.append(ref)
+        self.ref_shas[ref] = None
+        return True
 
     def get_ref_sha(self, *, ref: str) -> str | None:
         """Return a fake branch SHA."""
@@ -153,6 +154,7 @@ def _cleanup(
     keep_latest_open_pr: bool = False,
     delete_stale_branches: bool = False,
     delete_merged_branches: bool = True,
+    close_stale_prs: bool = True,
     close_obsolete_prs: bool = False,
 ) -> cleanup.CleanupResult:
     """Run cleanup with workflow defaults."""
@@ -166,7 +168,7 @@ def _cleanup(
         body_marker=WORKFLOW_BODY_MARKER,
         keep_pr_number=keep_pr_number,
         keep_latest_open_pr=keep_latest_open_pr,
-        close_stale_prs=True,
+        close_stale_prs=close_stale_prs,
         close_obsolete_prs=close_obsolete_prs,
         delete_stale_branches=delete_stale_branches,
         delete_merged_branches=delete_merged_branches,
@@ -406,6 +408,141 @@ def test_cleanup_script_reopens_when_head_moves_before_final_delete() -> None:
     assert result.deleted_branches == []
 
 
+def test_cleanup_script_reopens_all_shared_head_pulls_on_final_mismatch() -> None:
+    """Same-revision shared-head candidates should aggregate compensation PRs."""
+    pulls = [
+        _workflow_pull(number=18, base_ref="main", changed_files=0),
+        _workflow_pull(number=19, base_ref="develop", changed_files=0),
+    ]
+
+    class MovingSharedHeadClient(FakeCleanupClient):
+        """Fake client whose shared head moves before final deletion."""
+
+        head_ref_calls = 0
+        immediate_checks = len(pulls)
+
+        def get_ref_sha(self, *, ref: str) -> str | None:
+            """Move the shared head after both immediate checks."""
+            if ref == f"heads/{WORKFLOW_BRANCH}":
+                self.head_ref_calls += 1
+                return "sha" if self.head_ref_calls <= self.immediate_checks else "new-sha"
+            return super().get_ref_sha(ref=ref)
+
+    client = MovingSharedHeadClient(open_pulls=pulls, closed_pulls=[])
+
+    result = _cleanup(client, close_obsolete_prs=True)
+
+    assert client.reopened_prs == [18, 19]
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+    assert result.deleted_branches == []
+
+
+def test_cleanup_script_compensates_conflicting_shared_head_candidates() -> None:
+    """Different expected SHAs for one head should reopen every affected pull."""
+    pulls = [
+        _workflow_pull(number=18, base_ref="main", head_sha="old-sha", changed_files=0),
+        _workflow_pull(number=19, base_ref="develop", head_sha="new-sha", changed_files=0),
+    ]
+
+    class AdvancingSharedHeadClient(FakeCleanupClient):
+        """Fake client whose shared branch advances between pull checks."""
+
+        head_ref_calls = 0
+
+        def get_ref_sha(self, *, ref: str) -> str | None:
+            """Return each pull's expected SHA at its immediate check."""
+            if ref == f"heads/{WORKFLOW_BRANCH}":
+                self.head_ref_calls += 1
+                return "old-sha" if self.head_ref_calls == 1 else "new-sha"
+            return super().get_ref_sha(ref=ref)
+
+    client = AdvancingSharedHeadClient(open_pulls=pulls, closed_pulls=[])
+
+    result = _cleanup(client, close_obsolete_prs=True)
+
+    assert client.reopened_prs == [18, 19]
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+    assert result.deleted_branches == []
+
+
+def test_cleanup_script_compensates_post_close_validation_error() -> None:
+    """A post-close payload failure should reopen before propagating."""
+    pull = _workflow_pull(number=18, changed_files=0)
+
+    class InvalidPostClosePullClient(FakeCleanupClient):
+        """Fake client whose post-close pull payload is invalid."""
+
+        closed = False
+
+        def close_pull(self, pull_number: int) -> None:
+            """Record that subsequent pull validation should fail."""
+            super().close_pull(pull_number)
+            self.closed = True
+
+        def get_pull(self, pull_number: int) -> dict[str, object]:
+            """Raise for the first pull read after closing."""
+            if self.closed:
+                raise TypeError("Malformed pull response")
+            return super().get_pull(pull_number)
+
+    client = InvalidPostClosePullClient(open_pulls=[pull], closed_pulls=[])
+
+    with pytest.raises(TypeError, match="Malformed pull response"):
+        _cleanup(client, close_obsolete_prs=True)
+
+    assert client.reopened_prs == [18]
+    assert client.deleted_refs == []
+
+
+def test_cleanup_script_compensates_final_ref_lookup_error() -> None:
+    """A final ref lookup error should reopen before propagating."""
+    pull = _workflow_pull(number=18, changed_files=0)
+
+    class FailingFinalLookupClient(FakeCleanupClient):
+        """Fake client whose head lookup fails during final validation."""
+
+        head_ref_calls = 0
+
+        def get_ref_sha(self, *, ref: str) -> str | None:
+            """Fail the second head lookup."""
+            if ref == f"heads/{WORKFLOW_BRANCH}":
+                self.head_ref_calls += 1
+                if self.head_ref_calls > 1:
+                    raise URLError("lookup failed")
+            return super().get_ref_sha(ref=ref)
+
+    client = FailingFinalLookupClient(open_pulls=[pull], closed_pulls=[])
+
+    with pytest.raises(URLError, match="lookup failed"):
+        _cleanup(client, close_obsolete_prs=True)
+
+    assert client.reopened_prs == [18]
+    assert client.deleted_refs == []
+
+
+def test_cleanup_script_does_not_claim_rejected_lease_deletion() -> None:
+    """A lease rejection should not be reported as a deleted branch."""
+    pull = _workflow_pull(number=7, merged_at="2026-05-28T00:00:00Z")
+
+    class RejectedLeaseClient(FakeCleanupClient):
+        """Fake client whose atomic deletion lease is rejected."""
+
+        def delete_ref(self, ref: str, *, expected_sha: str) -> bool:
+            """Report a rejected lease without recording deletion."""
+            assert ref == f"heads/{WORKFLOW_BRANCH}"
+            assert expected_sha == "sha"
+            return False
+
+    client = RejectedLeaseClient(open_pulls=[], closed_pulls=[pull])
+
+    result = _cleanup(client)
+
+    assert client.deleted_refs == []
+    assert result.deleted_branches == []
+
+
 def test_cleanup_script_propagates_reopen_failure_after_revision_moves() -> None:
     """Cleanup should expose a failed compensation instead of claiming success."""
     pull = _workflow_pull(number=18, changed_files=0)
@@ -616,6 +753,26 @@ def test_cleanup_script_deletes_closed_unmerged_workflow_branches_with_sha_match
 
     assert client.deleted_refs == [f"heads/{stale_branch}"]
     assert result.deleted_branches == [stale_branch]
+
+
+def test_cleanup_script_protects_open_branch_when_stale_closing_is_disabled() -> None:
+    """An open workflow branch should override a closed deletion candidate."""
+    client = FakeCleanupClient(
+        open_pulls=[_workflow_pull(number=18)],
+        closed_pulls=[_workflow_pull(number=7)],
+    )
+
+    result = _cleanup(
+        client,
+        close_stale_prs=False,
+        delete_stale_branches=True,
+        delete_merged_branches=False,
+    )
+
+    assert client.closed_prs == []
+    assert client.deleted_refs == []
+    assert result.closed_prs == []
+    assert result.deleted_branches == []
 
 
 def test_cleanup_script_preserves_merged_workflow_branch_when_sha_differs() -> None:
@@ -1166,25 +1323,54 @@ def test_main_returns_failure_for_github_request_errors(
     )
 
 
-def test_github_client_delete_ref_urlencodes_reserved_chars(
+def test_github_client_deletes_ref_with_atomic_push_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Delete calls should URL-encode reserved characters in refs."""
-    calls: list[str] = []
+    """Delete calls should use an expected-SHA lease without exposing the token."""
+    calls: list[tuple[list[str], dict[str, str]]] = []
 
-    def fake_urlopen(request: Request, *_args: object, **_kwargs: object) -> object:
-        url = request.full_url
-        calls.append(url)
-        raise HTTPError(
-            url=url,
-            code=404,
-            msg="Not Found",
-            hdrs=Message(),
-            fp=BytesIO(b'{"message": "Not Found"}'),
-        )
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        """Record the lease-guarded git invocation."""
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        calls.append((command, environment))
+        return subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(cleanup, "urlopen", fake_urlopen)
+    monkeypatch.setattr("prek_autoupdate.cleanup_prek_update_branches.subprocess.run", fake_run)
+    client = cleanup.GithubClient(repository=REPOSITORY, token="secret-token")
+
+    assert client.delete_ref("heads/feature#1", expected_sha="expected-sha")
+
+    command, environment = calls[0]
+    assert command == [
+        "git",
+        "push",
+        "origin",
+        "--force-with-lease=refs/heads/feature#1:expected-sha",
+        ":refs/heads/feature#1",
+    ]
+    assert "secret-token" not in " ".join(command)
+    encoded_credential = base64.b64encode(b"x-access-token:secret-token").decode()
+    assert encoded_credential not in " ".join(command)
+    assert environment["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+    header = environment["GIT_CONFIG_VALUE_0"]
+    prefix = "AUTHORIZATION: basic "
+    assert hmac.compare_digest(header[: len(prefix)], prefix)
+    assert hmac.compare_digest(
+        base64.b64decode(header.removeprefix(prefix)),
+        b"x-access-token:secret-token",
+    )
+
+
+def test_github_client_reports_rejected_delete_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected lease should safely report that no deletion occurred."""
+    monkeypatch.setattr(
+        "prek_autoupdate.cleanup_prek_update_branches.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(["git", "push"], 1, "", "stale info"),
+    )
     client = cleanup.GithubClient(repository=REPOSITORY, token="token")
-    client.delete_ref("heads/feature#1")
+    monkeypatch.setattr(client, "get_ref_sha", lambda **_kwargs: "moved-sha")
 
-    assert calls == ["https://api.github.com/repos/o/r/git/refs/heads/feature%231"]
+    assert not client.delete_ref("heads/feature", expected_sha="expected-sha")
