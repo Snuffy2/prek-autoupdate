@@ -42605,13 +42605,10 @@ async function proveCurrentOwnership(execution, remote) {
     return current;
 }
 async function provePublishedOwnership(execution, remote, newSha) {
-    const current = await proveCurrentOwnership(execution, {
+    await proveCurrentOwnership(execution, {
         sha: newSha,
         ownedPullRequest: remote.ownedPullRequest,
     });
-    if (current.headSha !== newSha) {
-        throw new Error("Published pull request does not point at the new update commit");
-    }
 }
 async function compensateClose(execution, closed, closeEtag) {
     if (closeEtag === undefined) {

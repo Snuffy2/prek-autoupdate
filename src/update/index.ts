@@ -709,15 +709,10 @@ async function provePublishedOwnership(
   remote: RemoteState,
   newSha: string,
 ): Promise<void> {
-  const current = await proveCurrentOwnership(execution, {
+  await proveCurrentOwnership(execution, {
     sha: newSha,
     ownedPullRequest: remote.ownedPullRequest,
   });
-  if (current.headSha !== newSha) {
-    throw new Error(
-      "Published pull request does not point at the new update commit",
-    );
-  }
 }
 
 async function compensateClose(
