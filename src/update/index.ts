@@ -55,6 +55,7 @@ export async function validateUpdateConfiguration(
     validateAddPath(addPath);
   }
   await assertBaseCommit(execution);
+  await assertOwnershipLabel(execution);
 }
 
 /** Validate the ownership namespace before cleanup is allowed to mutate. */
@@ -124,7 +125,7 @@ export async function runUpdate(
     await proveBase(execution);
     await pushUpdate(execution, worktree, remote.sha);
     if (remote.ownedPullRequest === undefined) {
-      let pullNumber: number;
+      let pullNumber: number | undefined;
       try {
         const response = await execution.client.rest.pulls.create({
           owner: execution.context.owner,
@@ -136,25 +137,37 @@ export async function runUpdate(
         });
         pullNumber = response.data.number;
       } catch (error) {
-        if (isDefiniteCreateFailure(error)) {
-          await rollbackNewBranch(execution, newSha, error);
-        }
+        let recovered: number | undefined;
         try {
-          const recovered = await recoverAmbiguousCreatedPull(
+          recovered = await recoverAmbiguousCreatedPull(
             execution,
             newSha,
             body,
           );
-          if (recovered === undefined) {
-            throw new Error("No exact created pull request was observable");
-          }
-          pullNumber = recovered;
         } catch (recoveryError) {
           throw new Error(
             "Pull request creation had an ambiguous outcome; the lease-protected update branch was preserved for inspection",
             { cause: new AggregateError([error, recoveryError]) },
           );
         }
+        if (recovered !== undefined) {
+          pullNumber = recovered;
+        } else if (isDefiniteCreateFailure(error)) {
+          await rollbackNewBranch(execution, newSha, error);
+        } else {
+          throw new Error(
+            "Pull request creation had an ambiguous outcome; the lease-protected update branch was preserved for inspection",
+            {
+              cause: new AggregateError([
+                error,
+                new Error("No exact created pull request was observable"),
+              ]),
+            },
+          );
+        }
+      }
+      if (pullNumber === undefined) {
+        throw new Error("Pull request creation did not return a pull number");
       }
       try {
         await applyLabel(execution, pullNumber);
@@ -269,7 +282,7 @@ function isExactUpdatedPull(
     pull.number === pullNumber &&
     pull.headSha === newSha &&
     pull.title === execution.inputs.prTitle &&
-    pull.body === body
+    bodiesEqual(pull.body, body)
   );
 }
 
@@ -287,8 +300,12 @@ function isExactOriginalMetadataPull(
     pull.number === original.number &&
     pull.headSha === newSha &&
     pull.title === original.title &&
-    pull.body === original.body
+    bodiesEqual(pull.body, original.body)
   );
+}
+
+function bodiesEqual(left: string | null, right: string | null): boolean {
+  return left?.replaceAll("\r\n", "\n") === right?.replaceAll("\r\n", "\n");
 }
 
 async function recoverAmbiguousCreatedPull(
@@ -417,11 +434,25 @@ function validateBranch(
       value.startsWith("-") ||
       value.includes("..") ||
       value.includes("@{") ||
-      /[\s~^:?*[\]\\]/u.test(value) ||
+      /[\u0000-\u0020\u007F~^:?*[\]\\]/u.test(value) ||
       value.startsWith("/") ||
       (!allowTrailingSlash && value.endsWith("/")) ||
       value.endsWith(".") ||
-      value.includes("//")
+      value.includes("//") ||
+      value === "@"
+    ) {
+      throw new Error(`Invalid ${name}: ${JSON.stringify(value)}`);
+    }
+    const components = (
+      allowTrailingSlash ? value.replace(/\/$/u, "") : value
+    ).split("/");
+    if (
+      components.some(
+        (component) =>
+          component === "" ||
+          component.startsWith(".") ||
+          component.endsWith(".lock"),
+      )
     ) {
       throw new Error(`Invalid ${name}: ${JSON.stringify(value)}`);
     }
@@ -470,6 +501,21 @@ async function assertBaseCommit(execution: ActionExecution): Promise<void> {
   ]);
 }
 
+async function assertOwnershipLabel(execution: ActionExecution): Promise<void> {
+  try {
+    await execution.client.rest.issues.getLabel({
+      owner: execution.context.owner,
+      repo: execution.context.repository,
+      name: execution.inputs.label,
+    });
+  } catch (error) {
+    throw new Error(
+      `Configured ownership label ${JSON.stringify(execution.inputs.label)} does not exist or is not accessible`,
+      { cause: error },
+    );
+  }
+}
+
 async function observeRemoteState(
   execution: ActionExecution,
 ): Promise<RemoteState> {
@@ -500,16 +546,29 @@ async function observeRemoteState(
   const associated = pulls.map((pull) => pullFromData(pull));
   const live = associated.filter((pull) => pull.state === "open");
   const owned = live.filter((pull) => isOwned(execution, pull));
+  const exactClosedOwners =
+    sha === undefined
+      ? []
+      : associated.filter(
+          (pull) =>
+            pull.state === "closed" &&
+            pull.headSha === sha &&
+            isOwned(execution, pull),
+        );
   if (
     live.length !== owned.length ||
     owned.length > 1 ||
-    (sha === undefined ? live.length !== 0 : owned.length !== 1)
+    (sha === undefined
+      ? live.length !== 0
+      : owned.length === 0
+        ? exactClosedOwners.length !== 1
+        : owned.length !== 1)
   ) {
     throw new Error(
       "Update branch conflicts with a branch or pull request not owned by this workflow",
     );
   }
-  if (sha !== undefined && owned[0]?.headSha !== sha) {
+  if (sha !== undefined && owned[0] !== undefined && owned[0].headSha !== sha) {
     throw new Error(
       "Update pull request head does not match the observed branch revision",
     );
@@ -784,35 +843,37 @@ async function rollbackCreatedPullRequest(
   pushedSha: string,
   labelError: unknown,
 ): Promise<never> {
-  const ref = `refs/heads/${execution.inputs.updateBranch}`;
   try {
-    await gitAuthenticated(execution, execution.context.workspace, [
-      "push",
-      repositoryUrl(execution),
-      `:${ref}`,
-      `--force-with-lease=${ref}:${pushedSha}`,
-    ]);
-  } catch (rollbackError) {
-    throw new Error(
-      `Created pull request #${pullNumber}, but applying its ownership label failed; lease-protected rollback also failed, so the visible pull request and branch were preserved`,
-      { cause: new AggregateError([labelError, rollbackError]) },
-    );
-  }
-  try {
-    await execution.client.rest.pulls.update({
+    const response = await execution.client.rest.pulls.update({
       owner: execution.context.owner,
       repo: execution.context.repository,
       pull_number: pullNumber,
       state: "closed",
     });
+    const closed = pullFromData(response.data);
+    if (
+      closed.number !== pullNumber ||
+      closed.state !== "closed" ||
+      closed.headSha !== pushedSha
+    ) {
+      throw new Error("GitHub returned an unexpected pull request after close");
+    }
   } catch (closeError) {
     throw new Error(
-      `Applying the ownership label failed and the update branch was rolled back, but pull request #${pullNumber} could not be closed`,
+      `Created pull request #${pullNumber}, but applying or proving its ownership failed; closing it also failed, so its branch was preserved`,
       { cause: new AggregateError([labelError, closeError]) },
     );
   }
+  try {
+    await deleteBranch(execution, pushedSha);
+  } catch (rollbackError) {
+    throw new Error(
+      `Created pull request #${pullNumber} was closed after ownership setup failed, but lease-protected branch rollback also failed; the branch was preserved`,
+      { cause: new AggregateError([labelError, rollbackError]) },
+    );
+  }
   throw new Error(
-    `Applying the ownership label failed; pull request #${pullNumber} was closed and its branch was rolled back`,
+    `Applying or proving pull request ownership failed; pull request #${pullNumber} was closed and its branch was lease-rolled back`,
     { cause: labelError },
   );
 }
@@ -936,7 +997,7 @@ async function gitAuthenticated(
       "git",
       hardenedGitArguments([
         "-c",
-        `http.https://github.com/.extraheader=AUTHORIZATION: basic ${credential}`,
+        `http.${execution.context.serverUrl}/.extraheader=AUTHORIZATION: basic ${credential}`,
         "-C",
         workspace,
         ...arguments_,
@@ -952,7 +1013,7 @@ async function gitAuthenticated(
 }
 
 function repositoryUrl(execution: ActionExecution): string {
-  return `https://github.com/${execution.context.repositoryFullName}.git`;
+  return `${execution.context.serverUrl}/${execution.context.repositoryFullName}.git`;
 }
 
 async function gitExit(

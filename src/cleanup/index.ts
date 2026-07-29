@@ -39,6 +39,7 @@ export async function cleanupUpdateBranches(
     execution.context.owner,
     execution.context.repository,
     execution.inputs.token,
+    execution.context.serverUrl,
   );
   return cleanupWithApi(api, execution, options);
 }
@@ -360,14 +361,14 @@ async function reopenAndProtect(
     const index = result.closedPullRequests.indexOf(identity.number);
     if (index >= 0) result.closedPullRequests.splice(index, 1);
     let current: Payload;
-    let etag: string;
     try {
-      ({ pull: current, etag } = await api.getVersionedPull(identity.number));
-    } catch {
-      continue;
+      current = await api.getPull(identity.number);
+    } catch (error: unknown) {
+      if (isStatus(error, 404) || isStatus(error, 410)) continue;
+      throw error;
     }
     if (canCompensate(current, identity, policy)) {
-      const reopened = await api.reopenPull(identity.number, etag);
+      const reopened = await api.reopenPull(identity.number);
       if (
         reopened.state !== "open" ||
         pullNumber(reopened) !== identity.number ||
@@ -380,6 +381,15 @@ async function reopenAndProtect(
     }
   }
   protectedBranches.add(branch);
+}
+
+function isStatus(error: unknown, status: number): boolean {
+  return (
+    error !== null &&
+    typeof error === "object" &&
+    "status" in error &&
+    (error as { readonly status?: unknown }).status === status
+  );
 }
 
 function canCompensate(

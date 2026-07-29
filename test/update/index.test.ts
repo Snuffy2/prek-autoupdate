@@ -141,6 +141,46 @@ describe("non-mutating update preflight", () => {
     ).rejects.toThrow(/base branch/u);
   });
 
+  it.each([
+    ".hidden",
+    "chore/.hidden/update",
+    "chore/update.lock",
+    "chore/update/.lock",
+    "@",
+  ])("rejects Git-invalid update branch %s", async (updateBranch) => {
+    const execution = await makeExecution([]);
+    await expect(
+      validateUpdateConfiguration({
+        ...execution,
+        inputs: { ...execution.inputs, updateBranch },
+      }),
+    ).rejects.toThrow(/Invalid update-branch/u);
+  });
+
+  it.each([".automation/", "automation/.hidden/", "automation/owned.lock/"])(
+    "rejects Git-invalid cleanup prefix %s",
+    async (branchPrefix) => {
+      const execution = await makeExecution([]);
+      await expect(
+        validateUpdateConfiguration({
+          ...execution,
+          inputs: { ...execution.inputs, branchPrefix },
+        }),
+      ).rejects.toThrow(/Invalid branch-prefix/u);
+    },
+  );
+
+  it("fails preflight clearly when the ownership label is unavailable", async () => {
+    const execution = await makeExecution([]);
+    vi.mocked(execution.client.rest.issues.getLabel).mockRejectedValueOnce(
+      Object.assign(new Error("missing"), { status: 404 }),
+    );
+
+    await expect(validateUpdateConfiguration(execution)).rejects.toThrow(
+      /ownership label "dependencies" does not exist or is not accessible/u,
+    );
+  });
+
   it.each(["github-actions[bot]", "pat-owner"])(
     "uses authenticated login %s for ownership",
     async (authenticatedLogin) => {
@@ -249,6 +289,9 @@ async function makeExecution(
     paginate: async () => effectivePulls,
     rest: {
       git: { getRef },
+      issues: {
+        getLabel: vi.fn(async () => ({ data: { name: "dependencies" } })),
+      },
       pulls: {
         get: async () => ({ data: effectivePulls[0] }),
         list: async () => ({ data: [] }),
@@ -271,6 +314,7 @@ async function makeExecution(
       owner: "owner",
       repository: "repo",
       repositoryFullName: "owner/repo",
+      serverUrl: "https://github.com",
       workspace,
     },
     inputs: {

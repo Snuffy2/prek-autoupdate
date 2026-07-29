@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -34,6 +34,7 @@ afterEach(async () => {
   process.env.PATH = originalPath;
   delete process.env.TEST_GIT_LOG;
   delete process.env.TEST_GIT_REMOTE;
+  delete process.env.TEST_GIT_URL;
   delete process.env.TEST_GIT_FAIL_PUSH;
   delete process.env.TEST_GIT_FAIL_DIFF;
   installPrek.mockReset();
@@ -45,6 +46,30 @@ afterEach(async () => {
 });
 
 describe("update publication races", () => {
+  it("scopes authenticated pushes to the configured Actions server", async () => {
+    const harness = await makeHarness();
+    const serverUrl = "https://github.example.com";
+    const execution: ActionExecution = {
+      ...harness.execution,
+      context: { ...harness.execution.context, serverUrl },
+    };
+    process.env.TEST_GIT_URL = `${serverUrl}/owner/repo.git`;
+    harness.create.mockRejectedValue(
+      Object.assign(new Error("bad"), { status: 422 }),
+    );
+
+    await expect(runUpdate(execution)).rejects.toThrow(/lease-rolled back/u);
+    const observedPushes = await pushes(harness.log);
+    expect(observedPushes).toHaveLength(2);
+    for (const push of observedPushes) {
+      expect(push).toContain(
+        "http.https://github.example.com/.extraheader=AUTHORIZATION: basic",
+      );
+      expect(push).toContain("https://github.example.com/owner/repo.git");
+      expect(push).not.toContain("https://github.com/owner/repo.git");
+    }
+  });
+
   it("lease-deletes the exact pushed SHA after a definite create failure", async () => {
     const harness = await makeHarness();
     harness.create.mockRejectedValue(
@@ -63,6 +88,38 @@ describe("update publication races", () => {
       ),
     ]);
     expect(harness.update).not.toHaveBeenCalled();
+  });
+
+  it("recovers an exact concurrent pull even when create reports 422", async () => {
+    const harness = await makeHarness();
+    harness.create.mockRejectedValue(
+      Object.assign(new Error("already exists"), { status: 422 }),
+    );
+    harness.paginate.mockResolvedValueOnce([]).mockImplementation(async () => [
+      mergePull(harness.pull, {
+        number: 77,
+        head: {
+          ...harness.pull.head,
+          sha: await remoteSha(harness.remote),
+        },
+      }),
+    ]);
+    harness.get.mockImplementation(async () => ({
+      data: mergePull(harness.pull, {
+        number: 77,
+        head: {
+          ...harness.pull.head,
+          sha: await remoteSha(harness.remote),
+        },
+      }),
+      headers: { etag: '"created"' },
+    }));
+
+    await expect(runUpdate(harness.execution)).resolves.toEqual({
+      operation: "created",
+      pullRequestNumber: 77,
+    });
+    expect(await pushes(harness.log)).toHaveLength(1);
   });
 
   it("preserves the pushed branch when create has an ambiguous outcome", async () => {
@@ -232,22 +289,24 @@ describe("update publication races", () => {
 
   it("preserves the new branch when an applied metadata update cannot be verified", async () => {
     const harness = await makeHarness({ existing: true });
-    harness.update.mockResolvedValueOnce({
-      data: mergePull(harness.pull, { body: "unexpected response" }),
-      headers: { etag: '"unexpected"' },
-    });
-    let calls = 0;
+    let metadataUpdateAttempted = false;
     harness.get.mockImplementation(async () => {
-      calls += 1;
-      if (calls === 3) {
+      const sha = await remoteSha(harness.remote);
+      if (metadataUpdateAttempted && sha !== harness.oldSha) {
         throw new Error("verification timeout");
       }
-      const sha = await remoteSha(harness.remote);
       return {
         data: mergePull(harness.pull, {
           head: { ...harness.pull.head, sha },
         }),
         headers: { etag: '"after"' },
+      };
+    });
+    harness.update.mockImplementationOnce(async () => {
+      metadataUpdateAttempted = true;
+      return {
+        data: mergePull(harness.pull, { body: "unexpected response" }),
+        headers: { etag: '"unexpected"' },
       };
     });
 
@@ -256,6 +315,128 @@ describe("update publication races", () => {
     );
     expect(await remoteSha(harness.remote)).not.toBe(harness.oldSha);
     expect(await pushes(harness.log)).toHaveLength(1);
+  });
+
+  it("normalizes CRLF only when verifying unchanged original metadata", async () => {
+    const harness = await makeHarness({ existing: true });
+    harness.pull.body = `${BODY_MARKER}\r\noriginal`;
+    harness.update.mockRejectedValueOnce(new Error("timeout"));
+    harness.get.mockImplementation(async () => ({
+      data: mergePull(harness.pull, {
+        body: `${BODY_MARKER}\noriginal`,
+        head: {
+          ...harness.pull.head,
+          sha: await remoteSha(harness.remote),
+        },
+      }),
+      headers: { etag: '"after"' },
+    }));
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /lease-rolled back/u,
+    );
+    expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
+  });
+
+  it("normalizes CRLF when verifying freshly updated metadata", async () => {
+    const harness = await makeHarness({ existing: true });
+    await writeFile(
+      harness.prek,
+      "#!/bin/sh\nprintf 'updated\\n' > prek.toml\nprintf 'detail\\n'\n",
+    );
+    harness.update.mockResolvedValueOnce({
+      data: mergePull(harness.pull, { body: "unexpected response" }),
+      headers: { etag: '"unexpected"' },
+    });
+    const updatedBody = `${BODY_MARKER}\r\n\r\n<details><summary>prek output</summary>\r\n\r\n\`\`\`text\r\ndetail\r\n\`\`\`\r\n</details>`;
+    harness.get.mockImplementation(async () => ({
+      data: mergePull(harness.pull, {
+        body: updatedBody,
+        head: {
+          ...harness.pull.head,
+          sha: await remoteSha(harness.remote),
+        },
+      }),
+      headers: { etag: '"after"' },
+    }));
+
+    await expect(runUpdate(harness.execution)).resolves.toEqual({
+      operation: "updated",
+      pullRequestNumber: 42,
+    });
+  });
+
+  it("reconciles a branch tied to one exact closed owned pull request", async () => {
+    const harness = await makeHarness({ existing: true, closedExisting: true });
+    harness.create.mockImplementation(async () => ({
+      data: mergePull(harness.pull, {
+        number: 77,
+        state: "open",
+        closed_at: null,
+        head: {
+          ...harness.pull.head,
+          sha: await remoteSha(harness.remote),
+        },
+      }),
+    }));
+    harness.get.mockImplementation(async () => ({
+      data: mergePull(harness.pull, {
+        number: 77,
+        state: "open",
+        closed_at: null,
+        head: {
+          ...harness.pull.head,
+          sha: await remoteSha(harness.remote),
+        },
+      }),
+      headers: { etag: '"created"' },
+    }));
+
+    await expect(runUpdate(harness.execution)).resolves.toEqual({
+      operation: "created",
+      pullRequestNumber: 77,
+    });
+    expect(harness.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves a created branch when closing after label failure fails", async () => {
+    const harness = await makeHarness();
+    harness.create.mockImplementation(async () => ({
+      data: mergePull(harness.pull, {
+        head: {
+          ...harness.pull.head,
+          sha: await remoteSha(harness.remote),
+        },
+      }),
+    }));
+    harness.addLabels.mockRejectedValueOnce(new Error("label failed"));
+    harness.update.mockRejectedValueOnce(new Error("close failed"));
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /closing it also failed.*branch was preserved/u,
+    );
+    expect(await pushes(harness.log)).toHaveLength(1);
+  });
+
+  it("closes a created pull before lease-deleting after label failure", async () => {
+    const harness = await makeHarness();
+    harness.create.mockImplementation(async () => ({
+      data: mergePull(harness.pull, {
+        head: {
+          ...harness.pull.head,
+          sha: await remoteSha(harness.remote),
+        },
+      }),
+    }));
+    harness.addLabels.mockRejectedValueOnce(new Error("label failed"));
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /closed and its branch was lease-rolled back/u,
+    );
+    expect(harness.update).toHaveBeenCalledWith(
+      expect.objectContaining({ pull_number: 42, state: "closed" }),
+    );
+    expect(await pushes(harness.log)).toHaveLength(2);
   });
 
   it("accepts an unexpected update response only after an exact fresh GET", async () => {
@@ -399,6 +580,7 @@ describe("no-change close compensation", () => {
 
 interface HarnessOptions {
   existing?: boolean;
+  closedExisting?: boolean;
   noChange?: boolean;
   loseAfterPush?: boolean;
   baseDriftAt?: number;
@@ -457,6 +639,10 @@ async function makeHarness(options: HarnessOptions = {}) {
   installPrek.mockResolvedValue(prek);
 
   const pull = ownedPull(oldSha);
+  if (options.closedExisting) {
+    pull.state = "closed";
+    pull.closed_at = "2026-07-28T00:00:00Z";
+  }
   const create = vi.fn();
   let closedPull: ReturnType<typeof ownedPull> | undefined;
   const update = vi.fn(
@@ -475,7 +661,7 @@ async function makeHarness(options: HarnessOptions = {}) {
         title: title ?? pull.title,
         head: {
           ...pull.head,
-          sha: state === undefined ? await remoteSha(remote) : pull.head.sha,
+          sha: await remoteSha(remote),
         },
         updated_at:
           state === "closed" ? "2026-07-28T00:00:01Z" : pull.updated_at,
@@ -526,11 +712,12 @@ async function makeHarness(options: HarnessOptions = {}) {
   });
   const paginate = vi.fn(async () => (options.existing ? [pull] : []));
   const addLabels = vi.fn();
+  const getLabel = vi.fn(async () => ({ data: { name: "dependencies" } }));
   const client = {
     paginate,
     rest: {
       git: { getRef },
-      issues: { addLabels },
+      issues: { addLabels, getLabel },
       pulls: { create, get, list: vi.fn(), update },
     },
   } as unknown as GitHubClient;
@@ -544,6 +731,7 @@ async function makeHarness(options: HarnessOptions = {}) {
       owner: "owner",
       repository: "repo",
       repositoryFullName: "owner/repo",
+      serverUrl: "https://github.com",
       workspace,
     },
     inputs: {
@@ -559,6 +747,7 @@ async function makeHarness(options: HarnessOptions = {}) {
       updateDay: 1,
     },
   } satisfies ActionExecution;
+  process.env.TEST_GIT_URL = `${execution.context.serverUrl}/${execution.context.repositoryFullName}.git`;
   return {
     addLabels,
     create,
@@ -567,6 +756,7 @@ async function makeHarness(options: HarnessOptions = {}) {
     log,
     oldSha,
     paginate,
+    prek,
     pull,
     remote,
     update,
@@ -574,14 +764,14 @@ async function makeHarness(options: HarnessOptions = {}) {
 }
 
 async function installGitProxy(directory: string): Promise<void> {
-  await exec("mkdir", ["-p", directory]);
+  await mkdir(directory, { recursive: true });
   const realGit = (await exec("which", ["git"])).stdout.trim();
   await writeFile(
     path.join(directory, "git"),
     `#!/bin/sh
 args=""
 for arg in "$@"; do
-  [ "$arg" = "https://github.com/owner/repo.git" ] && arg="$TEST_GIT_REMOTE"
+  [ "$arg" = "$TEST_GIT_URL" ] && arg="$TEST_GIT_REMOTE"
   args="$args '$arg'"
 done
 case " $* " in
@@ -633,7 +823,7 @@ function ownedPull(sha: string) {
   return {
     base: { ref: "main" },
     body: BODY_MARKER,
-    closed_at: null,
+    closed_at: null as string | null,
     head: { ref: "chore/prek-updates", repo: { full_name: "owner/repo" }, sha },
     labels: [{ name: "dependencies" }],
     number: 42,

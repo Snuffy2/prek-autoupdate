@@ -19,7 +19,13 @@ const BLOCKED_GIT_VARIABLES = new Set([
   "SSH_ASKPASS",
 ]);
 
-const TRUSTED_SYSTEM_PATH = "/usr/bin:/bin";
+const TRUSTED_SYSTEM_PATH = [
+  "/usr/local/bin",
+  "/usr/bin",
+  "/bin",
+  "/run/current-system/sw/bin",
+  "/nix/var/nix/profiles/default/bin",
+].join(":");
 
 /** Return a child environment without action inputs or caller-controlled Git behavior. */
 export function sanitizedChildEnvironment(

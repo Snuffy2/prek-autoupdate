@@ -36010,7 +36010,13 @@ const BLOCKED_GIT_VARIABLES = new Set([
     "GIT_WORK_TREE",
     "SSH_ASKPASS",
 ]);
-const TRUSTED_SYSTEM_PATH = "/usr/bin:/bin";
+const TRUSTED_SYSTEM_PATH = [
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/run/current-system/sw/bin",
+    "/nix/var/nix/profiles/default/bin",
+].join(":");
 /** Return a child environment without action inputs or caller-controlled Git behavior. */
 function sanitizedChildEnvironment(additions = {}) {
     const environment = {};
@@ -36187,11 +36193,13 @@ class OctokitCleanupApi {
     owner;
     repo;
     token;
-    constructor(client, owner, repo, token) {
+    serverUrl;
+    constructor(client, owner, repo, token, serverUrl) {
         this.client = client;
         this.owner = owner;
         this.repo = repo;
         this.token = token;
+        this.serverUrl = serverUrl;
     }
     async listPulls(state) {
         const pulls = [];
@@ -36223,26 +36231,14 @@ class OctokitCleanupApi {
         });
         return payload(response.data, "pull request object");
     }
-    async getVersionedPull(number) {
-        const response = await this.client.rest.pulls.get({
-            owner: this.owner,
-            repo: this.repo,
-            pull_number: number,
-        });
-        const etag = response.headers.etag;
-        if (typeof etag !== "string")
-            throw new TypeError("Expected pull ETag");
-        return { pull: payload(response.data, "pull request object"), etag };
-    }
-    async reopenPull(number, etag) {
-        const response = await this.client.rest.pulls.update({
+    async reopenPull(number) {
+        await this.client.rest.pulls.update({
             owner: this.owner,
             repo: this.repo,
             pull_number: number,
             state: "open",
-            headers: { "if-match": etag },
         });
-        const reopened = payload(response.data, "reopened pull request object");
+        const reopened = await this.getPull(number);
         if (reopened.number !== number || reopened.state !== "open")
             throw new TypeError("Reopen response did not match requested pull");
         return reopened;
@@ -36273,10 +36269,12 @@ class OctokitCleanupApi {
         }
         if (!Array.isArray(data.files))
             throw new TypeError("Expected comparison file list");
-        if (typeof data.total_commits === "number" &&
-            data.files.length === 300 &&
-            typeof data.changed_files === "number" &&
-            data.changed_files > data.files.length)
+        const changedFiles = data.changed_files;
+        if (data.files.length === 300 &&
+            (typeof changedFiles !== "number" ||
+                !Number.isInteger(changedFiles) ||
+                changedFiles < 0 ||
+                changedFiles > data.files.length))
             throw new TypeError("Comparison file list exceeded GitHub's 300-file limit");
         return data.files.map((file) => payload(file, "comparison file"));
     }
@@ -36322,7 +36320,7 @@ class OctokitCleanupApi {
             return response.data.object.sha;
         }
         catch (error) {
-            if (isStatus(error, 404))
+            if (isStatus$1(error, 404))
                 return undefined;
             throw error;
         }
@@ -36343,9 +36341,9 @@ class OctokitCleanupApi {
                     "-C",
                     directory,
                     "-c",
-                    `http.https://github.com/.extraheader=AUTHORIZATION: basic ${credential}`,
+                    `http.${this.serverUrl}/.extraheader=AUTHORIZATION: basic ${credential}`,
                     "push",
-                    `https://github.com/${this.owner}/${this.repo}.git`,
+                    `${this.serverUrl}/${this.owner}/${this.repo}.git`,
                     `--force-with-lease=${fullRef}:${expectedSha}`,
                     `:${fullRef}`,
                 ]), { env: environment, timeout: GIT_TIMEOUT_MS });
@@ -36365,15 +36363,22 @@ class OctokitCleanupApi {
         }
     }
     async restoreRef(ref, sha) {
-        await this.client.rest.git.createRef({
-            owner: this.owner,
-            repo: this.repo,
-            ref: `refs/${ref}`,
-            sha,
-        });
+        try {
+            await this.client.rest.git.createRef({
+                owner: this.owner,
+                repo: this.repo,
+                ref: `refs/${ref}`,
+                sha,
+            });
+        }
+        catch (error) {
+            if (isStatus$1(error, 422) && (await this.getRefSha(ref)) !== undefined)
+                return;
+            throw error;
+        }
     }
 }
-function isStatus(error, status) {
+function isStatus$1(error, status) {
     return (error !== null &&
         typeof error === "object" &&
         "status" in error &&
@@ -36382,7 +36387,7 @@ function isStatus(error, status) {
 
 const BODY_MARKER$1 = "Automated update of `prek` hooks.";
 async function cleanupUpdateBranches(execution, options) {
-    const api = new OctokitCleanupApi(execution.client, execution.context.owner, execution.context.repository, execution.inputs.token);
+    const api = new OctokitCleanupApi(execution.client, execution.context.owner, execution.context.repository, execution.inputs.token, execution.context.serverUrl);
     return cleanupWithApi(api, execution, options);
 }
 async function cleanupWithApi(api, execution, options) {
@@ -36575,15 +36580,16 @@ async function reopenAndProtect(api, pulls, branch, protectedBranches, result, p
         if (index >= 0)
             result.closedPullRequests.splice(index, 1);
         let current;
-        let etag;
         try {
-            ({ pull: current, etag } = await api.getVersionedPull(identity.number));
+            current = await api.getPull(identity.number);
         }
-        catch {
-            continue;
+        catch (error) {
+            if (isStatus(error, 404) || isStatus(error, 410))
+                continue;
+            throw error;
         }
         if (canCompensate(current, identity, policy)) {
-            const reopened = await api.reopenPull(identity.number, etag);
+            const reopened = await api.reopenPull(identity.number);
             if (reopened.state !== "open" ||
                 pullNumber(reopened) !== identity.number ||
                 !isWorkflowPull(reopened, policy) ||
@@ -36594,6 +36600,12 @@ async function reopenAndProtect(api, pulls, branch, protectedBranches, result, p
         }
     }
     protectedBranches.add(branch);
+}
+function isStatus(error, status) {
+    return (error !== null &&
+        typeof error === "object" &&
+        "status" in error &&
+        error.status === status);
 }
 function canCompensate(pull, identity, policy) {
     const current = closeIdentity(pull);
@@ -36708,12 +36720,19 @@ function parseInputs() {
     coreExports.setSecret(token);
     delete process.env.INPUT_TOKEN;
     const updateDayText = coreExports.getInput("update-day", { required: true });
+    const updateDay = Number(updateDayText);
+    if (updateDayText.trim() === "" ||
+        !Number.isInteger(updateDay) ||
+        updateDay < 0 ||
+        updateDay > 6) {
+        throw new Error("update-day must be an integer from 0 through 6");
+    }
     const cooldownDays = coreExports.getInput("cooldown-days", { required: true });
     return {
         token,
         authorLogin: nonEmptyInput("author-login"),
         cooldownDays,
-        updateDay: Number(updateDayText),
+        updateDay,
         updateBranch: nonEmptyInput("update-branch"),
         branchPrefix: nonEmptyInput("branch-prefix"),
         label: nonEmptyInput("label"),
@@ -36740,6 +36759,7 @@ async function resolveContext(client, inputs) {
     }
     const { owner, repo: repository } = context.repo;
     const repositoryFullName = `${owner}/${repository}`;
+    const serverUrl = normalizeServerUrl(context.serverUrl);
     const baseBranch = await git$1(workspace, [
         "symbolic-ref",
         "--quiet",
@@ -36752,6 +36772,7 @@ async function resolveContext(client, inputs) {
         owner,
         repository,
         repositoryFullName,
+        serverUrl,
         workspace,
         baseBranch,
         baseSha,
@@ -36773,7 +36794,7 @@ async function validateCheckout(context) {
         "get-url",
         "origin",
     ]);
-    if (!remoteMatchesRepository(remoteUrl, context.repositoryFullName)) {
+    if (!remoteMatchesRepository(remoteUrl, context.serverUrl, context.repositoryFullName)) {
         throw new Error("The caller checkout origin does not match the workflow repository");
     }
     const persistedCredential = await gitOptional(context.workspace, [
@@ -36845,12 +36866,55 @@ async function gitOptional(workspace, arguments_) {
         throw error;
     }
 }
-function remoteMatchesRepository(remoteUrl, repositoryFullName) {
-    const normalized = remoteUrl
-        .replace(/^git@github\.com:/u, "")
-        .replace(/^https:\/\/github\.com\//u, "")
-        .replace(/\.git$/u, "");
-    return normalized.toLowerCase() === repositoryFullName.toLowerCase();
+function remoteMatchesRepository(remoteUrl, serverUrl, repositoryFullName) {
+    const server = new URL(serverUrl);
+    const expectedPath = repositoryFullName.toLowerCase();
+    const scp = remoteUrl.includes("://")
+        ? null
+        : /^(?:[^@/:]+@)?([^/:]+):(.+)$/u.exec(remoteUrl);
+    if (scp !== null) {
+        return (scp[1]?.toLowerCase() === server.hostname.toLowerCase() &&
+            normalizeRepositoryPath(scp[2] ?? "") === expectedPath);
+    }
+    try {
+        const remote = new URL(remoteUrl);
+        const supportedProtocol = remote.protocol === "https:" || remote.protocol === "ssh:";
+        const originMatches = remote.protocol === "https:"
+            ? remote.origin.toLowerCase() === server.origin.toLowerCase()
+            : remote.hostname.toLowerCase() === server.hostname.toLowerCase();
+        return (supportedProtocol &&
+            originMatches &&
+            normalizeRepositoryPath(remote.pathname) === expectedPath);
+    }
+    catch {
+        return false;
+    }
+}
+function normalizeRepositoryPath(value) {
+    return value
+        .replace(/^\/+/u, "")
+        .replace(/\.git$/u, "")
+        .replace(/\/+$/u, "")
+        .toLowerCase();
+}
+function normalizeServerUrl(value) {
+    let server;
+    try {
+        server = new URL(value);
+    }
+    catch {
+        throw new Error("GITHUB_SERVER_URL must be a valid HTTPS origin");
+    }
+    if (server.protocol !== "https:" ||
+        server.username !== "" ||
+        server.password !== "" ||
+        server.search !== "" ||
+        server.hash !== "" ||
+        server.hostname === "" ||
+        (server.pathname !== "" && server.pathname !== "/")) {
+        throw new Error("GITHUB_SERVER_URL must be a valid HTTPS origin");
+    }
+    return server.origin;
 }
 
 // We use any as a valid input type
@@ -42138,6 +42202,7 @@ async function validateUpdateConfiguration(execution) {
         validateAddPath(addPath);
     }
     await assertBaseCommit(execution);
+    await assertOwnershipLabel(execution);
 }
 /** Validate the ownership namespace before cleanup is allowed to mutate. */
 function validateCleanupConfiguration(execution) {
@@ -42209,19 +42274,30 @@ async function runUpdate(execution) {
                 pullNumber = response.data.number;
             }
             catch (error) {
-                if (isDefiniteCreateFailure(error)) {
-                    await rollbackNewBranch(execution, newSha, error);
-                }
+                let recovered;
                 try {
-                    const recovered = await recoverAmbiguousCreatedPull(execution, newSha, body);
-                    if (recovered === undefined) {
-                        throw new Error("No exact created pull request was observable");
-                    }
-                    pullNumber = recovered;
+                    recovered = await recoverAmbiguousCreatedPull(execution, newSha, body);
                 }
                 catch (recoveryError) {
                     throw new Error("Pull request creation had an ambiguous outcome; the lease-protected update branch was preserved for inspection", { cause: new AggregateError([error, recoveryError]) });
                 }
+                if (recovered !== undefined) {
+                    pullNumber = recovered;
+                }
+                else if (isDefiniteCreateFailure(error)) {
+                    await rollbackNewBranch(execution, newSha, error);
+                }
+                else {
+                    throw new Error("Pull request creation had an ambiguous outcome; the lease-protected update branch was preserved for inspection", {
+                        cause: new AggregateError([
+                            error,
+                            new Error("No exact created pull request was observable"),
+                        ]),
+                    });
+                }
+            }
+            if (pullNumber === undefined) {
+                throw new Error("Pull request creation did not return a pull number");
             }
             try {
                 await applyLabel(execution, pullNumber);
@@ -42301,7 +42377,7 @@ function isExactUpdatedPull(execution, pull, pullNumber, newSha, body) {
         pull.number === pullNumber &&
         pull.headSha === newSha &&
         pull.title === execution.inputs.prTitle &&
-        pull.body === body);
+        bodiesEqual(pull.body, body));
 }
 function isExactOriginalMetadataPull(execution, pull, remote, newSha) {
     const original = remote.ownedPullRequest;
@@ -42311,7 +42387,10 @@ function isExactOriginalMetadataPull(execution, pull, remote, newSha) {
         pull.number === original.number &&
         pull.headSha === newSha &&
         pull.title === original.title &&
-        pull.body === original.body);
+        bodiesEqual(pull.body, original.body));
+}
+function bodiesEqual(left, right) {
+    return left?.replaceAll("\r\n", "\n") === right?.replaceAll("\r\n", "\n");
 }
 async function recoverAmbiguousCreatedPull(execution, newSha, body) {
     const pulls = await execution.client.paginate(execution.client.rest.pulls.list, {
@@ -42399,11 +42478,18 @@ function validateBranch(updateBranch, prefix, baseBranch) {
             value.startsWith("-") ||
             value.includes("..") ||
             value.includes("@{") ||
-            /[\s~^:?*[\]\\]/u.test(value) ||
+            /[\u0000-\u0020\u007F~^:?*[\]\\]/u.test(value) ||
             value.startsWith("/") ||
             (!allowTrailingSlash && value.endsWith("/")) ||
             value.endsWith(".") ||
-            value.includes("//")) {
+            value.includes("//") ||
+            value === "@") {
+            throw new Error(`Invalid ${name}: ${JSON.stringify(value)}`);
+        }
+        const components = (allowTrailingSlash ? value.replace(/\/$/u, "") : value).split("/");
+        if (components.some((component) => component === "" ||
+            component.startsWith(".") ||
+            component.endsWith(".lock"))) {
             throw new Error(`Invalid ${name}: ${JSON.stringify(value)}`);
         }
     }
@@ -42442,6 +42528,18 @@ async function assertBaseCommit(execution) {
         execution.context.baseSha,
     ]);
 }
+async function assertOwnershipLabel(execution) {
+    try {
+        await execution.client.rest.issues.getLabel({
+            owner: execution.context.owner,
+            repo: execution.context.repository,
+            name: execution.inputs.label,
+        });
+    }
+    catch (error) {
+        throw new Error(`Configured ownership label ${JSON.stringify(execution.inputs.label)} does not exist or is not accessible`, { cause: error });
+    }
+}
 async function observeRemoteState(execution) {
     let sha;
     try {
@@ -42467,12 +42565,21 @@ async function observeRemoteState(execution) {
     const associated = pulls.map((pull) => pullFromData(pull));
     const live = associated.filter((pull) => pull.state === "open");
     const owned = live.filter((pull) => isOwned(execution, pull));
+    const exactClosedOwners = sha === undefined
+        ? []
+        : associated.filter((pull) => pull.state === "closed" &&
+            pull.headSha === sha &&
+            isOwned(execution, pull));
     if (live.length !== owned.length ||
         owned.length > 1 ||
-        (sha === undefined ? live.length !== 0 : owned.length !== 1)) {
+        (sha === undefined
+            ? live.length !== 0
+            : owned.length === 0
+                ? exactClosedOwners.length !== 1
+                : owned.length !== 1)) {
         throw new Error("Update branch conflicts with a branch or pull request not owned by this workflow");
     }
-    if (sha !== undefined && owned[0]?.headSha !== sha) {
+    if (sha !== undefined && owned[0] !== undefined && owned[0].headSha !== sha) {
         throw new Error("Update pull request head does not match the observed branch revision");
     }
     return { sha, ownedPullRequest: owned[0] };
@@ -42662,30 +42769,30 @@ async function applyLabel(execution, pullNumber) {
     });
 }
 async function rollbackCreatedPullRequest(execution, pullNumber, pushedSha, labelError) {
-    const ref = `refs/heads/${execution.inputs.updateBranch}`;
     try {
-        await gitAuthenticated(execution, execution.context.workspace, [
-            "push",
-            repositoryUrl(execution),
-            `:${ref}`,
-            `--force-with-lease=${ref}:${pushedSha}`,
-        ]);
-    }
-    catch (rollbackError) {
-        throw new Error(`Created pull request #${pullNumber}, but applying its ownership label failed; lease-protected rollback also failed, so the visible pull request and branch were preserved`, { cause: new AggregateError([labelError, rollbackError]) });
-    }
-    try {
-        await execution.client.rest.pulls.update({
+        const response = await execution.client.rest.pulls.update({
             owner: execution.context.owner,
             repo: execution.context.repository,
             pull_number: pullNumber,
             state: "closed",
         });
+        const closed = pullFromData(response.data);
+        if (closed.number !== pullNumber ||
+            closed.state !== "closed" ||
+            closed.headSha !== pushedSha) {
+            throw new Error("GitHub returned an unexpected pull request after close");
+        }
     }
     catch (closeError) {
-        throw new Error(`Applying the ownership label failed and the update branch was rolled back, but pull request #${pullNumber} could not be closed`, { cause: new AggregateError([labelError, closeError]) });
+        throw new Error(`Created pull request #${pullNumber}, but applying or proving its ownership failed; closing it also failed, so its branch was preserved`, { cause: new AggregateError([labelError, closeError]) });
     }
-    throw new Error(`Applying the ownership label failed; pull request #${pullNumber} was closed and its branch was rolled back`, { cause: labelError });
+    try {
+        await deleteBranch(execution, pushedSha);
+    }
+    catch (rollbackError) {
+        throw new Error(`Created pull request #${pullNumber} was closed after ownership setup failed, but lease-protected branch rollback also failed; the branch was preserved`, { cause: new AggregateError([labelError, rollbackError]) });
+    }
+    throw new Error(`Applying or proving pull request ownership failed; pull request #${pullNumber} was closed and its branch was lease-rolled back`, { cause: labelError });
 }
 async function rollbackNewBranch(execution, pushedSha, createError) {
     try {
@@ -42756,7 +42863,7 @@ async function gitAuthenticated(execution, workspace, arguments_) {
     try {
         const { stdout } = await execFileAsync("git", hardenedGitArguments([
             "-c",
-            `http.https://github.com/.extraheader=AUTHORIZATION: basic ${credential}`,
+            `http.${execution.context.serverUrl}/.extraheader=AUTHORIZATION: basic ${credential}`,
             "-C",
             workspace,
             ...arguments_,
@@ -42768,7 +42875,7 @@ async function gitAuthenticated(execution, workspace, arguments_) {
     }
 }
 function repositoryUrl(execution) {
-    return `https://github.com/${execution.context.repositoryFullName}.git`;
+    return `${execution.context.serverUrl}/${execution.context.repositoryFullName}.git`;
 }
 async function gitExit(workspace, arguments_) {
     try {

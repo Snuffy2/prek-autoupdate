@@ -62,7 +62,9 @@ in-flight cleanup.
 | `workflow_dispatch`              | Yes                    | Yes                                                                                   |
 | `push` to `main`                 | No                     | Yes; close the owned PR only when its paths are already identical to the current base |
 
-The action supports Linux runners on x64 and arm64. It is not supported on
+The action supports GitHub.com and GitHub Enterprise Server on Linux x64 and
+arm64 runners, including self-hosted runners with system Git installed under
+`/usr/local/bin` or standard Nix/NixOS system profiles. It is not supported on
 Windows or macOS runners.
 
 Each action release pins a verified `prek` release for reproducible updates.
@@ -80,7 +82,7 @@ runner tool cache.
 | `update-day`     | `"1"`                      | UTC day of week for scheduled updates, where `0` is Sunday and `6` is Saturday.                                    |
 | `update-branch`  | `chore/prek-updates`       | Branch used for update pull requests.                                                                              |
 | `branch-prefix`  | `chore/prek-updates`       | Prefix considered owned by cleanup.                                                                                |
-| `label`          | `dependencies`             | Pull-request label and cleanup ownership signal.                                                                   |
+| `label`          | `dependencies`             | Existing repository label used for the pull request and as a cleanup ownership signal.                             |
 | `commit-message` | `chore: update prek hooks` | Update commit message.                                                                                             |
 | `pr-title`       | `Bump prek Hooks`          | Update pull-request title.                                                                                         |
 | `add-paths`      | auto-detect                | Newline-separated git pathspecs to commit. Empty requires exactly one of `prek.toml` or `.pre-commit-config.yaml`. |

@@ -50,7 +50,7 @@ describe("sanitizedChildEnvironment", () => {
       GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_CONFIG_NOSYSTEM: "1",
       GIT_TERMINAL_PROMPT: "0",
-      PATH: "/usr/bin:/bin",
+      PATH: "/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin",
       SAFE_ACTION_VALUE: "preserved",
     });
     expect(environment).not.toHaveProperty("INPUT_TOKEN");
@@ -89,7 +89,7 @@ describe("sanitizedChildEnvironment", () => {
       GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_CONFIG_NOSYSTEM: "1",
       GIT_TERMINAL_PROMPT: "0",
-      PATH: "/usr/bin:/bin",
+      PATH: "/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin",
     });
     expect(environment).not.toHaveProperty("INPUT_TOKEN");
     expect(environment).not.toHaveProperty("GIT_TRACE");

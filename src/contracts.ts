@@ -22,6 +22,7 @@ export interface ActionContext {
   readonly owner: string;
   readonly repository: string;
   readonly repositoryFullName: string;
+  readonly serverUrl: string;
   readonly workspace: string;
   readonly baseBranch: string;
   readonly baseSha: string;

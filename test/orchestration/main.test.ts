@@ -56,6 +56,7 @@ const context: ActionContext = {
   owner: "owner",
   repository: "repo",
   repositoryFullName: "owner/repo",
+  serverUrl: "https://github.com",
   workspace: "/workspace",
   baseBranch: "main",
   baseSha: "base",

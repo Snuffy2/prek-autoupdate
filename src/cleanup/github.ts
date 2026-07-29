@@ -10,12 +10,7 @@ import {
   hardenedGitArguments,
   sanitizedChildEnvironment,
 } from "../environment.js";
-import type {
-  CleanupApi,
-  DeleteRefOutcome,
-  Payload,
-  VersionedPull,
-} from "./model.js";
+import type { CleanupApi, DeleteRefOutcome, Payload } from "./model.js";
 import { payload } from "./payload.js";
 
 const execFileAsync = promisify(execFile);
@@ -27,6 +22,7 @@ export class OctokitCleanupApi implements CleanupApi {
     private readonly owner: string,
     private readonly repo: string,
     private readonly token: string,
+    private readonly serverUrl: string,
   ) {}
 
   public async listPulls(state: "closed" | "open"): Promise<Payload[]> {
@@ -65,26 +61,14 @@ export class OctokitCleanupApi implements CleanupApi {
     return payload(response.data, "pull request object");
   }
 
-  public async getVersionedPull(number: number): Promise<VersionedPull> {
-    const response = await this.client.rest.pulls.get({
-      owner: this.owner,
-      repo: this.repo,
-      pull_number: number,
-    });
-    const etag = response.headers.etag;
-    if (typeof etag !== "string") throw new TypeError("Expected pull ETag");
-    return { pull: payload(response.data, "pull request object"), etag };
-  }
-
-  public async reopenPull(number: number, etag: string): Promise<Payload> {
-    const response = await this.client.rest.pulls.update({
+  public async reopenPull(number: number): Promise<Payload> {
+    await this.client.rest.pulls.update({
       owner: this.owner,
       repo: this.repo,
       pull_number: number,
       state: "open",
-      headers: { "if-match": etag },
     });
-    const reopened = payload(response.data, "reopened pull request object");
+    const reopened = await this.getPull(number);
     if (reopened.number !== number || reopened.state !== "open")
       throw new TypeError("Reopen response did not match requested pull");
     return reopened;
@@ -127,11 +111,13 @@ export class OctokitCleanupApi implements CleanupApi {
     }
     if (!Array.isArray(data.files))
       throw new TypeError("Expected comparison file list");
+    const changedFiles = data.changed_files;
     if (
-      typeof data.total_commits === "number" &&
       data.files.length === 300 &&
-      typeof data.changed_files === "number" &&
-      data.changed_files > data.files.length
+      (typeof changedFiles !== "number" ||
+        !Number.isInteger(changedFiles) ||
+        changedFiles < 0 ||
+        changedFiles > data.files.length)
     )
       throw new TypeError(
         "Comparison file list exceeded GitHub's 300-file limit",
@@ -215,9 +201,9 @@ export class OctokitCleanupApi implements CleanupApi {
             "-C",
             directory,
             "-c",
-            `http.https://github.com/.extraheader=AUTHORIZATION: basic ${credential}`,
+            `http.${this.serverUrl}/.extraheader=AUTHORIZATION: basic ${credential}`,
             "push",
-            `https://github.com/${this.owner}/${this.repo}.git`,
+            `${this.serverUrl}/${this.owner}/${this.repo}.git`,
             `--force-with-lease=${fullRef}:${expectedSha}`,
             `:${fullRef}`,
           ]),
@@ -239,12 +225,18 @@ export class OctokitCleanupApi implements CleanupApi {
   }
 
   public async restoreRef(ref: string, sha: string): Promise<void> {
-    await this.client.rest.git.createRef({
-      owner: this.owner,
-      repo: this.repo,
-      ref: `refs/${ref}`,
-      sha,
-    });
+    try {
+      await this.client.rest.git.createRef({
+        owner: this.owner,
+        repo: this.repo,
+        ref: `refs/${ref}`,
+        sha,
+      });
+    } catch (error: unknown) {
+      if (isStatus(error, 422) && (await this.getRefSha(ref)) !== undefined)
+        return;
+      throw error;
+    }
   }
 }
 

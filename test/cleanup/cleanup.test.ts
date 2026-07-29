@@ -44,6 +44,7 @@ const execution = {
     owner: "owner",
     repository: "repo",
     repositoryFullName: repository,
+    serverUrl: "https://github.com",
     workspace: "/workspace",
     baseBranch: "main",
     baseSha: "base",
@@ -73,7 +74,10 @@ const defaults: CleanupOptions = {
 class FakeApi implements CleanupApi {
   public open: Payload[] = [];
   public closed: Payload[] = [];
-  public details = new Map<number, Payload[]>();
+  public details = new Map<
+    number,
+    Array<Payload | Error | { status: number }>
+  >();
   public refs = new Map<string, string>();
   public refValues = new Map<string, Array<string | undefined>>();
   public comparisons: Payload[] = [];
@@ -87,7 +91,8 @@ class FakeApi implements CleanupApi {
   public deleteOutcome: DeleteRefOutcome = "deleted";
   public listOpenValues: Payload[][] = [];
   public reopenError?: Error;
-  private versionedPull?: Payload;
+  public restoreErrors: unknown[] = [];
+  public restoreConflictSha?: string;
 
   async listPulls(state: "closed" | "open"): Promise<Payload[]> {
     if (state === "open" && this.listOpenValues.length > 0)
@@ -98,24 +103,28 @@ class FakeApi implements CleanupApi {
     const values = this.details.get(number);
     if (values === undefined || values.length === 0)
       throw new Error(`No detail for ${number}`);
-    return values.length === 1 ? values[0]! : values.shift()!;
+    const value = values.length === 1 ? values[0]! : values.shift()!;
+    if (value instanceof Error || "status" in value) throw value;
+    return value;
   }
   async closePull(number: number): Promise<Payload> {
     this.closedNumbers.push(number);
     const values = this.details.get(number);
     if (values === undefined || values.length === 0)
       throw new Error(`No close for ${number}`);
-    return values.length === 1 ? values[0]! : values.shift()!;
-  }
-  async getVersionedPull(number: number) {
-    const checked = await this.getPull(number);
-    this.versionedPull = checked;
-    return { pull: checked, etag: `"${number}"` };
+    const value = values.length === 1 ? values[0]! : values.shift()!;
+    if (value instanceof Error || "status" in value) throw value;
+    return value;
   }
   async reopenPull(number: number): Promise<Payload> {
     if (this.reopenError !== undefined) throw this.reopenError;
     this.reopenedNumbers.push(number);
-    return { ...this.versionedPull, number, state: "open" };
+    const values = this.details.get(number);
+    if (values === undefined || values.length === 0)
+      throw new Error(`No reopened pull for ${number}`);
+    const current = values.length === 1 ? values[0]! : values.shift()!;
+    if (current instanceof Error || "status" in current) throw current;
+    return { ...current, number, state: "open" };
   }
   async compareFiles(): Promise<Payload[]> {
     return this.comparisons;
@@ -133,9 +142,30 @@ class FakeApi implements CleanupApi {
   }
   async deleteRef(ref: string, expected: string): Promise<DeleteRefOutcome> {
     this.deleted.push([ref, expected]);
+    if (this.deleteOutcome === "deleted") this.refs.delete(ref);
     return this.deleteOutcome;
   }
   async restoreRef(ref: string, sha: string): Promise<void> {
+    const error = this.restoreErrors.shift();
+    if (error !== undefined) {
+      if (
+        error !== null &&
+        typeof error === "object" &&
+        "status" in error &&
+        error.status === 422 &&
+        this.restoreConflictSha !== undefined
+      )
+        this.refs.set(ref, this.restoreConflictSha);
+      if (
+        error !== null &&
+        typeof error === "object" &&
+        "status" in error &&
+        error.status === 422 &&
+        this.refs.has(ref)
+      )
+        return;
+      throw error;
+    }
     this.refs.set(ref, sha);
   }
 }
@@ -506,6 +536,44 @@ describe("cleanupUpdateBranches safety behavior", () => {
     expect((failure as AggregateError).errors[1]).toBe(compensation);
   });
 
+  it("skips a vanished pull during compensation but propagates transient fetch failures", async () => {
+    const options = { ...defaults, closeObsoletePullRequests: true };
+    const vanished = new FakeApi();
+    vanished.open = [pull({ changed_files: 0 })];
+    vanished.refs.set("heads/main", "base");
+    vanished.refs.set(`heads/${branch}`, "moved");
+    vanished.details.set(1, [
+      pull({ changed_files: 0 }),
+      pull({ changed_files: 0 }),
+      pull({ changed_files: 0 }),
+      closed({ changed_files: 0 }),
+      closed({ changed_files: 0 }),
+      { status: 404 },
+    ]);
+    await expect(
+      cleanupWithApi(vanished, execution, options),
+    ).resolves.toMatchObject({ closedPullRequests: [] });
+
+    const transient = new FakeApi();
+    const timeout = new Error("pull refresh timed out");
+    transient.open = [pull({ changed_files: 0 })];
+    transient.refs.set("heads/main", "base");
+    transient.refs.set(`heads/${branch}`, "moved");
+    transient.details.set(1, [
+      pull({ changed_files: 0 }),
+      pull({ changed_files: 0 }),
+      pull({ changed_files: 0 }),
+      closed({ changed_files: 0 }),
+      closed({ changed_files: 0 }),
+      timeout,
+    ]);
+    const failure = await cleanupWithApi(transient, execution, options).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([timeout, timeout]);
+  });
+
   it.each<DeleteRefOutcome>(["already-absent", "lease-rejected"])(
     "does not claim a %s deletion outcome",
     async (outcome) => {
@@ -543,6 +611,43 @@ describe("cleanupUpdateBranches safety behavior", () => {
     expect(result.deletedBranches).toEqual([]);
     expect(api.deleted).toEqual([[`heads/${branch}`, "head"]]);
     expect(api.refs.get(`heads/${branch}`)).toBe("head");
+  });
+
+  it("treats a fake restore conflict as benign only after the ref reappears", async () => {
+    const api = new FakeApi();
+    const candidate = closed();
+    api.closed = [candidate];
+    api.refs.set(`heads/${branch}`, "head");
+    api.details.set(1, [candidate]);
+    api.listOpenValues = [[], [], [pull({ number: 9 })]];
+    api.restoreErrors = [{ status: 422 }];
+    api.restoreConflictSha = "concurrent";
+
+    await expect(cleanupWithApi(api, execution, defaults)).resolves.toEqual({
+      closedPullRequests: [],
+      deletedBranches: [],
+    });
+  });
+
+  it("retains validation and transient restoration failures", async () => {
+    const api = new FakeApi();
+    const candidate = closed();
+    const firstRestore = new Error("restore timeout");
+    const retryRestore = new Error("restore retry timeout");
+    api.closed = [candidate];
+    api.refs.set(`heads/${branch}`, "head");
+    api.details.set(1, [candidate]);
+    api.listOpenValues = [[], [], [pull({ number: 9 })]];
+    api.restoreErrors = [firstRestore, retryRestore];
+
+    const failure = await cleanupWithApi(api, execution, defaults).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      firstRestore,
+      retryRestore,
+    ]);
   });
 
   it.each([

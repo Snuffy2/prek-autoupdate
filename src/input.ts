@@ -27,13 +27,22 @@ export function parseInputs(): ActionInputs {
   delete process.env.INPUT_TOKEN;
 
   const updateDayText = core.getInput("update-day", { required: true });
+  const updateDay = Number(updateDayText);
+  if (
+    updateDayText.trim() === "" ||
+    !Number.isInteger(updateDay) ||
+    updateDay < 0 ||
+    updateDay > 6
+  ) {
+    throw new Error("update-day must be an integer from 0 through 6");
+  }
   const cooldownDays = core.getInput("cooldown-days", { required: true });
 
   return {
     token,
     authorLogin: nonEmptyInput("author-login"),
     cooldownDays,
-    updateDay: Number(updateDayText),
+    updateDay,
     updateBranch: nonEmptyInput("update-branch"),
     branchPrefix: nonEmptyInput("branch-prefix"),
     label: nonEmptyInput("label"),
@@ -71,6 +80,7 @@ export async function resolveContext(
 
   const { owner, repo: repository } = github.context.repo;
   const repositoryFullName = `${owner}/${repository}`;
+  const serverUrl = normalizeServerUrl(github.context.serverUrl);
   const baseBranch = await git(workspace, [
     "symbolic-ref",
     "--quiet",
@@ -84,6 +94,7 @@ export async function resolveContext(
     owner,
     repository,
     repositoryFullName,
+    serverUrl,
     workspace,
     baseBranch,
     baseSha,
@@ -112,7 +123,13 @@ export async function validateCheckout(context: ActionContext): Promise<void> {
     "get-url",
     "origin",
   ]);
-  if (!remoteMatchesRepository(remoteUrl, context.repositoryFullName)) {
+  if (
+    !remoteMatchesRepository(
+      remoteUrl,
+      context.serverUrl,
+      context.repositoryFullName,
+    )
+  ) {
     throw new Error(
       "The caller checkout origin does not match the workflow repository",
     );
@@ -219,11 +236,63 @@ async function gitOptional(
 
 function remoteMatchesRepository(
   remoteUrl: string,
+  serverUrl: string,
   repositoryFullName: string,
 ): boolean {
-  const normalized = remoteUrl
-    .replace(/^git@github\.com:/u, "")
-    .replace(/^https:\/\/github\.com\//u, "")
-    .replace(/\.git$/u, "");
-  return normalized.toLowerCase() === repositoryFullName.toLowerCase();
+  const server = new URL(serverUrl);
+  const expectedPath = repositoryFullName.toLowerCase();
+  const scp = remoteUrl.includes("://")
+    ? null
+    : /^(?:[^@/:]+@)?([^/:]+):(.+)$/u.exec(remoteUrl);
+  if (scp !== null) {
+    return (
+      scp[1]?.toLowerCase() === server.hostname.toLowerCase() &&
+      normalizeRepositoryPath(scp[2] ?? "") === expectedPath
+    );
+  }
+  try {
+    const remote = new URL(remoteUrl);
+    const supportedProtocol =
+      remote.protocol === "https:" || remote.protocol === "ssh:";
+    const originMatches =
+      remote.protocol === "https:"
+        ? remote.origin.toLowerCase() === server.origin.toLowerCase()
+        : remote.hostname.toLowerCase() === server.hostname.toLowerCase();
+    return (
+      supportedProtocol &&
+      originMatches &&
+      normalizeRepositoryPath(remote.pathname) === expectedPath
+    );
+  } catch {
+    return false;
+  }
+}
+
+function normalizeRepositoryPath(value: string): string {
+  return value
+    .replace(/^\/+/u, "")
+    .replace(/\.git$/u, "")
+    .replace(/\/+$/u, "")
+    .toLowerCase();
+}
+
+export function normalizeServerUrl(value: string): string {
+  let server: URL;
+  try {
+    server = new URL(value);
+  } catch {
+    throw new Error("GITHUB_SERVER_URL must be a valid HTTPS origin");
+  }
+  if (
+    server.protocol !== "https:" ||
+    server.username !== "" ||
+    server.password !== "" ||
+    server.search !== "" ||
+    server.hash !== "" ||
+    server.hostname === "" ||
+    (server.pathname !== "" && server.pathname !== "/")
+  ) {
+    throw new Error("GITHUB_SERVER_URL must be a valid HTTPS origin");
+  }
+  return server.origin;
 }

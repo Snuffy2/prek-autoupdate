@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActionContext, GitHubClient } from "../../src/contracts.js";
 import {
   parseInputs,
+  normalizeServerUrl,
   resolveAuthenticatedLogin,
   shouldUpdate,
   validateCheckout,
@@ -49,6 +50,7 @@ function checkoutContext(
     owner: "example",
     repository: "project",
     repositoryFullName,
+    serverUrl: "https://github.com",
     workspace,
   };
 }
@@ -107,18 +109,27 @@ describe("parseInputs", () => {
   });
 
   it.each([
-    ["", 0],
-    ["7", 7],
-    ["Mon", Number.NaN],
-    ["-1", -1],
-  ])(
-    "defers validation of update-day %j until the guarded update phase",
-    (updateDay, expected) => {
+    ["0", 0],
+    ["6", 6],
+    ["6.0", 6],
+  ])("accepts update-day %j as %i", (updateDay, expected) => {
+    vi.mocked(core.getInput).mockImplementation((name) =>
+      name === "update-day" ? updateDay : (DEFAULT_INPUTS[name] ?? ""),
+    );
+
+    expect(parseInputs().updateDay).toBe(expected);
+  });
+
+  it.each(["", "NaN", "Mon", "1.5", "-1", "7"])(
+    "rejects invalid update-day %j while parsing inputs",
+    (updateDay) => {
       vi.mocked(core.getInput).mockImplementation((name) =>
         name === "update-day" ? updateDay : (DEFAULT_INPUTS[name] ?? ""),
       );
 
-      expect(parseInputs().updateDay).toEqual(expected);
+      expect(() => parseInputs()).toThrow(
+        "update-day must be an integer from 0 through 6",
+      );
     },
   );
 });
@@ -174,6 +185,42 @@ describe("resolveAuthenticatedLogin", () => {
 });
 
 describe("validateCheckout", () => {
+  it.each([
+    "https://github.example.com/example/project.git",
+    "ssh://git@github.example.com/example/project.git",
+    "git@github.example.com:example/project.git",
+  ])("accepts a matching GitHub Enterprise checkout remote %s", async (url) => {
+    const directory = await initializedRepository(url);
+    try {
+      await expect(
+        validateCheckout({
+          ...checkoutContext(directory),
+          serverUrl: "https://github.example.com",
+        }),
+      ).resolves.toBeUndefined();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects a checkout on a different server even when its repository path matches", async () => {
+    const directory = await initializedRepository(
+      "https://github.com/example/project.git",
+    );
+    try {
+      await expect(
+        validateCheckout({
+          ...checkoutContext(directory),
+          serverUrl: "https://github.example.com",
+        }),
+      ).rejects.toThrow(
+        "The caller checkout origin does not match the workflow repository",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("rejects credentials persisted by actions/checkout", async () => {
     const directory = await initializedRepository(
       "https://github.com/example/project.git",
@@ -219,6 +266,25 @@ describe("validateCheckout", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
+  });
+});
+
+describe("normalizeServerUrl", () => {
+  it("normalizes a trailing slash to an HTTPS origin", () => {
+    expect(normalizeServerUrl("https://github.example.com:8443/")).toBe(
+      "https://github.example.com:8443",
+    );
+  });
+
+  it.each([
+    "http://github.example.com",
+    "https://user@github.example.com",
+    "https://github.example.com/path",
+    "not a URL",
+  ])("rejects invalid Actions server URL %j", (serverUrl) => {
+    expect(() => normalizeServerUrl(serverUrl)).toThrow(
+      "GITHUB_SERVER_URL must be a valid HTTPS origin",
+    );
   });
 });
 
