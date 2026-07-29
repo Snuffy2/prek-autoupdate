@@ -212,15 +212,13 @@ describe("update publication races", () => {
 
   it("rolls an existing branch back when pull metadata update fails", async () => {
     const harness = await makeHarness({ existing: true });
+    harness.pull.title = "Previous update";
     harness.update.mockRejectedValueOnce(new Error("timeout"));
-    let calls = 0;
     harness.get.mockImplementation(async () => {
-      calls += 1;
       const sha = await remoteSha(harness.remote);
       return {
         data: mergePull(harness.pull, {
           head: { ...harness.pull.head, sha },
-          ...(calls >= 3 ? { title: "stale" } : {}),
         }),
         headers: { etag: '"after"' },
       };
@@ -230,6 +228,34 @@ describe("update publication races", () => {
       /lease-rolled back/u,
     );
     expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
+  });
+
+  it("preserves the new branch when an applied metadata update cannot be verified", async () => {
+    const harness = await makeHarness({ existing: true });
+    harness.update.mockResolvedValueOnce({
+      data: mergePull(harness.pull, { body: "unexpected response" }),
+      headers: { etag: '"unexpected"' },
+    });
+    let calls = 0;
+    harness.get.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 3) {
+        throw new Error("verification timeout");
+      }
+      const sha = await remoteSha(harness.remote);
+      return {
+        data: mergePull(harness.pull, {
+          head: { ...harness.pull.head, sha },
+        }),
+        headers: { etag: '"after"' },
+      };
+    });
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /metadata outcome is ambiguous.*new branch was preserved/u,
+    );
+    expect(await remoteSha(harness.remote)).not.toBe(harness.oldSha);
+    expect(await pushes(harness.log)).toHaveLength(1);
   });
 
   it("accepts an unexpected update response only after an exact fresh GET", async () => {

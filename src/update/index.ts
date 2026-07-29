@@ -200,13 +200,14 @@ export async function runUpdate(
     } catch (error) {
       updateError = error;
     }
+    let verified: PullRequest;
     try {
       const response = await execution.client.rest.pulls.get({
         owner: execution.context.owner,
         repo: execution.context.repository,
         pull_number: remote.ownedPullRequest.number,
       });
-      const verified = pullFromData(response.data);
+      verified = pullFromData(response.data);
       if (
         isExactUpdatedPull(
           execution,
@@ -221,8 +222,16 @@ export async function runUpdate(
           pullRequestNumber: remote.ownedPullRequest.number,
         };
       }
-      throw new Error("Fresh pull request verification was not exact");
     } catch (verificationError) {
+      throw new Error(
+        "Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved",
+        { cause: new AggregateError([updateError, verificationError]) },
+      );
+    }
+    const verificationError = new Error(
+      "Fresh pull request verification was not exact",
+    );
+    if (isExactOriginalMetadataPull(execution, verified, remote, newSha)) {
       return await rollbackExistingPush(
         execution,
         remote,
@@ -230,6 +239,10 @@ export async function runUpdate(
         new AggregateError([updateError, verificationError]),
       );
     }
+    throw new Error(
+      "Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved",
+      { cause: new AggregateError([updateError, verificationError]) },
+    );
   } finally {
     if (added) {
       await git(execution.context.workspace, [
@@ -257,6 +270,24 @@ function isExactUpdatedPull(
     pull.headSha === newSha &&
     pull.title === execution.inputs.prTitle &&
     pull.body === body
+  );
+}
+
+function isExactOriginalMetadataPull(
+  execution: ActionExecution,
+  pull: PullRequest,
+  remote: RemoteState,
+  newSha: string,
+): boolean {
+  const original = remote.ownedPullRequest;
+  return (
+    original !== undefined &&
+    isOwned(execution, pull) &&
+    pull.state === "open" &&
+    pull.number === original.number &&
+    pull.headSha === newSha &&
+    pull.title === original.title &&
+    pull.body === original.body
   );
 }
 
