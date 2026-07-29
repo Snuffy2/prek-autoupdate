@@ -43,7 +43,7 @@ repo = "local"
 [[repos.hooks]]
 id = "prettier"
 name = "prettier"
-entry = "npm exec -- prettier --check"
+entry = "npm exec -- prettier --write"
 language = "system"
 types_or = ["json", "markdown", "ts", "yaml"]
 
