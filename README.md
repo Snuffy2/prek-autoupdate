@@ -44,6 +44,9 @@ jobs:
           update-day: "1"
 ```
 
+GitHub enables manual `workflow_dispatch` runs only after this file exists on
+the repository's default branch.
+
 Schedule the workflow every day. The action decides which scheduled day actually
 runs `prek auto-update` from `update-day`; cleanup still runs on the other days.
 Keep the `push` trigger for `main`: it is a cleanup-only run that reconciles an
@@ -123,18 +126,18 @@ If a generated update PR must trigger downstream CI, provide a GitHub App
 installation token or a personal access token (PAT) through `token` instead.
 Give that token repository **Contents: read and write** and **Pull requests:
 read and write** permissions; it needs no `actions: write` permission. Store it
-as a repository secret, then pass it to the action:
+as a repository secret, then pass it to the action. With a GitHub App
+installation token, also set its bot login before the action creates a PR:
 
 ```yaml
 with:
   token: ${{ secrets.PREK_AUTOUPDATE_TOKEN }}
+  author-login: <app-slug>[bot]
 ```
 
-Use the same token for scheduled, manual, and push-triggered cleanup runs. The
-action normally discovers the token's GitHub login and uses it to identify its
-own PRs. If GitHub does not allow that lookup, also set `author-login` to the
-GitHub login shown on the generated PR, and keep that value unchanged across
-those runs.
+Keep the same `author-login` value for scheduled, manual, and push-triggered
+cleanup runs. For a PAT, the action normally discovers the token owner's GitHub
+login automatically, so `author-login` is not required.
 
 ## Releases
 
