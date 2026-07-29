@@ -102,6 +102,7 @@ export function isWorkflowPull(
     return false;
   const ref = sameRepoHeadRef(pull, policy.repository);
   return (
+    pullBaseRef(pull) === policy.baseBranch &&
     ref !== undefined &&
     (ref === policy.branch || ref.startsWith(policy.branchPrefix))
   );

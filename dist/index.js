@@ -36121,7 +36121,8 @@ function isWorkflowPull(pull, policy) {
     if (typeof pull.body !== "string" || !pull.body.includes(policy.bodyMarker))
         return false;
     const ref = sameRepoHeadRef(pull, policy.repository);
-    return (ref !== undefined &&
+    return (pullBaseRef(pull) === policy.baseBranch &&
+        ref !== undefined &&
         (ref === policy.branch || ref.startsWith(policy.branchPrefix)));
 }
 function closeIdentity(pull) {
@@ -36391,6 +36392,7 @@ async function cleanupWithApi(api, execution, options) {
     };
     const policy = {
         repository: execution.context.repositoryFullName,
+        baseBranch: execution.context.baseBranch,
         branch: execution.inputs.updateBranch,
         branchPrefix: execution.inputs.branchPrefix,
         labelName: execution.inputs.label,

@@ -2,6 +2,7 @@ export type Payload = Record<string, unknown>;
 
 export interface OwnershipPolicy {
   readonly repository: string;
+  readonly baseBranch: string;
   readonly branch: string;
   readonly branchPrefix: string;
   readonly labelName: string;

@@ -178,6 +178,19 @@ describe("cleanupUpdateBranches safety behavior", () => {
     expect(result).toEqual({ closedPullRequests: [], deletedBranches: [] });
   });
 
+  it("preserves matching open and closed pulls targeting another base", async () => {
+    const api = new FakeApi();
+    api.open = [pull({ base: { ref: "release" } })];
+    api.closed = [closed({ number: 2, base: { ref: "release" } })];
+    api.refs.set(`heads/${branch}`, "head");
+
+    const result = await cleanupWithApi(api, execution, defaults);
+
+    expect(result).toEqual({ closedPullRequests: [], deletedBranches: [] });
+    expect(api.closedNumbers).toEqual([]);
+    expect(api.deleted).toEqual([]);
+  });
+
   it("does not delete a closed branch whose current SHA differs", async () => {
     const api = new FakeApi();
     api.closed = [closed()];

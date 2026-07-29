@@ -56,6 +56,7 @@ export async function cleanupWithApi(
   };
   const policy: OwnershipPolicy = {
     repository: execution.context.repositoryFullName,
+    baseBranch: execution.context.baseBranch,
     branch: execution.inputs.updateBranch,
     branchPrefix: execution.inputs.branchPrefix,
     labelName: execution.inputs.label,
