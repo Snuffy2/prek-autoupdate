@@ -119,6 +119,23 @@ Do not add `actions: write`; the action does not need it. Keep the default token
 identity consistent for the update PR and later cleanup runs, because cleanup
 uses that identity as part of its ownership proof.
 
+If a generated update PR must trigger downstream CI, provide a GitHub App
+installation token or a personal access token (PAT) through `token` instead.
+Give that token repository **Contents: read and write** and **Pull requests:
+read and write** permissions; it needs no `actions: write` permission. Store it
+as a repository secret, then pass it to the action:
+
+```yaml
+with:
+  token: ${{ secrets.PREK_AUTOUPDATE_TOKEN }}
+```
+
+Use the same token for scheduled, manual, and push-triggered cleanup runs. The
+action normally discovers the token's GitHub login and uses it to identify its
+own PRs. If GitHub does not allow that lookup, also set `author-login` to the
+GitHub login shown on the generated PR, and keep that value unchanged across
+those runs.
+
 ## Releases
 
 Use the moving major tag `v2` for stable v2 updates. Each published,
