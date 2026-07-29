@@ -44,15 +44,6 @@ jobs:
           update-day: "1"
 ```
 
-The checkout step is part of the setup, not optional boilerplate. Check out the
-same repository that contains this workflow, on the branch being updated, using
-the settings shown above. The action needs that checkout to read the current
-configuration and create an update branch safely. Before it updates anything, it
-checks that the checkout is clean, that `origin` points to this repository, and
-that checkout did not leave credentials in Git configuration. If one of those
-checks fails, restore the checkout to this example rather than working around
-the error.
-
 Schedule the workflow every day. The action decides which scheduled day actually
 runs `prek auto-update` from `update-day`; cleanup still runs on the other days.
 Keep the `push` trigger for `main`: it is a cleanup-only run that reconciles an
