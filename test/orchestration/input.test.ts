@@ -6,9 +6,10 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ActionContext } from "../../src/contracts.js";
+import type { ActionContext, GitHubClient } from "../../src/contracts.js";
 import {
   parseInputs,
+  resolveAuthenticatedLogin,
   shouldUpdate,
   validateCheckout,
 } from "../../src/input.js";
@@ -20,6 +21,7 @@ vi.mock("@actions/core", () => ({
 
 const DEFAULT_INPUTS: Readonly<Record<string, string>> = {
   "token": "token",
+  "author-login": "github-actions[bot]",
   "cooldown-days": "7",
   "update-day": "1",
   "update-branch": "chore/prek-updates",
@@ -69,6 +71,7 @@ describe("parseInputs", () => {
     process.env.INPUT_TOKEN = "token";
     expect(parseInputs()).toEqual({
       token: "token",
+      authorLogin: "github-actions[bot]",
       cooldownDays: "7",
       updateDay: 1,
       updateBranch: "chore/prek-updates",
@@ -118,6 +121,56 @@ describe("parseInputs", () => {
       expect(parseInputs().updateDay).toEqual(expected);
     },
   );
+});
+
+describe("resolveAuthenticatedLogin", () => {
+  function clientWithAuthenticatedUser(
+    implementation: () => Promise<unknown>,
+  ): GitHubClient {
+    return {
+      rest: {
+        users: {
+          getAuthenticated: vi.fn(implementation),
+        },
+      },
+    } as unknown as GitHubClient;
+  }
+
+  it("uses the login discovered for a user token", async () => {
+    const client = clientWithAuthenticatedUser(async () => ({
+      data: { login: "exact-user-login" },
+    }));
+
+    await expect(
+      resolveAuthenticatedLogin(client, "token", "fallback[bot]"),
+    ).resolves.toBe("exact-user-login");
+  });
+
+  it.each([401, 403])(
+    "uses the configured author fallback when GET /user returns %i",
+    async (status) => {
+      const client = clientWithAuthenticatedUser(async () => {
+        throw { status };
+      });
+
+      await expect(
+        resolveAuthenticatedLogin(client, "token", "custom-app[bot]"),
+      ).resolves.toBe("custom-app[bot]");
+    },
+  );
+
+  it("propagates failures unrelated to installation-token authentication", async () => {
+    const failure = Object.assign(new Error("service unavailable"), {
+      status: 500,
+    });
+    const client = clientWithAuthenticatedUser(async () => {
+      throw failure;
+    });
+
+    await expect(
+      resolveAuthenticatedLogin(client, "token", "fallback[bot]"),
+    ).rejects.toBe(failure);
+  });
 });
 
 describe("validateCheckout", () => {

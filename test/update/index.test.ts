@@ -275,6 +275,7 @@ async function makeExecution(
     },
     inputs: {
       addPaths: [],
+      authorLogin: "github-actions[bot]",
       branchPrefix: "chore/prek-",
       commitMessage: "update",
       cooldownDays: "7",

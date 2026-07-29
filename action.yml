@@ -8,6 +8,11 @@ inputs:
       GitHub token used to push the update branch and manage pull requests.
     required: false
     default: ${{ github.token }}
+  author-login:
+    description:
+      Pull-request author login used when the token cannot query GET /user.
+    required: false
+    default: github-actions[bot]
   cooldown-days:
     description: Cooldown days passed to prek auto-update.
     required: false

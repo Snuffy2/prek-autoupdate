@@ -36709,6 +36709,7 @@ function parseInputs() {
     const cooldownDays = coreExports.getInput("cooldown-days", { required: true });
     return {
         token,
+        authorLogin: nonEmptyInput("author-login"),
         cooldownDays,
         updateDay: Number(updateDayText),
         updateBranch: nonEmptyInput("update-branch"),
@@ -36752,7 +36753,7 @@ async function resolveContext(client, inputs) {
         workspace,
         baseBranch,
         baseSha,
-        authenticatedLogin: await authenticatedLogin(client, inputs.token),
+        authenticatedLogin: await resolveAuthenticatedLogin(client, inputs.token, inputs.authorLogin),
     };
 }
 /** Validate checkout requirements needed only by the update phase. */
@@ -36804,10 +36805,22 @@ function assertRuntime() {
         throw new Error(`prek-autoupdate supports Linux x64 and arm64, not ${process.arch}`);
     }
 }
-async function authenticatedLogin(client, token) {
+async function resolveAuthenticatedLogin(client, token, fallbackLogin) {
     coreExports.setSecret(token);
-    const response = await client.rest.users.getAuthenticated();
-    return response.data.login;
+    try {
+        const response = await client.rest.users.getAuthenticated();
+        return response.data.login;
+    }
+    catch (error) {
+        if (typeof error === "object" &&
+            error !== null &&
+            "status" in error &&
+            (error.status === 401 ||
+                error.status === 403)) {
+            return fallbackLogin;
+        }
+        throw error;
+    }
 }
 async function git$1(workspace, arguments_) {
     const { stdout } = await execFileAsync$1("git", hardenedGitArguments(["-C", workspace, ...arguments_]), {

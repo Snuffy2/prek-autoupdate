@@ -18,6 +18,7 @@ describe("action metadata", () => {
   it("declares the stable v2 input contract", () => {
     expect(Object.keys(metadata.inputs)).toEqual([
       "token",
+      "author-login",
       "cooldown-days",
       "update-day",
       "update-branch",
@@ -29,6 +30,9 @@ describe("action metadata", () => {
     ]);
     expect(metadata.inputs).not.toHaveProperty("dispatch-workflows");
     expect(metadata.inputs.token?.default).toBe("${{ github.token }}");
+    expect(metadata.inputs["author-login"]?.default).toBe(
+      "github-actions[bot]",
+    );
     expect(metadata.inputs["cooldown-days"]?.default).toBe("7");
     expect(metadata.inputs["update-day"]?.default).toBe("1");
     expect(metadata.inputs["update-branch"]?.default).toBe(

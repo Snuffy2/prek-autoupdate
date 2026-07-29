@@ -41,6 +41,7 @@ vi.mock("../../src/cleanup/index.js", () => ({
 
 const inputs: ActionInputs = {
   token: "token",
+  authorLogin: "github-actions[bot]",
   cooldownDays: "7",
   updateDay: 1,
   updateBranch: "chore/prek-updates",

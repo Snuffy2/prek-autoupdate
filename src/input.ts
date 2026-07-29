@@ -31,6 +31,7 @@ export function parseInputs(): ActionInputs {
 
   return {
     token,
+    authorLogin: nonEmptyInput("author-login"),
     cooldownDays,
     updateDay: Number(updateDayText),
     updateBranch: nonEmptyInput("update-branch"),
@@ -86,7 +87,11 @@ export async function resolveContext(
     workspace,
     baseBranch,
     baseSha,
-    authenticatedLogin: await authenticatedLogin(client, inputs.token),
+    authenticatedLogin: await resolveAuthenticatedLogin(
+      client,
+      inputs.token,
+      inputs.authorLogin,
+    ),
   };
 }
 
@@ -155,13 +160,27 @@ function assertRuntime(): void {
   }
 }
 
-async function authenticatedLogin(
+export async function resolveAuthenticatedLogin(
   client: GitHubClient,
   token: string,
+  fallbackLogin: string,
 ): Promise<string> {
   core.setSecret(token);
-  const response = await client.rest.users.getAuthenticated();
-  return response.data.login;
+  try {
+    const response = await client.rest.users.getAuthenticated();
+    return response.data.login;
+  } catch (error: unknown) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "status" in error &&
+      ((error as { readonly status?: unknown }).status === 401 ||
+        (error as { readonly status?: unknown }).status === 403)
+    ) {
+      return fallbackLogin;
+    }
+    throw error;
+  }
 }
 
 async function git(

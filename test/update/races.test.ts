@@ -548,6 +548,7 @@ async function makeHarness(options: HarnessOptions = {}) {
     },
     inputs: {
       addPaths: ["prek.toml"],
+      authorLogin: "github-actions[bot]",
       branchPrefix: "chore/prek-",
       commitMessage: "update",
       cooldownDays: "7",

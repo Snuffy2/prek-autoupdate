@@ -6,6 +6,7 @@ export type SupportedEventName = "push" | "schedule" | "workflow_dispatch";
 
 export interface ActionInputs {
   readonly token: string;
+  readonly authorLogin: string;
   readonly cooldownDays: string;
   readonly updateDay: number;
   readonly updateBranch: string;

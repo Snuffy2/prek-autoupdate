@@ -75,6 +75,7 @@ runner tool cache.
 | Input            | Default                    | Description                                                                                                        |
 | ---------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | `token`          | `${{ github.token }}`      | GitHub token used to push the update branch and manage pull requests.                                              |
+| `author-login`   | `github-actions[bot]`      | Pull-request author login used for ownership checks when an installation token cannot query `GET /user`.           |
 | `cooldown-days`  | `"7"`                      | Value passed to `prek auto-update --cooldown-days`.                                                                |
 | `update-day`     | `"1"`                      | UTC day of week for scheduled updates, where `0` is Sunday and `6` is Saturday.                                    |
 | `update-branch`  | `chore/prek-updates`       | Branch used for update pull requests.                                                                              |
@@ -118,7 +119,14 @@ intentionally fail ownership proof.
 ```yaml
 with:
   token: ${{ secrets.PREK_AUTOUPDATE_TOKEN }}
+  author-login: your-app-slug[bot] # Required for an App installation token.
 ```
+
+The default `GITHUB_TOKEN` uses `github-actions[bot]` automatically. For a
+custom GitHub App installation token, set `author-login` to `<app-slug>[bot]`.
+PATs and GitHub App user tokens discover their authenticated login through
+`GET /user`; `author-login` is only the fallback when that endpoint rejects an
+installation token.
 
 No `actions: write` permission is required.
 
