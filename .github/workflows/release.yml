@@ -1,68 +1,76 @@
-name: Update Version on Release
+name: Update Major Version Tag
 
 on:
   release:
     types: [published]
 
 jobs:
-  update-version:
-    name: Update Version on Release
-    runs-on: ubuntu-latest
-    if: ${{ github.event.release.draft == false && github.event.release.prerelease == false }}
+  update-v2:
+    name: Move v2 tag
+    if:
+      ${{ !github.event.release.draft && !github.event.release.prerelease &&
+      startsWith(github.event.release.tag_name, 'v2.') }}
+    concurrency:
+      group: update-v2-major-tag
+      cancel-in-progress: false
     permissions:
       contents: write
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout Repository
+      - name: Checkout release
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.target_commitish }}
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: true
 
-      - name: Update pyproject version
+      - name: Move v2 to the released commit
         env:
-          TAG_NAME: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import json
-          import os
-          import re
-          from pathlib import Path
 
-          tag_name = os.environ["TAG_NAME"]
-          version = tag_name.removeprefix("v")
-          path = Path("pyproject.toml")
-          text = path.read_text()
-          text, count = re.subn(
-              r'(?m)^version = ".*"$',
-              lambda _match: f"version = {json.dumps(version)}",
-              text,
-              count=1,
-          )
-          if count != 1:
-              raise SystemExit("Unable to find version field in pyproject.toml")
-          path.write_text(text)
-          PY
+          releases='[]'
+          page=1
+          while true; do
+            response="$(
+              curl --fail-with-body --silent --show-error \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${REPOSITORY}/releases?per_page=100&page=${page}"
+            )"
+            releases="$(jq --compact-output \
+              --argjson page_releases "${response}" \
+              '. + $page_releases' <<<"${releases}")"
+            if [[ "$(jq 'length' <<<"${response}")" -lt 100 ]]; then
+              break
+            fi
+            page=$((page + 1))
+          done
 
-      - name: Commit & Push Version Changes
-        uses: stefanzweifel/git-auto-commit-action@v7
-        with:
-          branch: ${{ github.event.release.target_commitish }}
-          commit_message: "Updating to version ${{ github.event.release.tag_name }} [skip ci]"
+          newest_v2="$(
+            jq --raw-output '
+              map(select(
+                (.draft | not) and
+                (.prerelease | not) and
+                (.tag_name | test("^v2\\."))
+              ))
+              | if length == 0 then "" else max_by(.published_at).tag_name end
+            ' <<<"${releases}"
+          )"
+          if [[ "${RELEASE_TAG}" != "${newest_v2}" ]]; then
+            echo "::error::${RELEASE_TAG} is not the newest published stable v2 release (${newest_v2:-none})."
+            exit 1
+          fi
 
-      - name: Update Release with Version Changes Commit
-        env:
-          TAG_NAME: ${{ github.event.release.tag_name }}
-        run: |
-          set -euo pipefail
-          tag_name="${TAG_NAME}"
-          git tag -f "${tag_name}"
-          git push -f origin "${tag_name}"
-
-      - name: Update Major Version Tag
-        env:
-          TAG_NAME: ${{ github.event.release.tag_name }}
-        run: |
-          set -euo pipefail
-          major_tag="${TAG_NAME%%.*}"
-          git tag -f "${major_tag}"
-          git push -f origin "${major_tag}"
+          observed_v2="$(
+            git ls-remote --refs origin refs/tags/v2 |
+              awk 'NR == 1 { print $1 }'
+          )"
+          git tag --force v2 "${RELEASE_TAG}^{commit}"
+          git push \
+            --force-with-lease="refs/tags/v2:${observed_v2}" \
+            origin refs/tags/v2

@@ -1,4 +1,4 @@
-name: 'Pull Request Labeler'
+name: "Pull Request Labeler"
 on:
   pull_request_target:
 
@@ -15,4 +15,4 @@ jobs:
       - name: Pull Request Labeler
         uses: srvaroa/labeler@v1
         env:
-          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"

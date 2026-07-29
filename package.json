@@ -1,0 +1,42 @@
+{
+  "name": "prek-autoupdate",
+  "version": "2.0.0",
+  "private": true,
+  "description": "GitHub Action that opens and maintains prek auto-update pull requests",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "rollup --config",
+    "check:dist": "npm run build && git diff --exit-code -- dist/index.js",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\" \"*.config.ts\"",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@actions/core": "^2.0.1",
+    "@actions/github": "^9.1.1",
+    "@actions/tool-cache": "^4.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@rollup/plugin-commonjs": "^29.0.0",
+    "@rollup/plugin-node-resolve": "^16.0.0",
+    "@types/node": "^24.0.0",
+    "@vitest/coverage-v8": "^4.0.0",
+    "eslint": "^10.8.0",
+    "eslint-config-prettier": "^10.0.0",
+    "globals": "^16.0.0",
+    "jiti": "^2.0.0",
+    "prettier": "^3.0.0",
+    "rollup": "^4.0.0",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^4.0.0",
+    "yaml": "^2.0.0"
+  }
+}

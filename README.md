@@ -1,18 +1,13 @@
 # prek-autoupdate
 
-Reusable GitHub Actions workflow for opening and maintaining `prek auto-update` pull requests.
+A Linux Node 24 GitHub Action that runs `prek auto-update`, opens or updates one
+workflow-owned pull request, and removes stale workflow-owned pull requests and
+branches.
 
-## What It Does
+## Usage
 
-- Runs `prek auto-update --cooldown-days <days>`.
-- Opens or updates one PR on `chore/prek-updates`.
-- Checks the existing update PR after pushes to `main`, closing it when it is no longer needed.
-- Closes duplicate stale workflow-owned PRs.
-- Deletes stale and merged workflow-owned update branches.
-
-## Quick Start
-
-Create `.github/workflows/prek_autoupdate.yml` in the consuming repository:
+Create `.github/workflows/prek_autoupdate.yml` in the repository whose hooks
+should be updated:
 
 ```yaml
 name: prek Autoupdate
@@ -25,31 +20,120 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: prek-autoupdate-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   prek-autoupdate:
-    uses: Snuffy2/prek-autoupdate/.github/workflows/prek_autoupdate.yml@v1
-    permissions:
-      contents: write
-      pull-requests: write
-    with:
-      update-day: "1"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Update prek hooks
+        id: prek-autoupdate
+        uses: Snuffy2/prek-autoupdate@v2
+        with:
+          update-day: "1"
 ```
 
-Keep the `push` trigger so changes landing on `main` check whether an existing workflow-owned update PR still changes any files. This covers upstream syncs and similar workflows that may make the PR unnecessary. Push runs do not call `prek auto-update`, create a PR, or update a still-needed PR; cleanup only closes a PR with no changed files and safely deletes its branch.
+The checkout is required. It must be the repository being updated, on its
+branch, with `persist-credentials: false`; the action refuses a dirty checkout
+or an `origin` that does not match the workflow repository.
 
-Run the caller workflow daily so stale PR and branch cleanup happens every night. Scheduled runs only call `prek auto-update` on `update-day`, and manual runs always check for updates.
-This normal path does not need `actions: write`.
-Major version tags such as `v1` are updated on release to point at the latest release in that major series.
+Run the workflow daily so cleanup runs every night. Keep the `push` trigger so
+changes landing on `main` reconcile an existing update PR. The concurrency group
+prevents two runs from mutating the same branch at once without cancelling an
+in-flight cleanup.
+
+## Event behavior
+
+| Event                            | Run `prek auto-update` | Reconcile PRs and branches                                                            |
+| -------------------------------- | ---------------------- | ------------------------------------------------------------------------------------- |
+| Daily `schedule` on `update-day` | Yes                    | Yes                                                                                   |
+| Daily `schedule` on another day  | No                     | Yes                                                                                   |
+| `workflow_dispatch`              | Yes                    | Yes                                                                                   |
+| `push` to `main`                 | No                     | Yes; close the owned PR only when its paths are already identical to the current base |
+
+The action supports GitHub.com and GitHub Enterprise Server on Linux x64 and
+arm64 runners, including self-hosted runners with system Git installed under
+`/usr/local/bin` or standard Nix/NixOS system profiles. It is not supported on
+Windows or macOS runners.
+
+Each action release pins a verified `prek` release for reproducible updates.
+Version 2.0.0 uses `prek` 0.4.11 and verifies both the official archive and the
+extracted executable before running it, including executables restored from the
+runner tool cache.
 
 ## Inputs
 
-| Input | Default | Description |
-| --- | --- | --- |
-| `cooldown-days` | `"7"` | Value passed to `prek auto-update --cooldown-days`. |
-| `update-day` | `"1"` | UTC day of week for scheduled `prek auto-update`, where `0` is Sunday and `6` is Saturday. Manual runs always check for updates. Schedule callers daily so cleanup can run every night. |
-| `update-branch` | `chore/prek-updates` | Branch used for update PRs. |
-| `branch-prefix` | `chore/prek-updates` | Prefix considered owned by cleanup. |
-| `label` | `dependencies` | PR label used for generated PRs and cleanup ownership checks. |
-| `commit-message` | `chore: update prek hooks` | Commit message for update commits. |
-| `pr-title` | `Bump prek Hooks` | Pull request title. |
-| `add-paths` | auto-detect | Newline-separated paths the PR action may commit. By default, the workflow uses the one existing `prek` config file: `prek.toml` or `.pre-commit-config.yaml`. |
+| Input            | Default                    | Description                                                                                                        |
+| ---------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `token`          | `${{ github.token }}`      | GitHub token used to push the update branch and manage pull requests.                                              |
+| `author-login`   | `github-actions[bot]`      | Pull-request author login used for ownership checks when an installation token cannot query `GET /user`.           |
+| `cooldown-days`  | `"7"`                      | Value passed to `prek auto-update --cooldown-days`.                                                                |
+| `update-day`     | `"1"`                      | UTC day of week for scheduled updates, where `0` is Sunday and `6` is Saturday.                                    |
+| `update-branch`  | `chore/prek-updates`       | Branch used for update pull requests.                                                                              |
+| `branch-prefix`  | `chore/prek-updates`       | Prefix considered owned by cleanup.                                                                                |
+| `label`          | `dependencies`             | Existing repository label used for the pull request and as a cleanup ownership signal.                             |
+| `commit-message` | `chore: update prek hooks` | Update commit message.                                                                                             |
+| `pr-title`       | `Bump prek Hooks`          | Update pull-request title.                                                                                         |
+| `add-paths`      | auto-detect                | Newline-separated git pathspecs to commit. Empty requires exactly one of `prek.toml` or `.pre-commit-config.yaml`. |
+
+## Output
+
+`pull-request-number` is the number of the pull request created or updated by
+this run. It is empty on cleanup-only and no-update runs, even if an existing
+owned update pull request remains:
+
+```yaml
+- name: Report update PR
+  if: steps.prek-autoupdate.outputs.pull-request-number != ''
+  run: echo "PR #${{ steps.prek-autoupdate.outputs.pull-request-number }}"
+```
+
+## Token and permissions
+
+The normal path uses the job's `GITHUB_TOKEN` and needs only:
+
+```yaml
+permissions:
+  contents: write
+  pull-requests: write
+```
+
+GitHub may prevent events from a `GITHUB_TOKEN`-created pull request from
+starting additional workflows. If downstream CI must run for the generated PR,
+pass a GitHub App installation token or a fine-grained PAT as `token`. Limit it
+to this repository with read/write **Contents** and **Pull requests** access.
+For a classic PAT, the equivalent repository scope is `repo`. Store the token as
+an Actions secret and keep one identity consistent across PR creation, ownership
+checks, and branch cleanup; changing identities can make an existing PR
+intentionally fail ownership proof.
+
+```yaml
+with:
+  token: ${{ secrets.PREK_AUTOUPDATE_TOKEN }}
+  author-login: your-app-slug[bot] # Required for an App installation token.
+```
+
+The default `GITHUB_TOKEN` uses `github-actions[bot]` automatically. For a
+custom GitHub App installation token, set `author-login` to `<app-slug>[bot]`.
+PATs and GitHub App user tokens discover their authenticated login through
+`GET /user`; `author-login` is only the fallback when that endpoint rejects an
+installation token.
+
+No `actions: write` permission is required.
+
+## Releases
+
+Use the moving major tag `v2` for stable v2 updates. Published, non-prerelease
+`v2.x.y` releases move `v2` to the released commit; immutable release tags are
+not rewritten.

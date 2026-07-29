@@ -21,7 +21,11 @@ id = "check-yaml"
 id = "check-toml"
 
 [[repos.hooks]]
+id = "check-json"
+
+[[repos.hooks]]
 id = "check-added-large-files"
+exclude = "^dist/index\\.js$"
 
 [[repos]]
 repo = "https://github.com/rhysd/actionlint"
@@ -29,36 +33,31 @@ rev = "v1.7.12"
 
 [[repos.hooks]]
 id = "actionlint"
-args = [
-  "-ignore",
-  "property \"workflow_(repository|sha)\" is not defined",
-]
 additional_dependencies = [
   "github.com/wasilibs/go-shellcheck/cmd/shellcheck@v0.11.1",
 ]
 
 [[repos]]
-repo = "https://github.com/astral-sh/ruff-pre-commit"
-rev = "v0.15.22"
+repo = "local"
 
 [[repos.hooks]]
-id = "ruff-check"
-args = ["--fix"]
+id = "prettier"
+name = "prettier"
+entry = "npm exec -- prettier --check"
+language = "system"
+types_or = ["json", "markdown", "ts", "yaml"]
 
 [[repos.hooks]]
-id = "ruff-format"
-
-[[repos]]
-repo = "https://github.com/pre-commit/mirrors-mypy"
-rev = "v2.3.0"
+id = "eslint"
+name = "eslint"
+entry = "npm run lint --"
+language = "system"
+types = ["ts"]
 
 [[repos.hooks]]
-id = "mypy"
-language_version = "python3.14"
-args = ["--config-file=pyproject.toml"]
+id = "typescript"
+name = "typescript"
+entry = "npm run typecheck"
+language = "system"
 pass_filenames = false
-additional_dependencies = [
-  "PyYAML>=6.0.2",
-  "pytest",
-  "types-PyYAML>=6.0.12.20250516",
-]
+types = ["ts"]

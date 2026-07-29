@@ -1,0 +1,66 @@
+name: prek Autoupdate
+description: Update prek hooks and maintain the resulting pull request.
+author: Snuffy2
+
+inputs:
+  token:
+    description:
+      GitHub token used to push the update branch and manage pull requests.
+    required: false
+    default: ${{ github.token }}
+  author-login:
+    description:
+      Pull-request author login used when the token cannot query GET /user.
+    required: false
+    default: github-actions[bot]
+  cooldown-days:
+    description: Cooldown days passed to prek auto-update.
+    required: false
+    default: "7"
+  update-day:
+    description:
+      UTC day of week for scheduled updates, 0=Sunday through 6=Saturday.
+    required: false
+    default: "1"
+  update-branch:
+    description: Branch used for the generated update pull request.
+    required: false
+    default: chore/prek-updates
+  branch-prefix:
+    description: Branch prefix considered owned by this action.
+    required: false
+    default: chore/prek-updates
+  label:
+    description:
+      Label applied to generated pull requests and used for ownership checks.
+    required: false
+    default: dependencies
+  commit-message:
+    description: Commit message for hook update commits.
+    required: false
+    default: "chore: update prek hooks"
+  pr-title:
+    description: Title for hook update pull requests.
+    required: false
+    default: Bump prek Hooks
+  add-paths:
+    description:
+      Newline-separated git pathspecs to commit; empty auto-detects the prek
+      config.
+    required: false
+    default: ""
+
+outputs:
+  pull-request-number:
+    description:
+      Number of the pull request created or updated by this run; empty on
+      cleanup-only or no-update runs, even if an existing owned pull request
+      remains.
+
+runs:
+  using: node24
+  main: dist/index.js
+
+branding:
+  icon: git-pull-request
+  color: gray-dark
