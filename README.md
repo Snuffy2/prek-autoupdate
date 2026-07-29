@@ -1,8 +1,8 @@
 # prek-autoupdate
 
-`prek-autoupdate` is a Linux, Node 24 GitHub Action that runs `prek auto-update`
-for you. It keeps one pull request for the resulting hook updates, then cleans
-up older action-owned pull requests and branches when they are no longer needed.
+`prek-autoupdate` is a GitHub Action that runs `prek auto-update` for you. It
+keeps one pull request for the resulting hook updates, then cleans up older
+action-owned pull requests and branches when they are no longer needed.
 
 ## Get started
 
@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   prek-autoupdate:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -118,9 +118,8 @@ permissions:
   pull-requests: write
 ```
 
-Do not add `actions: write`; the action does not need it. Keep the default token
-identity consistent for the update PR and later cleanup runs, because cleanup
-uses that identity as part of its ownership proof.
+Keep the default token identity consistent for the update PR and later cleanup
+runs, because cleanup uses that identity as part of its ownership proof.
 
 If a generated update PR must trigger downstream CI, provide a GitHub App
 installation token or a personal access token (PAT) through `token` instead.

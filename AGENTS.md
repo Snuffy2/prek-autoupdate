@@ -16,7 +16,7 @@ permissions.
 ## Source Of Truth Rules
 
 - Caller examples must check out the target repository with
-  `actions/checkout@v7` and `persist-credentials: false` before invoking the
+  `actions/checkout` and `persist-credentials: false` before invoking the
   action.
 - Keep the caller example's `push` trigger for `main` aligned with the
   cleanup-only reconciliation path. Pushes must not run `prek auto-update`,
