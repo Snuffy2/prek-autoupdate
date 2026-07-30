@@ -8,11 +8,11 @@ rev = "v6.0.0"
 
 [[repos.hooks]]
 id = "trailing-whitespace"
-exclude = ".*\\.md$"
+exclude = "(^dist/|.*\\.md$)"
 
 [[repos.hooks]]
 id = "end-of-file-fixer"
-exclude = ".*\\.md$"
+exclude = "(^dist/|.*\\.md$)"
 
 [[repos.hooks]]
 id = "check-yaml"

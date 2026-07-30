@@ -1,0 +1,32 @@
+name: prek-autofix apply
+
+on:
+  workflow_run:
+    workflows: [prek-autofix]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+concurrency:
+  # prettier-ignore
+  group: prek-autofix-apply-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    name: Apply prek fixes
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply collected prek fixes
+        uses: Snuffy2/prek-autofix/apply@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          autofix-token: ${{ secrets.PREK_AUTOFIX_TOKEN }}
+          source-workflow: prek-autofix
