@@ -140,6 +140,7 @@ login automatically, so `author-login` is not required.
 
 ## Releases
 
-Use the moving major tag `v2` for stable v2 updates. Each published,
-non-prerelease `v2.x.y` release moves `v2` to that release commit. Immutable
-release tags are never rewritten.
+Use the moving major tag for stable updates. Each published, non-prerelease
+`v<major>.<minor>.<patch>` release creates or moves its corresponding `v<major>`
+tag to that release commit. For example, publishing `v3.1.0` creates or moves
+`v3`. Immutable release tags are never rewritten.
