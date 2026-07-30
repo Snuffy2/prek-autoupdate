@@ -450,7 +450,15 @@ describe("update publication races", () => {
       operation: "updated",
       pullRequestNumber: 42,
     });
-    expect(harness.get).toHaveBeenCalledTimes(3);
+    const updateCallOrder = harness.update.mock.invocationCallOrder.at(-1);
+    if (updateCallOrder === undefined) {
+      throw new Error("expected the pull request update to be called");
+    }
+    expect(
+      harness.get.mock.invocationCallOrder.some(
+        (getCallOrder) => getCallOrder > updateCallOrder,
+      ),
+    ).toBe(true);
     expect(await pushes(harness.log)).toHaveLength(1);
   });
 
