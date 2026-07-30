@@ -5,16 +5,13 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
-    ignore:
-      # Runtime dependencies are compiled into dist/index.js. Update them
-      # manually so the reviewed pull request includes the rebuilt bundle.
-      # update-types only applies to version updates, so security updates
-      # remain eligible for Dependabot pull requests.
-      - dependency-name: "@actions/*"
+    groups:
+      development-dependencies:
+        dependency-type: "development"
         update-types:
-          - "version-update:semver-patch"
-          - "version-update:semver-minor"
-          - "version-update:semver-major"
+          - "minor"
+          - "patch"
+    ignore:
       # typescript-eslint 8 currently declares support through TypeScript 6.
       - dependency-name: "typescript"
         versions:
@@ -22,5 +19,12 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
     open-pull-requests-limit: 10
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
