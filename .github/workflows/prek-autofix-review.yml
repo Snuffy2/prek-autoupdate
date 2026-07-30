@@ -3,19 +3,16 @@ name: prek-autofix Review
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group:
-    prek-autofix-review-${{ github.event.pull_request.number || github.ref }}
+  group: prek-autofix-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   review:
-    name: Review with prek
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -24,10 +21,8 @@ jobs:
       - name: Checkout pull request
         uses: actions/checkout@v7
         with:
-          repository:
-            ${{ github.event.pull_request.head.repo.full_name ||
-            github.repository }}
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -39,10 +34,9 @@ jobs:
         uses: Snuffy2/prek-autofix/review@v1
 
   signal:
-    name: Report pending prek fixes
     needs: review
     if: needs.review.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Fail when fixes are pending
+      - name: Report pending prek fixes
         run: exit 1

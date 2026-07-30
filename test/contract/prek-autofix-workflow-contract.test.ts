@@ -4,29 +4,42 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
 describe("prek-autofix consumer workflows", () => {
-  it("collects untrusted pull-request fixes with read-only permissions", () => {
+  it("reviews untrusted pull requests with read-only permissions", () => {
     const workflow = parse(
-      readFileSync(".github/workflows/prek-autofix.yml", "utf8"),
+      readFileSync(".github/workflows/prek-autofix-review.yml", "utf8"),
     );
     expect(workflow.permissions).toEqual({ contents: "read" });
-    const steps = workflow.jobs.collect.steps;
-    expect(steps[0].with["persist-credentials"]).toBe(false);
+    expect(workflow.on).not.toHaveProperty("workflow_dispatch");
+    expect(workflow.jobs.review).not.toHaveProperty("name");
+    expect(workflow.jobs.signal).not.toHaveProperty("name");
+    expect(workflow.jobs.signal.steps).toEqual([
+      { name: "Report pending prek fixes", run: "exit 1" },
+    ]);
+    const steps = workflow.jobs.review.steps;
+    expect(steps[0].with).toEqual({
+      "repository": "${{ github.event.pull_request.head.repo.full_name }}",
+      "ref": "${{ github.event.pull_request.head.sha }}",
+      "fetch-depth": 1,
+      "persist-credentials": false,
+    });
     expect(steps[1].run).toBe("npm ci --ignore-scripts");
-    expect(steps[2].uses).toBe("Snuffy2/prek-autofix/collect@v1");
+    expect(steps[2].uses).toBe("Snuffy2/prek-autofix/review@v1");
   });
 
-  it("keeps the privileged apply stage shell- and checkout-free", () => {
+  it("keeps the privileged fix stage shell- and checkout-free", () => {
     const workflow = parse(
-      readFileSync(".github/workflows/prek-autofix-apply.yml", "utf8"),
+      readFileSync(".github/workflows/prek-autofix-fix.yml", "utf8"),
     );
+    expect(workflow.on.workflow_run.workflows).toEqual(["prek-autofix Review"]);
     expect(workflow.permissions).toEqual({
       "actions": "read",
       "contents": "read",
       "pull-requests": "write",
     });
-    const steps = workflow.jobs.apply.steps;
+    const steps = workflow.jobs.fix.steps;
     expect(steps).toHaveLength(1);
-    expect(steps[0].uses).toBe("Snuffy2/prek-autofix/apply@v1");
+    expect(steps[0].uses).toBe("Snuffy2/prek-autofix/fix@v1");
+    expect(steps[0].with["source-workflow"]).toBe("prek-autofix Review");
     expect(steps[0]).not.toHaveProperty("run");
   });
 });
