@@ -5,28 +5,44 @@ on:
     types: [published]
 
 jobs:
-  update-v2:
-    name: Move v2 tag
-    if:
-      ${{ !github.event.release.draft && !github.event.release.prerelease &&
-      startsWith(github.event.release.tag_name, 'v2.') }}
+  update-major:
+    name: Move major version tag
+    if: ${{ !github.event.release.draft && !github.event.release.prerelease }}
     concurrency:
-      group: update-v2-major-tag
+      group: update-major-version-tag
       cancel-in-progress: false
     permissions:
       contents: write
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve major version tag
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "major_tag=v${BASH_REMATCH[1]}" >>"${GITHUB_OUTPUT}"
+            echo "valid=true" >>"${GITHUB_OUTPUT}"
+          else
+            echo "::notice::${RELEASE_TAG} is not a stable v-prefixed semantic version tag; no major tag will be moved."
+            echo "valid=false" >>"${GITHUB_OUTPUT}"
+          fi
+
       - name: Checkout release
+        if: ${{ steps.version.outputs.valid == 'true' }}
         uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Move v2 to the released commit
+      - name: Move major tag to the released commit
+        if: ${{ steps.version.outputs.valid == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          MAJOR_TAG: ${{ steps.version.outputs.major_tag }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
@@ -51,26 +67,28 @@ jobs:
             page=$((page + 1))
           done
 
-          newest_v2="$(
-            jq --raw-output '
+          newest_major_release="$(
+            jq --raw-output --arg major_tag "${MAJOR_TAG}" '
               map(select(
                 (.draft | not) and
                 (.prerelease | not) and
-                (.tag_name | test("^v2\\."))
+                (.tag_name | test(
+                  "^" + $major_tag + "\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+                ))
               ))
               | if length == 0 then "" else max_by(.published_at).tag_name end
             ' <<<"${releases}"
           )"
-          if [[ "${RELEASE_TAG}" != "${newest_v2}" ]]; then
-            echo "::error::${RELEASE_TAG} is not the newest published stable v2 release (${newest_v2:-none})."
+          if [[ "${RELEASE_TAG}" != "${newest_major_release}" ]]; then
+            echo "::error::${RELEASE_TAG} is not the newest published stable ${MAJOR_TAG} release (${newest_major_release:-none})."
             exit 1
           fi
 
-          observed_v2="$(
-            git ls-remote --refs origin refs/tags/v2 |
+          observed_major="$(
+            git ls-remote --refs origin "refs/tags/${MAJOR_TAG}" |
               awk 'NR == 1 { print $1 }'
           )"
-          git tag --force v2 "${RELEASE_TAG}^{commit}"
+          git tag --force "${MAJOR_TAG}" "${RELEASE_TAG}^{commit}"
           git push \
-            --force-with-lease="refs/tags/v2:${observed_v2}" \
-            origin refs/tags/v2
+            --force-with-lease="refs/tags/${MAJOR_TAG}:${observed_major}" \
+            origin "refs/tags/${MAJOR_TAG}"
