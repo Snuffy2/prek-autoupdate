@@ -8,3 +8,4 @@ build/
 coverage/
 node_modules/
 Thumbs.db
+dist/**/*.map

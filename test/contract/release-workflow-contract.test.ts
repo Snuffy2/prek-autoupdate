@@ -6,8 +6,19 @@ import { parse } from "yaml";
 interface ReleaseWorkflow {
   readonly permissions?: Record<string, string>;
   readonly jobs: {
-    readonly "update-major": {
+    readonly "verify": {
       readonly if: string;
+      readonly outputs: Record<string, string>;
+      readonly steps: readonly {
+        readonly name: string;
+        readonly id?: string;
+        readonly uses?: string;
+        readonly with?: Record<string, unknown>;
+        readonly run?: string;
+      }[];
+    };
+    readonly "update-major": {
+      readonly needs: string;
       readonly concurrency: {
         readonly "group": string;
         readonly "cancel-in-progress": boolean;
@@ -31,17 +42,40 @@ const workflow = parse(
 
 describe("release workflow", () => {
   it("limits write permission and serializes major-tag updates", () => {
-    expect(workflow.permissions).toBeUndefined();
+    expect(workflow.permissions).toEqual({ contents: "read" });
     expect(workflow.jobs["update-major"].permissions).toEqual({
       contents: "write",
     });
-    expect(workflow.jobs["update-major"].if).toBe(
-      "${{ !github.event.release.draft && !github.event.release.prerelease }}",
-    );
+    expect(workflow.jobs["update-major"].needs).toBe("verify");
     expect(workflow.jobs["update-major"].concurrency).toEqual({
-      "group": "update-major-version-tag",
+      "group": "update-major-version-tag-${{ github.repository }}",
       "cancel-in-progress": false,
     });
+  });
+
+  it("validates the immutable release before granting write permission", () => {
+    const verify = workflow.jobs.verify;
+    expect(verify.if).toBe(
+      "${{ !github.event.release.draft && !github.event.release.prerelease }}",
+    );
+    expect(verify.outputs["release-sha"]).toBe(
+      "${{ steps.release.outputs.sha }}",
+    );
+    const checkout = verify.steps[0];
+    expect(checkout.name).toBe("Checkout immutable release");
+    expect(checkout.uses).toBe("actions/checkout@v7");
+    expect(checkout.with).toMatchObject({
+      "ref": "${{ github.event.release.tag_name }}",
+      "persist-credentials": false,
+    });
+    expect(verify.steps.map((step) => step.run)).toEqual(
+      expect.arrayContaining([
+        "npm ci",
+        "npm run typecheck",
+        "npm run test:coverage",
+        "npm run check:dist",
+      ]),
+    );
   });
 
   it("checks out with project policy and safely advances the release major", () => {
@@ -70,6 +104,10 @@ describe("release workflow", () => {
     expect(move.name).toBe("Move major tag to the released commit");
     expect(move.if).toBe("${{ steps.version.outputs.valid == 'true' }}");
     expect(move.env?.MAJOR_TAG).toBe("${{ steps.version.outputs.major_tag }}");
+    expect(move.env?.TARGET_SHA).toBe(
+      "${{ needs.verify.outputs.release-sha }}",
+    );
+    expect(move.run).toContain("Verified release SHA does not match");
     expect(move.run).toContain("/releases?per_page=100&page=${page}");
     expect(move.run).toContain("(.draft | not)");
     expect(move.run).toContain("(.prerelease | not)");
@@ -79,6 +117,9 @@ describe("release workflow", () => {
     );
     expect(move.run).toContain(
       '--force-with-lease="refs/tags/${MAJOR_TAG}:${observed_major}"',
+    );
+    expect(move.run).toContain(
+      'git tag --force "${MAJOR_TAG}" "${TARGET_SHA}"',
     );
     expect(move.run).toContain('origin "refs/tags/${MAJOR_TAG}"');
     expect(move.run).not.toContain("git push --force origin");

@@ -4,12 +4,51 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: read
+
 jobs:
+  verify:
+    name: Verify immutable release
+    if: ${{ !github.event.release.draft && !github.event.release.prerelease }}
+    outputs:
+      release-sha: ${{ steps.release.outputs.sha }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout immutable release
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test with coverage
+        run: npm run test:coverage
+
+      - name: Verify bundled action
+        run: npm run check:dist
+
+      - name: Record verified release
+        id: release
+        run: echo "sha=$(git rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
+
   update-major:
     name: Move major version tag
-    if: ${{ !github.event.release.draft && !github.event.release.prerelease }}
+    needs: verify
     concurrency:
-      group: update-major-version-tag
+      group: update-major-version-tag-${{ github.repository }}
       cancel-in-progress: false
     permissions:
       contents: write
@@ -45,8 +84,20 @@ jobs:
           MAJOR_TAG: ${{ steps.version.outputs.major_tag }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          TARGET_SHA: ${{ needs.verify.outputs.release-sha }}
         run: |
           set -euo pipefail
+
+          if [[ ! "${TARGET_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Verified release SHA is invalid."
+            exit 1
+          fi
+
+          release_sha="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          if [[ "${release_sha}" != "${TARGET_SHA}" ]]; then
+            echo "::error::Verified release SHA does not match ${RELEASE_TAG}."
+            exit 1
+          fi
 
           releases='[]'
           page=1
@@ -88,7 +139,7 @@ jobs:
             git ls-remote --refs origin "refs/tags/${MAJOR_TAG}" |
               awk 'NR == 1 { print $1 }'
           )"
-          git tag --force "${MAJOR_TAG}" "${RELEASE_TAG}^{commit}"
+          git tag --force "${MAJOR_TAG}" "${TARGET_SHA}"
           git push \
             --force-with-lease="refs/tags/${MAJOR_TAG}:${observed_major}" \
             origin "refs/tags/${MAJOR_TAG}"
