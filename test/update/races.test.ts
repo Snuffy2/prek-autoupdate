@@ -1,5 +1,12 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -602,6 +609,7 @@ async function makeHarness(options: HarnessOptions = {}) {
   const remote = path.join(root, "remote.git");
   const bin = path.join(root, "bin");
   const log = path.join(root, "git.log");
+  await writeFile(log, "");
   await exec("git", ["init", "-b", "main", workspace]);
   await exec("git", ["-C", workspace, "config", "user.name", "Test"]);
   await exec("git", [
@@ -799,14 +807,8 @@ eval exec ${JSON.stringify(realGit)} "$args"
 }
 
 async function pushes(log: string): Promise<string[]> {
-  try {
-    const value = await (
-      await import("node:fs/promises")
-    ).readFile(log, "utf8");
-    return value.trim().split("\n").filter(Boolean);
-  } catch {
-    return [];
-  }
+  const value = await readFile(log, "utf8");
+  return value.trim().split("\n").filter(Boolean);
 }
 
 async function remoteSha(remote: string): Promise<string> {
