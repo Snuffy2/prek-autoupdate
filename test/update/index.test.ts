@@ -72,25 +72,26 @@ describe("non-mutating update preflight", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("permits ambiguous config discovery for cleanup-only events", async () => {
-    const execution = await makeExecution([
-      "prek.toml",
-      ".pre-commit-config.yaml",
-    ]);
-    await expect(
-      validateUpdateConfiguration(execution),
-    ).resolves.toBeUndefined();
-  });
-
-  it("permits a stale remote branch for cleanup-only events", async () => {
-    const execution = await makeExecution(["prek.toml"], "abc123");
-    await expect(
-      validateUpdateConfiguration(execution),
-    ).resolves.toBeUndefined();
-  });
-
-  it("permits a missing config for cleanup-only events", async () => {
-    const execution = await makeExecution([]);
+  it.each<{
+    name: string;
+    files: readonly string[];
+    remoteSha?: string;
+  }>([
+    {
+      name: "ambiguous config discovery",
+      files: ["prek.toml", ".pre-commit-config.yaml"],
+    },
+    {
+      name: "a stale remote branch",
+      files: ["prek.toml"],
+      remoteSha: "abc123",
+    },
+    {
+      name: "a missing config",
+      files: [],
+    },
+  ])("permits $name for cleanup-only events", async ({ files, remoteSha }) => {
+    const execution = await makeExecution(files, remoteSha);
     await expect(
       validateUpdateConfiguration(execution),
     ).resolves.toBeUndefined();

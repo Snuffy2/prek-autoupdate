@@ -1,5 +1,12 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -441,16 +448,29 @@ describe("update publication races", () => {
 
   it("accepts an unexpected update response only after an exact fresh GET", async () => {
     const harness = await makeHarness({ existing: true });
-    harness.update.mockResolvedValueOnce({
+    const unexpectedResponse = {
       data: mergePull(harness.pull, { body: "unexpected response" }),
       headers: { etag: '"unexpected"' },
+    };
+    const pendingUpdate = Promise.withResolvers<typeof unexpectedResponse>();
+    let getCallsWhenUpdateStarted = 0;
+    harness.update.mockImplementationOnce(() => {
+      getCallsWhenUpdateStarted = harness.get.mock.calls.length;
+      return pendingUpdate.promise;
     });
 
-    await expect(runUpdate(harness.execution)).resolves.toEqual({
+    const result = runUpdate(harness.execution);
+    await vi.waitFor(() => expect(harness.update).toHaveBeenCalledOnce());
+    expect(harness.get).toHaveBeenCalledTimes(getCallsWhenUpdateStarted);
+
+    pendingUpdate.resolve(unexpectedResponse);
+    await expect(result).resolves.toEqual({
       operation: "updated",
       pullRequestNumber: 42,
     });
-    expect(harness.get).toHaveBeenCalledTimes(3);
+    expect(harness.get.mock.calls.length).toBeGreaterThan(
+      getCallsWhenUpdateStarted,
+    );
     expect(await pushes(harness.log)).toHaveLength(1);
   });
 
@@ -594,6 +614,7 @@ async function makeHarness(options: HarnessOptions = {}) {
   const remote = path.join(root, "remote.git");
   const bin = path.join(root, "bin");
   const log = path.join(root, "git.log");
+  await writeFile(log, "");
   await exec("git", ["init", "-b", "main", workspace]);
   await exec("git", ["-C", workspace, "config", "user.name", "Test"]);
   await exec("git", [
@@ -791,14 +812,8 @@ eval exec ${JSON.stringify(realGit)} "$args"
 }
 
 async function pushes(log: string): Promise<string[]> {
-  try {
-    const value = await (
-      await import("node:fs/promises")
-    ).readFile(log, "utf8");
-    return value.trim().split("\n").filter(Boolean);
-  } catch {
-    return [];
-  }
+  const value = await readFile(log, "utf8");
+  return value.trim().split("\n").filter(Boolean);
 }
 
 async function remoteSha(remote: string): Promise<string> {
