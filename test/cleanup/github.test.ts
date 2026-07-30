@@ -168,9 +168,6 @@ describe("OctokitCleanupApi evidence adapters", () => {
 
   it("reopens a pull and returns an authoritative refreshed payload", async () => {
     const github = client();
-    vi.mocked(github.rest.pulls.get).mockResolvedValue({
-      data: { number: 7, state: "closed" },
-    } as never);
     vi.mocked(github.rest.pulls.update).mockResolvedValue({
       data: { number: 7, state: "open" },
     } as never);
