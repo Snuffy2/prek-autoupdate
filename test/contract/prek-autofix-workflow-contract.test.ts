@@ -11,7 +11,8 @@ describe("prek-autofix consumer workflows", () => {
     expect(workflow.permissions).toEqual({ contents: "read" });
     const steps = workflow.jobs.collect.steps;
     expect(steps[0].with["persist-credentials"]).toBe(false);
-    expect(steps[1].uses).toBe("Snuffy2/prek-autofix/collect@v1");
+    expect(steps[1].run).toBe("npm ci --ignore-scripts");
+    expect(steps[2].uses).toBe("Snuffy2/prek-autofix/collect@v1");
   });
 
   it("keeps the privileged apply stage shell- and checkout-free", () => {
