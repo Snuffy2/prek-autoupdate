@@ -448,24 +448,29 @@ describe("update publication races", () => {
 
   it("accepts an unexpected update response only after an exact fresh GET", async () => {
     const harness = await makeHarness({ existing: true });
-    harness.update.mockResolvedValueOnce({
+    const unexpectedResponse = {
       data: mergePull(harness.pull, { body: "unexpected response" }),
       headers: { etag: '"unexpected"' },
+    };
+    const pendingUpdate = Promise.withResolvers<typeof unexpectedResponse>();
+    let getCallsWhenUpdateStarted = 0;
+    harness.update.mockImplementationOnce(() => {
+      getCallsWhenUpdateStarted = harness.get.mock.calls.length;
+      return pendingUpdate.promise;
     });
 
-    await expect(runUpdate(harness.execution)).resolves.toEqual({
+    const result = runUpdate(harness.execution);
+    await vi.waitFor(() => expect(harness.update).toHaveBeenCalledOnce());
+    expect(harness.get).toHaveBeenCalledTimes(getCallsWhenUpdateStarted);
+
+    pendingUpdate.resolve(unexpectedResponse);
+    await expect(result).resolves.toEqual({
       operation: "updated",
       pullRequestNumber: 42,
     });
-    const updateCallOrder = harness.update.mock.invocationCallOrder.at(-1);
-    if (updateCallOrder === undefined) {
-      throw new Error("expected the pull request update to be called");
-    }
-    expect(
-      harness.get.mock.invocationCallOrder.some(
-        (getCallOrder) => getCallOrder > updateCallOrder,
-      ),
-    ).toBe(true);
+    expect(harness.get.mock.calls.length).toBeGreaterThan(
+      getCallsWhenUpdateStarted,
+    );
     expect(await pushes(harness.log)).toHaveLength(1);
   });
 
