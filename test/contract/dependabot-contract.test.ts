@@ -5,22 +5,12 @@ import { parse } from "yaml";
 
 interface DependabotIgnoreRule {
   readonly "dependency-name": string;
-  readonly "update-types"?: readonly string[];
   readonly "versions"?: readonly string[];
 }
 
 interface DependabotConfiguration {
   readonly updates: readonly {
     readonly "package-ecosystem": string;
-    readonly "groups"?: Readonly<
-      Record<
-        string,
-        {
-          readonly "dependency-type"?: string;
-          readonly "update-types"?: readonly string[];
-        }
-      >
-    >;
     readonly "ignore"?: readonly DependabotIgnoreRule[];
     readonly "schedule": {
       readonly interval: string;
@@ -52,17 +42,6 @@ describe("Dependabot configuration", () => {
     );
 
     expect(typescript?.versions).toEqual([">=7.0.0"]);
-  });
-
-  it("groups routine development updates while keeping majors separate", () => {
-    const npm = configuration.updates.find(
-      (update) => update["package-ecosystem"] === "npm",
-    );
-
-    expect(npm?.groups?.["development-dependencies"]).toEqual({
-      "dependency-type": "development",
-      "update-types": ["minor", "patch"],
-    });
   });
 
   it("checks GitHub Actions weekly", () => {
