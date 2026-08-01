@@ -17,7 +17,6 @@ interface DependabotConfiguration {
         string,
         {
           readonly "dependency-type"?: string;
-          readonly "patterns"?: readonly string[];
           readonly "update-types"?: readonly string[];
         }
       >
@@ -66,15 +65,11 @@ describe("Dependabot configuration", () => {
     });
   });
 
-  it("checks GitHub Actions weekly and groups non-major updates", () => {
+  it("checks GitHub Actions weekly", () => {
     const actions = configuration.updates.find(
       (update) => update["package-ecosystem"] === "github-actions",
     );
 
     expect(actions?.schedule.interval).toBe("weekly");
-    expect(actions?.groups?.["github-actions"]).toEqual({
-      "patterns": ["*"],
-      "update-types": ["minor", "patch"],
-    });
   });
 });

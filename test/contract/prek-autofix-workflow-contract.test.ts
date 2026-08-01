@@ -8,13 +8,11 @@ describe("prek-autofix consumer workflows", () => {
     const workflow = parse(
       readFileSync(".github/workflows/prek-autofix-review.yml", "utf8"),
     );
+    expect(workflow.name).toBe("prek-autofix");
     expect(workflow.permissions).toEqual({ contents: "read" });
     expect(workflow.on).not.toHaveProperty("workflow_dispatch");
     expect(workflow.jobs.review).not.toHaveProperty("name");
-    expect(workflow.jobs.signal).not.toHaveProperty("name");
-    expect(workflow.jobs.signal.steps).toEqual([
-      { name: "Report pending prek fixes", run: "exit 1" },
-    ]);
+    expect(workflow.jobs).not.toHaveProperty("signal");
     const steps = workflow.jobs.review.steps;
     expect(steps[0].with).toEqual({
       "repository": "${{ github.event.pull_request.head.repo.full_name }}",
@@ -30,16 +28,21 @@ describe("prek-autofix consumer workflows", () => {
     const workflow = parse(
       readFileSync(".github/workflows/prek-autofix-fix.yml", "utf8"),
     );
-    expect(workflow.on.workflow_run.workflows).toEqual(["prek-autofix Review"]);
+    expect(workflow.name).toBe("prek-autofix fix");
+    expect(workflow.on.workflow_run.workflows).toEqual(["prek-autofix"]);
     expect(workflow.permissions).toEqual({
       "actions": "read",
       "contents": "read",
       "pull-requests": "write",
     });
+    expect(workflow.jobs.fix.if).toBe(
+      "github.event.workflow_run.event == 'pull_request'",
+    );
     const steps = workflow.jobs.fix.steps;
     expect(steps).toHaveLength(1);
     expect(steps[0].uses).toBe("Snuffy2/prek-autofix/fix@v1");
-    expect(steps[0].with["source-workflow"]).toBe("prek-autofix Review");
+    expect(steps[0].with["source-workflow"]).toBe("prek-autofix");
+    expect(steps[0]).not.toHaveProperty("env");
     expect(steps[0]).not.toHaveProperty("run");
   });
 });

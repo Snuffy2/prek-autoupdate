@@ -1,8 +1,8 @@
-name: prek-autofix Fix
+name: prek-autofix fix
 
 on:
   workflow_run:
-    workflows: [prek-autofix Review]
+    workflows: [prek-autofix]
     types: [completed]
 
 permissions:
@@ -18,15 +18,11 @@ concurrency:
 jobs:
   fix:
     name: Fix prek issues
-    if: >-
-      github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.conclusion == 'failure'
+    if: github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Fix collected prek issues
         uses: Snuffy2/prek-autofix/fix@v1
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         with:
           autofix-token: ${{ secrets.PREK_AUTOFIX_TOKEN }}
-          source-workflow: prek-autofix Review
+          source-workflow: prek-autofix
