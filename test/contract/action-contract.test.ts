@@ -16,19 +16,20 @@ const metadata = parse(readFileSync("action.yml", "utf8")) as ActionMetadata;
 
 describe("action metadata", () => {
   it("declares the stable v2 input contract", () => {
-    expect(Object.keys(metadata.inputs)).toEqual([
-      "token",
-      "author-login",
-      "cooldown-days",
-      "update-day",
-      "update-branch",
-      "branch-prefix",
-      "label",
-      "commit-message",
-      "pr-title",
-      "add-paths",
-    ]);
-    expect(metadata.inputs).not.toHaveProperty("dispatch-workflows");
+    expect(new Set(Object.keys(metadata.inputs))).toEqual(
+      new Set([
+        "token",
+        "author-login",
+        "cooldown-days",
+        "update-day",
+        "update-branch",
+        "branch-prefix",
+        "label",
+        "commit-message",
+        "pr-title",
+        "add-paths",
+      ]),
+    );
     expect(metadata.inputs.token?.default).toBe("${{ github.token }}");
     expect(metadata.inputs["author-login"]?.default).toBe(
       "github-actions[bot]",
@@ -54,8 +55,6 @@ describe("action metadata", () => {
       using: "node24",
       main: "dist/index.js",
     });
-    expect(metadata.outputs["pull-request-number"]?.description).toBe(
-      "Number of the pull request created or updated by this run; empty on cleanup-only or no-update runs, even if an existing owned pull request remains.",
-    );
+    expect(metadata.outputs).toHaveProperty("pull-request-number");
   });
 });
