@@ -24,6 +24,8 @@ permissions.
 - Treat `action.yml`, `README.md`, and `dist/index.js` as the public release
   surface. Input or output changes require contract tests and documentation in
   the same change.
+- Changes to action source, runtime dependencies, or bundle configuration must
+  rebuild and commit `dist/index.js` in the same change.
 - Support Linux x64 and arm64 runners. The action uses the Node 24 runtime.
 - Do not request `actions: write`; no active path needs it.
 
@@ -49,16 +51,15 @@ permissions.
 
 - Use Node 24 and the committed npm lockfile.
 - Keep TypeScript strict and bundle the action with Rollup.
-- Use ESLint, Prettier, and Vitest with v8 coverage.
+- Run all linting and formatting through `prek`; do not invoke ESLint or Prettier
+  directly. Use Vitest with v8 coverage for tests.
 - Do not commit `node_modules/` or coverage output.
 
 Run the full local gate:
 
 ```sh
 npm ci
-npm run format:check
-npm run lint
-npm run typecheck
+prek run --all-files
 npm run test:coverage
 npm run check:dist
 ```
