@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Fix collected prek issues
-        uses: Snuffy2/prek-autofix/fix@v1
+        uses: Snuffy2/prek-autofix/fix@v1.0.2
         with:
           autofix-token: ${{ secrets.PREK_AUTOFIX_TOKEN }}
           source-workflow: prek-autofix

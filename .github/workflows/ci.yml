@@ -34,7 +34,7 @@ jobs:
         run: npm ci
 
       - name: Lint and format with prek
-        uses: j178/prek-action@v2
+        uses: j178/prek-action@v2.0.6
 
       - name: Test with coverage
         run: npm run test:coverage
