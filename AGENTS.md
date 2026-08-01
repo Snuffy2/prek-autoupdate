@@ -24,6 +24,8 @@ permissions.
 - Treat `action.yml`, `README.md`, and `dist/index.js` as the public release
   surface. Input or output changes require contract tests and documentation in
   the same change.
+- Changes to action source, runtime dependencies, or bundle configuration must
+  rebuild and commit `dist/index.js` in the same change.
 - Support Linux x64 and arm64 runners. The action uses the Node 24 runtime.
 - Do not request `actions: write`; no active path needs it.
 

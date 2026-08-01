@@ -45,7 +45,7 @@ id = "prettier"
 name = "prettier"
 entry = "npm exec -- prettier --write"
 language = "system"
-types_or = ["json", "markdown", "ts", "yaml"]
+types_or = ["javascript", "json", "markdown", "ts", "yaml"]
 
 [[repos.hooks]]
 id = "eslint"
