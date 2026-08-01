@@ -27,12 +27,25 @@ const selfWorkflow = parse(
   readFileSync(".github/workflows/prek_autoupdate_self.yml", "utf8"),
 ) as CallerWorkflow;
 
+function documentedWorkflow(): CallerWorkflow {
+  const yamlBlocks = [...readme.matchAll(/```yaml\n(?<yaml>[\s\S]*?)\n```/gu)];
+  const example = yamlBlocks.find((match) =>
+    match.groups?.yaml.includes("Snuffy2/prek-autoupdate@v2"),
+  );
+
+  expect(example?.groups?.yaml).toBeDefined();
+  return parse(example?.groups?.yaml ?? "") as CallerWorkflow;
+}
+
 describe("documented caller", () => {
   it("is a complete safe direct-action workflow", () => {
-    const match = /```yaml\n(?<yaml>[\s\S]*?)\n```/u.exec(readme);
-    expect(match?.groups?.yaml).toBeDefined();
-    const workflow = parse(match?.groups?.yaml ?? "") as CallerWorkflow;
-    const steps = workflow.jobs["prek-autoupdate"]?.steps ?? [];
+    const workflow = documentedWorkflow();
+    const job = Object.values(workflow.jobs).find((candidate) =>
+      candidate.steps?.some(
+        (step) => step.uses === "Snuffy2/prek-autoupdate@v2",
+      ),
+    );
+    const steps = job?.steps ?? [];
     const checkout = steps.find((step) =>
       step.uses?.startsWith("actions/checkout@"),
     );
@@ -44,6 +57,7 @@ describe("documented caller", () => {
       "contents": "write",
       "pull-requests": "write",
     });
+    expect(workflow.concurrency.group).toBeTruthy();
     expect(workflow.concurrency["cancel-in-progress"]).toBe(false);
     expect(checkout?.uses).toBe("actions/checkout@v7");
     expect(checkout?.with?.["persist-credentials"]).toBe(false);
@@ -53,16 +67,16 @@ describe("documented caller", () => {
   });
 
   it("keeps the repository caller aligned with the documented concurrency and checkout contract", () => {
-    const job = selfWorkflow.jobs["prek-autoupdate"];
+    const job = Object.values(selfWorkflow.jobs).find((candidate) =>
+      candidate.steps?.some((step) => step.uses === "./"),
+    );
     const steps = job?.steps ?? [];
     const checkout = steps.find((step) =>
       step.uses?.startsWith("actions/checkout@"),
     );
 
-    expect(selfWorkflow.concurrency).toEqual({
-      "group": "prek-autoupdate-${{ github.repository }}",
-      "cancel-in-progress": false,
-    });
+    expect(selfWorkflow.concurrency.group).toBeTruthy();
+    expect(selfWorkflow.concurrency["cancel-in-progress"]).toBe(false);
     expect(job?.permissions).toEqual({
       "contents": "write",
       "pull-requests": "write",

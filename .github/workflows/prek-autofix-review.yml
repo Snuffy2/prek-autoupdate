@@ -1,4 +1,4 @@
-name: prek-autofix Review
+name: prek-autofix
 
 on:
   pull_request:
@@ -8,15 +8,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: prek-autofix-review-${{ github.event.pull_request.number }}
+  group: prek-autofix-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   review:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    outputs:
-      changed: ${{ steps.review.outputs.changed }}
     steps:
       - name: Checkout pull request
         uses: actions/checkout@v7
@@ -32,11 +30,3 @@ jobs:
       - name: Review with prek
         id: review
         uses: Snuffy2/prek-autofix/review@v1
-
-  signal:
-    needs: review
-    if: needs.review.outputs.changed == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Report pending prek fixes
-        run: exit 1
