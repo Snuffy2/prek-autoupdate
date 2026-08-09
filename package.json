@@ -30,12 +30,12 @@
     "@vitest/coverage-v8": "^4.0.0",
     "eslint": "^10.8.0",
     "eslint-config-prettier": "^10.0.0",
-    "globals": "^17.8.0",
+    "globals": "^17.9.0",
     "jiti": "^2.0.0",
     "prettier": "^3.0.0",
-    "rollup": "^4.0.0",
+    "rollup": "^4.62.4",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.0.0",
+    "typescript-eslint": "^8.66.0",
     "vitest": "^4.0.0",
     "yaml": "^2.0.0"
   }
