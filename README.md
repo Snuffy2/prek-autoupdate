@@ -76,9 +76,12 @@ Enterprise Server, including self-hosted Linux runners with system Git in
 `/usr/local/bin` or the standard Nix/NixOS system profiles. Windows and macOS
 runners are not supported.
 
-Each release uses a pinned `prek` release. Version 2.0.0 uses `prek` 0.4.11 and
-verifies the official archive and extracted executable before running it. It
-also verifies an executable restored from the runner tool cache.
+Each run resolves the latest stable `prek` release from the official GitHub
+release URL. It downloads that version's archive and published SHA-256 checksum,
+or restores the versioned archive from the runner tool cache. The action
+verifies the archive against the official checksum every time before extracting
+and running the executable, so a new `prek-autoupdate` release is not required
+to pick up a newer `prek` release.
 
 ## Inputs
 

@@ -1,99 +1,107 @@
 import * as toolCache from "@actions/tool-cache";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-const PREK_VERSION = "0.4.11";
-const RELEASE_ROOT = `https://github.com/j178/prek/releases/download/v${PREK_VERSION}`;
+const LATEST_RELEASE_URL = "https://github.com/j178/prek/releases/latest";
+const RELEASE_ROOT = "https://github.com/j178/prek/releases/download";
+const RELEASE_PATH_PATTERN =
+  /^\/j178\/prek\/releases\/tag\/v(0|[1-9][0-9]*)\.([0-9]+)\.([0-9]+)$/u;
 
 interface Release {
-  readonly archiveSha256: string;
-  readonly binarySha256: string;
+  readonly root: string;
   readonly target: string;
+  readonly version: string;
 }
 
-function release(): Release {
+function target(): string {
   if (process.arch === "x64") {
-    return {
-      target: "x86_64-unknown-linux-gnu",
-      archiveSha256:
-        "038f67b69c1d1547e920532f975a0ec1a51453b962f1a2d9148abcb252a6d194",
-      binarySha256:
-        "c8ff33f4745f31fd770adfce904bb09108365542fd07580f3c2b1f783879495a",
-    };
+    return "x86_64-unknown-linux-gnu";
   }
   if (process.arch === "arm64") {
-    return {
-      target: "aarch64-unknown-linux-gnu",
-      archiveSha256:
-        "22edbb9353ca948b8260a904abedc352d0087944170785adab8d1fa1025534e7",
-      binarySha256:
-        "c6388688a4e98ffaff076e94ce9b65fda377101219207e76099cef0b0ce29482",
-    };
+    return "aarch64-unknown-linux-gnu";
   }
   throw new Error(`Unsupported prek architecture: ${process.arch}`);
 }
 
-/** Install the source-pinned official prek release and return its binary path. */
+/** Install the latest official prek release and return its binary path. */
 export async function installPrek(): Promise<string> {
-  const pinned = release();
-  const cached = toolCache.find("prek", PREK_VERSION, process.arch);
-  if (cached !== "") {
-    const cachedBinary = path.join(cached, "prek");
-    await verifyFileSha256(
-      cachedBinary,
-      pinned.binarySha256,
-      "cached prek binary",
-    );
-    return cachedBinary;
-  }
+  const latest = await resolveLatestRelease(target());
+  const asset = `prek-${latest.target}.tar.gz`;
+  const checksumFile = await toolCache.downloadTool(
+    `${latest.root}/${asset}.sha256`,
+  );
+  const checksumContents = await readFile(checksumFile, "utf8");
+  let archive = cachedArchive(latest.version, asset);
 
-  const directory = await mkdtemp(path.join(tmpdir(), "prek-download-"));
-  try {
-    const asset = `prek-${pinned.target}.tar.gz`;
-    const archive = await toolCache.downloadTool(`${RELEASE_ROOT}/${asset}`);
-    const checksumFile = await toolCache.downloadTool(
-      `${RELEASE_ROOT}/${asset}.sha256`,
+  if (archive === undefined) {
+    const downloadedArchive = await toolCache.downloadTool(
+      `${latest.root}/${asset}`,
     );
-    await verifySha256(
-      archive,
-      await readFile(checksumFile, "utf8"),
+    await verifySha256(downloadedArchive, checksumContents, asset);
+    const cacheDirectory = await toolCache.cacheFile(
+      downloadedArchive,
       asset,
-      pinned.archiveSha256,
-    );
-    const extracted = await toolCache.extractTar(archive, directory);
-    const binary = path.join(extracted, `prek-${pinned.target}`, "prek");
-    await verifyFileSha256(binary, pinned.binarySha256, "prek binary");
-    await chmod(binary, 0o755);
-    const cachedDirectory = await toolCache.cacheDir(
-      path.dirname(binary),
-      "prek",
-      PREK_VERSION,
+      "prek-archive",
+      latest.version,
       process.arch,
     );
-    const cachedBinary = path.join(cachedDirectory, "prek");
-    await verifyFileSha256(
-      cachedBinary,
-      pinned.binarySha256,
-      "cached prek binary",
-    );
-    return cachedBinary;
-  } finally {
-    await rm(directory, { force: true, recursive: true });
+    archive = path.join(cacheDirectory, asset);
   }
+
+  await verifySha256(archive, checksumContents, asset);
+  const directory = await mkdtemp(path.join(tmpdir(), "prek-extract-"));
+  const extracted = await toolCache.extractTar(archive, directory);
+  const binary = path.join(extracted, `prek-${latest.target}`, "prek");
+  await verifyExecutable(binary);
+  await chmod(binary, 0o755);
+  return binary;
 }
 
-async function verifyFileSha256(
-  file: string,
-  expected: string,
-  description: string,
-): Promise<void> {
-  const digest = createHash("sha256")
-    .update(await readFile(file))
-    .digest("hex");
-  if (digest !== expected) {
-    throw new Error(`SHA256 verification failed for ${description}`);
+function cachedArchive(version: string, asset: string): string | undefined {
+  const cached = toolCache.find("prek-archive", version, process.arch);
+  return cached === "" ? undefined : path.join(cached, asset);
+}
+
+async function resolveLatestRelease(releaseTarget: string): Promise<Release> {
+  const response = await fetch(LATEST_RELEASE_URL, {
+    method: "HEAD",
+    redirect: "manual",
+  });
+  if (![301, 302, 303, 307, 308].includes(response.status)) {
+    throw new Error(
+      `Latest prek release lookup returned HTTP ${response.status}`,
+    );
+  }
+  const location = response.headers.get("location");
+  if (location === null) {
+    throw new Error("Latest prek release did not provide a redirect");
+  }
+
+  const releaseUrl = new URL(location, LATEST_RELEASE_URL);
+  const match = releaseUrl.pathname.match(RELEASE_PATH_PATTERN);
+  if (
+    releaseUrl.origin !== "https://github.com" ||
+    releaseUrl.search !== "" ||
+    releaseUrl.hash !== "" ||
+    match === null
+  ) {
+    throw new Error(`Invalid latest prek release URL: ${releaseUrl.href}`);
+  }
+
+  const version = `${match[1]}.${match[2]}.${match[3]}`;
+  return {
+    root: `${RELEASE_ROOT}/v${version}`,
+    target: releaseTarget,
+    version,
+  };
+}
+
+async function verifyExecutable(binary: string): Promise<void> {
+  const metadata = await lstat(binary);
+  if (!metadata.isFile()) {
+    throw new Error("Extracted prek executable is not a regular file");
   }
 }
 
@@ -101,7 +109,6 @@ async function verifySha256(
   archive: string,
   checksumContents: string,
   asset: string,
-  pinnedDigest: string,
 ): Promise<void> {
   const match = checksumContents.match(/^([a-fA-F0-9]{64})(?:\s+\*?(\S+))?/u);
   if (
@@ -113,7 +120,7 @@ async function verifySha256(
   const digest = createHash("sha256")
     .update(await readFile(archive))
     .digest("hex");
-  if (digest !== match[1].toLowerCase() || digest !== pinnedDigest) {
+  if (digest !== match[1].toLowerCase()) {
     throw new Error(`SHA256 verification failed for ${asset}`);
   }
 }

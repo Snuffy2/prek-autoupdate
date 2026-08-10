@@ -1,6 +1,6 @@
 import * as toolCache from "@actions/tool-cache";
 import type * as NodeCrypto from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,28 +8,25 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { installPrek } from "../../src/prek/install.js";
 
 vi.mock("@actions/tool-cache", () => ({
-  cacheDir: vi.fn(),
+  cacheFile: vi.fn(),
   downloadTool: vi.fn(),
   extractTar: vi.fn(),
   find: vi.fn(),
 }));
 
-const RELEASE =
-  process.arch === "arm64"
-    ? {
-        archiveSha256:
-          "22edbb9353ca948b8260a904abedc352d0087944170785adab8d1fa1025534e7",
-        binarySha256:
-          "c6388688a4e98ffaff076e94ce9b65fda377101219207e76099cef0b0ce29482",
-        target: "aarch64-unknown-linux-gnu",
-      }
-    : {
-        archiveSha256:
-          "038f67b69c1d1547e920532f975a0ec1a51453b962f1a2d9148abcb252a6d194",
-        binarySha256:
-          "c8ff33f4745f31fd770adfce904bb09108365542fd07580f3c2b1f783879495a",
-        target: "x86_64-unknown-linux-gnu",
-      };
+const ARCHIVE_SHA256 =
+  "038f67b69c1d1547e920532f975a0ec1a51453b962f1a2d9148abcb252a6d194";
+const RELEASE = {
+  asset:
+    process.arch === "arm64"
+      ? "prek-aarch64-unknown-linux-gnu.tar.gz"
+      : "prek-x86_64-unknown-linux-gnu.tar.gz",
+  target:
+    process.arch === "arm64"
+      ? "aarch64-unknown-linux-gnu"
+      : "x86_64-unknown-linux-gnu",
+  version: "9.8.7",
+};
 const TEMPORARY_DIRECTORIES: string[] = [];
 
 vi.mock("node:crypto", async (importOriginal) => {
@@ -45,14 +42,7 @@ vi.mock("node:crypto", async (importOriginal) => {
         },
         digest(encoding: "hex") {
           if (contents === "valid archive") {
-            return process.arch === "arm64"
-              ? "22edbb9353ca948b8260a904abedc352d0087944170785adab8d1fa1025534e7"
-              : "038f67b69c1d1547e920532f975a0ec1a51453b962f1a2d9148abcb252a6d194";
-          }
-          if (contents === "valid binary") {
-            return process.arch === "arm64"
-              ? "c6388688a4e98ffaff076e94ce9b65fda377101219207e76099cef0b0ce29482"
-              : "c8ff33f4745f31fd770adfce904bb09108365542fd07580f3c2b1f783879495a";
+            return ARCHIVE_SHA256;
           }
           return actual.createHash("sha256").update(contents).digest(encoding);
         },
@@ -63,6 +53,8 @@ vi.mock("node:crypto", async (importOriginal) => {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.stubGlobal("fetch", vi.fn());
+  mockLatestRelease();
 });
 
 async function temporaryDirectory(prefix: string): Promise<string> {
@@ -71,40 +63,54 @@ async function temporaryDirectory(prefix: string): Promise<string> {
   return directory;
 }
 
+function mockLatestRelease(location = releaseUrl()): void {
+  vi.mocked(fetch).mockResolvedValue(
+    new Response(null, {
+      status: 302,
+      headers: { location },
+    }),
+  );
+}
+
+function releaseUrl(): string {
+  return `https://github.com/j178/prek/releases/tag/v${RELEASE.version}`;
+}
+
 async function arrangeDownload(
   checksumContents: string,
   archiveContents = "valid archive",
 ): Promise<{
   archive: string;
-  cachedBinary: string;
+  cachedArchive: string;
   extractedBinary: string;
 }> {
   const downloadDirectory = await temporaryDirectory("prek-assets-test-");
   const extractDirectory = await temporaryDirectory("prek-extract-test-");
   const cacheDirectory = await temporaryDirectory("prek-new-cache-test-");
-  const archive = path.join(downloadDirectory, "prek.tar.gz");
-  const checksum = path.join(downloadDirectory, "prek.tar.gz.sha256");
+  const archive = path.join(downloadDirectory, RELEASE.asset);
+  const checksum = path.join(downloadDirectory, `${RELEASE.asset}.sha256`);
+  const cachedArchive = path.join(cacheDirectory, RELEASE.asset);
   const extractedBinary = path.join(
     extractDirectory,
     `prek-${RELEASE.target}`,
     "prek",
   );
-  const cachedBinary = path.join(cacheDirectory, "prek");
   await mkdir(path.dirname(extractedBinary), { recursive: true });
   await writeFile(archive, archiveContents);
   await writeFile(checksum, checksumContents);
+  await writeFile(cachedArchive, archiveContents);
   await writeFile(extractedBinary, "valid binary");
-  await writeFile(cachedBinary, "valid binary");
   vi.mocked(toolCache.find).mockReturnValue("");
   vi.mocked(toolCache.downloadTool)
-    .mockResolvedValueOnce(archive)
-    .mockResolvedValueOnce(checksum);
+    .mockResolvedValueOnce(checksum)
+    .mockResolvedValueOnce(archive);
+  vi.mocked(toolCache.cacheFile).mockResolvedValue(cacheDirectory);
   vi.mocked(toolCache.extractTar).mockResolvedValue(extractDirectory);
-  vi.mocked(toolCache.cacheDir).mockResolvedValue(cacheDirectory);
-  return { archive, cachedBinary, extractedBinary };
+  return { archive, cachedArchive, extractedBinary };
 }
 
 afterEach(async () => {
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
   await Promise.all(
     TEMPORARY_DIRECTORIES.splice(0).map(async (directory) => {
@@ -114,45 +120,56 @@ afterEach(async () => {
 });
 
 describe("installPrek", () => {
-  it("rejects a tampered cached binary", async () => {
+  it("rejects a tampered cached archive", async () => {
+    const downloadDirectory = await temporaryDirectory("prek-checksum-test-");
+    const checksum = path.join(downloadDirectory, `${RELEASE.asset}.sha256`);
+    await writeFile(checksum, `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`);
     const cacheDirectory = await temporaryDirectory("prek-cache-test-");
-    await writeFile(path.join(cacheDirectory, "prek"), "tampered");
+    await writeFile(path.join(cacheDirectory, RELEASE.asset), "tampered");
     vi.mocked(toolCache.find).mockReturnValue(cacheDirectory);
+    vi.mocked(toolCache.downloadTool).mockResolvedValue(checksum);
 
     await expect(installPrek()).rejects.toThrow(
-      "SHA256 verification failed for cached prek binary",
+      `SHA256 verification failed for ${RELEASE.asset}`,
     );
-    expect(toolCache.downloadTool).not.toHaveBeenCalled();
+    expect(toolCache.downloadTool).toHaveBeenCalledOnce();
+    expect(toolCache.extractTar).not.toHaveBeenCalled();
   });
 
-  it("downloads, verifies, extracts, and caches the pinned release", async () => {
-    const { archive, cachedBinary, extractedBinary } = await arrangeDownload(
-      `${RELEASE.archiveSha256}  prek-${RELEASE.target}.tar.gz\n`,
+  it("resolves, downloads, verifies, extracts, and caches the latest release", async () => {
+    const { archive, cachedArchive, extractedBinary } = await arrangeDownload(
+      `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`,
     );
 
-    await expect(installPrek()).resolves.toBe(cachedBinary);
+    await expect(installPrek()).resolves.toBe(extractedBinary);
+    expect(fetch).toHaveBeenCalledWith(
+      "https://github.com/j178/prek/releases/latest",
+      { method: "HEAD", redirect: "manual" },
+    );
     expect(toolCache.downloadTool).toHaveBeenNthCalledWith(
       1,
-      `https://github.com/j178/prek/releases/download/v0.4.11/prek-${RELEASE.target}.tar.gz`,
+      `https://github.com/j178/prek/releases/download/v${RELEASE.version}/${RELEASE.asset}.sha256`,
+    );
+    expect(toolCache.downloadTool).toHaveBeenNthCalledWith(
+      2,
+      `https://github.com/j178/prek/releases/download/v${RELEASE.version}/${RELEASE.asset}`,
+    );
+    expect(toolCache.cacheFile).toHaveBeenCalledWith(
+      archive,
+      RELEASE.asset,
+      "prek-archive",
+      RELEASE.version,
+      process.arch,
     );
     expect(toolCache.extractTar).toHaveBeenCalledWith(
-      archive,
-      expect.stringContaining("prek-download-"),
-    );
-    expect(toolCache.cacheDir).toHaveBeenCalledWith(
-      path.dirname(extractedBinary),
-      "prek",
-      "0.4.11",
-      process.arch,
+      cachedArchive,
+      expect.stringContaining("prek-extract-"),
     );
   });
 
   it.each([
     ["not a checksum", "Invalid SHA256 checksum file"],
-    [
-      `${"0".repeat(64)}  prek-${RELEASE.target}.tar.gz\n`,
-      "SHA256 verification failed",
-    ],
+    [`${"0".repeat(64)}  ${RELEASE.asset}\n`, "SHA256 verification failed"],
   ])(
     "rejects an invalid downloaded checksum: %s",
     async (checksum, message) => {
@@ -160,20 +177,64 @@ describe("installPrek", () => {
 
       await expect(installPrek()).rejects.toThrow(message);
       expect(toolCache.extractTar).not.toHaveBeenCalled();
-      expect(toolCache.cacheDir).not.toHaveBeenCalled();
+      expect(toolCache.cacheFile).not.toHaveBeenCalled();
     },
   );
 
-  it("rejects a freshly downloaded archive that does not match its pinned checksum", async () => {
+  it("rejects a freshly downloaded archive that does not match its checksum", async () => {
     await arrangeDownload(
-      `${RELEASE.archiveSha256}  prek-${RELEASE.target}.tar.gz\n`,
+      `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`,
       "tampered archive",
     );
 
     await expect(installPrek()).rejects.toThrow(
-      `SHA256 verification failed for prek-${RELEASE.target}.tar.gz`,
+      `SHA256 verification failed for ${RELEASE.asset}`,
     );
     expect(toolCache.extractTar).not.toHaveBeenCalled();
-    expect(toolCache.cacheDir).not.toHaveBeenCalled();
+    expect(toolCache.cacheFile).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["https://example.com/j178/prek/releases/tag/v9.8.7"],
+    ["https://github.com/j178/prek/releases/tag/latest"],
+    ["https://github.com/other/prek/releases/tag/v9.8.7"],
+    ["https://github.com/j178/prek/releases/tag/v9.8.7?asset=other"],
+  ])("rejects an invalid latest-release redirect: %s", async (location) => {
+    mockLatestRelease(location);
+
+    await expect(installPrek()).rejects.toThrow(
+      "Invalid latest prek release URL",
+    );
+    expect(toolCache.downloadTool).not.toHaveBeenCalled();
+  });
+
+  it("rejects a latest-release response without a redirect", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 200 }));
+
+    await expect(installPrek()).rejects.toThrow(
+      "Latest prek release lookup returned HTTP 200",
+    );
+    expect(toolCache.downloadTool).not.toHaveBeenCalled();
+  });
+
+  it("rejects a redirect without a release location", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 302 }));
+
+    await expect(installPrek()).rejects.toThrow(
+      "Latest prek release did not provide a redirect",
+    );
+    expect(toolCache.downloadTool).not.toHaveBeenCalled();
+  });
+
+  it("rejects a symlink extracted in place of the executable", async () => {
+    const { extractedBinary } = await arrangeDownload(
+      `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`,
+    );
+    await rm(extractedBinary);
+    await symlink("/usr/bin/true", extractedBinary);
+
+    await expect(installPrek()).rejects.toThrow(
+      "Extracted prek executable is not a regular file",
+    );
   });
 });
