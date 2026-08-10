@@ -1,6 +1,13 @@
 import * as toolCache from "@actions/tool-cache";
 import type * as NodeCrypto from "node:crypto";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -61,6 +68,13 @@ async function temporaryDirectory(prefix: string): Promise<string> {
   const directory = await mkdtemp(path.join(tmpdir(), prefix));
   TEMPORARY_DIRECTORIES.push(directory);
   return directory;
+}
+
+async function exists(candidate: string): Promise<boolean> {
+  return access(candidate).then(
+    () => true,
+    () => false,
+  );
 }
 
 function mockLatestRelease(location = releaseUrl()): void {
@@ -141,7 +155,8 @@ describe("installPrek", () => {
       `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`,
     );
 
-    await expect(installPrek()).resolves.toBe(extractedBinary);
+    const installation = await installPrek();
+    expect(installation.binary).toBe(extractedBinary);
     expect(fetch).toHaveBeenCalledWith(
       "https://github.com/j178/prek/releases/latest",
       { method: "HEAD", redirect: "manual" },
@@ -165,6 +180,11 @@ describe("installPrek", () => {
       cachedArchive,
       expect.stringContaining("prek-extract-"),
     );
+    const extractionDirectory = vi.mocked(toolCache.extractTar).mock
+      .calls[0]![1]!;
+    await installation.cleanup();
+    await installation.cleanup();
+    expect(await exists(extractionDirectory)).toBe(false);
   });
 
   it.each([
@@ -236,5 +256,8 @@ describe("installPrek", () => {
     await expect(installPrek()).rejects.toThrow(
       "Extracted prek executable is not a regular file",
     );
+    const extractionDirectory = vi.mocked(toolCache.extractTar).mock
+      .calls[0]![1]!;
+    expect(await exists(extractionDirectory)).toBe(false);
   });
 });

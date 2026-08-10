@@ -1,6 +1,6 @@
 import * as toolCache from "@actions/tool-cache";
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdtemp, readFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -15,6 +15,11 @@ interface Release {
   readonly version: string;
 }
 
+export interface PrekInstallation {
+  readonly binary: string;
+  readonly cleanup: () => Promise<void>;
+}
+
 function target(): string {
   if (process.arch === "x64") {
     return "x86_64-unknown-linux-gnu";
@@ -25,8 +30,8 @@ function target(): string {
   throw new Error(`Unsupported prek architecture: ${process.arch}`);
 }
 
-/** Install the latest official prek release and return its binary path. */
-export async function installPrek(): Promise<string> {
+/** Install the latest official prek release and transfer cleanup ownership. */
+export async function installPrek(): Promise<PrekInstallation> {
   const latest = await resolveLatestRelease(target());
   const asset = `prek-${latest.target}.tar.gz`;
   const checksumFile = await toolCache.downloadTool(
@@ -52,11 +57,19 @@ export async function installPrek(): Promise<string> {
 
   await verifySha256(archive, checksumContents, asset);
   const directory = await mkdtemp(path.join(tmpdir(), "prek-extract-"));
-  const extracted = await toolCache.extractTar(archive, directory);
-  const binary = path.join(extracted, `prek-${latest.target}`, "prek");
-  await verifyExecutable(binary);
-  await chmod(binary, 0o755);
-  return binary;
+  const cleanup = async (): Promise<void> => {
+    await rm(directory, { force: true, recursive: true });
+  };
+  try {
+    const extracted = await toolCache.extractTar(archive, directory);
+    const binary = path.join(extracted, `prek-${latest.target}`, "prek");
+    await verifyExecutable(binary);
+    await chmod(binary, 0o755);
+    return { binary, cleanup };
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
 }
 
 function cachedArchive(version: string, asset: string): string | undefined {

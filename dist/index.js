@@ -39685,7 +39685,7 @@ function target() {
     }
     throw new Error(`Unsupported prek architecture: ${process.arch}`);
 }
-/** Install the latest official prek release and return its binary path. */
+/** Install the latest official prek release and transfer cleanup ownership. */
 async function installPrek() {
     const latest = await resolveLatestRelease(target());
     const asset = `prek-${latest.target}.tar.gz`;
@@ -39700,11 +39700,20 @@ async function installPrek() {
     }
     await verifySha256(archive, checksumContents, asset);
     const directory = await mkdtemp(path$1.join(tmpdir(), "prek-extract-"));
-    const extracted = await extractTar(archive, directory);
-    const binary = path$1.join(extracted, `prek-${latest.target}`, "prek");
-    await verifyExecutable(binary);
-    await chmod$1(binary, 0o755);
-    return binary;
+    const cleanup = async () => {
+        await rm$1(directory, { force: true, recursive: true });
+    };
+    try {
+        const extracted = await extractTar(archive, directory);
+        const binary = path$1.join(extracted, `prek-${latest.target}`, "prek");
+        await verifyExecutable(binary);
+        await chmod$1(binary, 0o755);
+        return { binary, cleanup };
+    }
+    catch (error) {
+        await cleanup();
+        throw error;
+    }
 }
 function cachedArchive(version, asset) {
     const cached = find("prek-archive", version, process.arch);
@@ -39790,6 +39799,7 @@ async function runUpdate(execution) {
     const temporaryRoot = await mkdtemp(path$1.join(tmpdir(), "prek-autoupdate-"));
     const worktree = path$1.join(temporaryRoot, "worktree");
     let added = false;
+    let installation;
     try {
         await git(execution.context.workspace, [
             "worktree",
@@ -39799,8 +39809,8 @@ async function runUpdate(execution) {
             execution.context.baseSha,
         ]);
         added = true;
-        const prek = await installPrek();
-        const output = await runPrek(prek, worktree, execution.inputs.cooldownDays);
+        installation = await installPrek();
+        const output = await runPrek(installation.binary, worktree, execution.inputs.cooldownDays);
         await git(worktree, ["add", "--", ...addPaths]);
         const diffStatus = await gitExit(worktree, [
             "diff",
@@ -39933,15 +39943,20 @@ async function runUpdate(execution) {
         throw new Error("Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved", { cause: new AggregateError([updateError, verificationError]) });
     }
     finally {
-        if (added) {
-            await git(execution.context.workspace, [
-                "worktree",
-                "remove",
-                "--force",
-                worktree,
-            ]).catch(() => undefined);
+        try {
+            await installation?.cleanup();
         }
-        await rm$1(temporaryRoot, { force: true, recursive: true });
+        finally {
+            if (added) {
+                await git(execution.context.workspace, [
+                    "worktree",
+                    "remove",
+                    "--force",
+                    worktree,
+                ]).catch(() => undefined);
+            }
+            await rm$1(temporaryRoot, { force: true, recursive: true });
+        }
     }
 }
 function isExactUpdatedPull(execution, pull, pullNumber, newSha, body) {

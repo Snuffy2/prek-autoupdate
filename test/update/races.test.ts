@@ -15,7 +15,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type * as EnvironmentModule from "../../src/environment.js";
 
-const installPrek = vi.hoisted(() => vi.fn<() => Promise<string>>());
+const installPrek = vi.hoisted(() =>
+  vi.fn<() => Promise<{ binary: string; cleanup: () => Promise<void> }>>(),
+);
 vi.mock("../../src/prek/index.js", () => ({ installPrek }));
 vi.mock("../../src/environment.js", async (importOriginal) => {
   const actual = await importOriginal<typeof EnvironmentModule>();
@@ -657,7 +659,10 @@ async function makeHarness(options: HarnessOptions = {}) {
       : "#!/bin/sh\nprintf 'updated\\n' > prek.toml\n",
   );
   await chmod(prek, 0o755);
-  installPrek.mockResolvedValue(prek);
+  installPrek.mockResolvedValue({
+    binary: prek,
+    cleanup: async () => undefined,
+  });
 
   const pull = ownedPull(oldSha);
   if (options.closedExisting) {

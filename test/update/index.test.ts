@@ -6,9 +6,11 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../../src/prek/index.js", () => ({
-  installPrek: vi.fn(async () => "/usr/bin/true"),
+const prekMocks = vi.hoisted(() => ({
+  cleanup: vi.fn(async () => undefined),
+  install: vi.fn(),
 }));
+vi.mock("../../src/prek/index.js", () => ({ installPrek: prekMocks.install }));
 
 import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
 import {
@@ -23,12 +25,18 @@ const exec = promisify(execFile);
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  vi.clearAllMocks();
   await Promise.all(
     temporaryDirectories
       .splice(0)
       .map((directory) => rm(directory, { force: true, recursive: true })),
   );
 });
+
+prekMocks.install.mockImplementation(async () => ({
+  binary: "/usr/bin/true",
+  cleanup: prekMocks.cleanup,
+}));
 
 describe("update path validation", () => {
   it.each([
@@ -242,6 +250,18 @@ describe("non-mutating update preflight", () => {
     ]);
     expect(status).toBe("");
     expect(worktrees.match(/^worktree /gmu)).toHaveLength(1);
+    expect(prekMocks.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("cleans the installation when running prek fails", async () => {
+    prekMocks.install.mockResolvedValueOnce({
+      binary: "/missing/prek",
+      cleanup: prekMocks.cleanup,
+    });
+    const execution = await makeExecution(["prek.toml"]);
+
+    await expect(runUpdate(execution)).rejects.toThrow();
+    expect(prekMocks.cleanup).toHaveBeenCalledOnce();
   });
 });
 

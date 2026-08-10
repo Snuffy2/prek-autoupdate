@@ -80,8 +80,11 @@ Each run resolves the latest stable `prek` release from the official GitHub
 release URL. It downloads that version's archive and published SHA-256 checksum,
 or restores the versioned archive from the runner tool cache. The action
 verifies the archive against the official checksum every time before extracting
-and running the executable, so a new `prek-autoupdate` release is not required
-to pick up a newer `prek` release.
+and running the executable. This detects download corruption or modification of
+a cached archive, but the checksum is published by the same upstream release and
+is not an independent trust anchor. Every new latest upstream `prek` release is
+trusted automatically, so a new `prek-autoupdate` release is not required to
+pick it up.
 
 ## Inputs
 

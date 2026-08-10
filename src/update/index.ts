@@ -10,7 +10,7 @@ import {
   hardenedGitArguments,
   sanitizedChildEnvironment,
 } from "../environment.js";
-import { installPrek } from "../prek/index.js";
+import { installPrek, type PrekInstallation } from "../prek/index.js";
 
 const execFileAsync = promisify(execFile);
 export const BODY_MARKER = "Automated update of `prek` hooks.";
@@ -78,6 +78,7 @@ export async function runUpdate(
   const temporaryRoot = await mkdtemp(path.join(tmpdir(), "prek-autoupdate-"));
   const worktree = path.join(temporaryRoot, "worktree");
   let added = false;
+  let installation: PrekInstallation | undefined;
   try {
     await git(execution.context.workspace, [
       "worktree",
@@ -87,8 +88,12 @@ export async function runUpdate(
       execution.context.baseSha,
     ]);
     added = true;
-    const prek = await installPrek();
-    const output = await runPrek(prek, worktree, execution.inputs.cooldownDays);
+    installation = await installPrek();
+    const output = await runPrek(
+      installation.binary,
+      worktree,
+      execution.inputs.cooldownDays,
+    );
     await git(worktree, ["add", "--", ...addPaths]);
     const diffStatus = await gitExit(worktree, [
       "diff",
@@ -257,15 +262,19 @@ export async function runUpdate(
       { cause: new AggregateError([updateError, verificationError]) },
     );
   } finally {
-    if (added) {
-      await git(execution.context.workspace, [
-        "worktree",
-        "remove",
-        "--force",
-        worktree,
-      ]).catch(() => undefined);
+    try {
+      await installation?.cleanup();
+    } finally {
+      if (added) {
+        await git(execution.context.workspace, [
+          "worktree",
+          "remove",
+          "--force",
+          worktree,
+        ]).catch(() => undefined);
+      }
+      await rm(temporaryRoot, { force: true, recursive: true });
     }
-    await rm(temporaryRoot, { force: true, recursive: true });
   }
 }
 
