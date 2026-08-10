@@ -30,6 +30,7 @@ concurrency:
 
 jobs:
   prek-autoupdate:
+    if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -45,7 +46,8 @@ jobs:
 ```
 
 GitHub enables manual `workflow_dispatch` runs only after this file exists on
-the repository's default branch.
+the repository's default branch. The job skips forked repositories, preventing
+forks from creating their own automated maintenance pull requests.
 
 Schedule the workflow every day. The action decides which scheduled day actually
 runs `prek auto-update` from `update-day`; cleanup still runs on the other days.

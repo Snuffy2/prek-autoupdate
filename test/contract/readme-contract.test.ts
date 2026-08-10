@@ -11,6 +11,7 @@ interface CallerWorkflow {
   readonly jobs: Record<
     string,
     {
+      readonly if?: string;
       readonly permissions?: Record<string, string>;
       readonly steps?: Array<{
         readonly uses?: string;
@@ -59,6 +60,7 @@ describe("documented caller", () => {
     });
     expect(workflow.concurrency.group).toBeTruthy();
     expect(workflow.concurrency["cancel-in-progress"]).toBe(false);
+    expect(job?.if).toBe("github.event.repository.fork == false");
     expect(checkout?.uses).toBe("actions/checkout@v7");
     expect(checkout?.with?.["persist-credentials"]).toBe(false);
     expect(steps).toContainEqual(
@@ -77,6 +79,7 @@ describe("documented caller", () => {
 
     expect(selfWorkflow.concurrency.group).toBeTruthy();
     expect(selfWorkflow.concurrency["cancel-in-progress"]).toBe(false);
+    expect(job?.if).toBe("github.event.repository.fork == false");
     expect(job?.permissions).toEqual({
       "contents": "write",
       "pull-requests": "write",
