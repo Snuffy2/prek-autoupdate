@@ -1,6 +1,7 @@
 import * as core from "@actions/core";
 import * as toolCache from "@actions/tool-cache";
 import { HttpClient } from "@actions/http-client";
+import type { HttpClientResponse } from "@actions/http-client";
 import { createHash } from "node:crypto";
 import {
   chmod,
@@ -18,6 +19,7 @@ const RELEASE_ROOT = "https://github.com/j178/prek/releases/download";
 const RELEASE_PATH_PATTERN =
   /^\/j178\/prek\/releases\/tag\/v(0|[1-9][0-9]*)\.([0-9]+)\.([0-9]+)$/u;
 const RELEASE_LOOKUP_ATTEMPTS = 3;
+const RELEASE_LOOKUP_DEADLINE_MS = 65_000;
 const RELEASE_LOOKUP_BACKOFF_MS = 100;
 const RELEASE_LOOKUP_MAX_DELAY_MS = 30_000;
 const RELEASE_LOOKUP_TOTAL_DELAY_MS = 30_000;
@@ -129,8 +131,15 @@ export async function installPrek(): Promise<PrekInstallation> {
 }
 
 function cachedArchive(version: string, asset: string): string | undefined {
-  const cached = toolCache.find("prek-archive", version, process.arch);
-  return cached === "" ? undefined : path.join(cached, asset);
+  try {
+    const cached = toolCache.find("prek-archive", version, process.arch);
+    return cached === "" ? undefined : path.join(cached, asset);
+  } catch (error) {
+    core.warning(
+      `Failed to read prek archive cache; continuing without cache: ${errorMessage(error)}`,
+    );
+    return undefined;
+  }
 }
 
 async function resolveLatestRelease(releaseTarget: string): Promise<Release> {
@@ -140,36 +149,63 @@ async function resolveLatestRelease(releaseTarget: string): Promise<Release> {
     keepAlive: true,
     socketTimeout: RELEASE_LOOKUP_TIMEOUT_MS,
   });
-  let response;
-  let totalDelay = 0;
+  const lookup = lookupLatestReleaseResponse(client);
+  let deadline: NodeJS.Timeout | undefined;
   try {
-    for (let attempt = 1; ; attempt += 1) {
-      try {
-        response = await client.head(LATEST_RELEASE_URL);
-      } catch (error) {
-        if (attempt === RELEASE_LOOKUP_ATTEMPTS) {
-          throw error;
-        }
-        const milliseconds = retryDelay(attempt);
-        totalDelay = addRetryDelay(totalDelay, milliseconds);
-        await delay(milliseconds);
-        continue;
-      }
-      const status = response.message.statusCode ?? 0;
-      if (!isTransientStatus(status) || attempt === RELEASE_LOOKUP_ATTEMPTS) {
-        break;
-      }
-      await response.readBody();
-      const milliseconds = retryDelay(
-        attempt,
-        response.message.headers["retry-after"],
-      );
-      totalDelay = addRetryDelay(totalDelay, milliseconds);
-      await delay(milliseconds);
-    }
+    const timeout = new Promise<never>((_resolve, reject) => {
+      deadline = setTimeout(() => {
+        reject(
+          new Error(
+            `Latest prek release lookup exceeded the ${RELEASE_LOOKUP_DEADLINE_MS}ms deadline`,
+          ),
+        );
+      }, RELEASE_LOOKUP_DEADLINE_MS);
+    });
+    const response = await Promise.race([lookup, timeout]);
+    return releaseFromResponse(response, releaseTarget);
   } finally {
+    if (deadline !== undefined) {
+      clearTimeout(deadline);
+    }
     client.dispose();
   }
+}
+
+async function lookupLatestReleaseResponse(
+  client: HttpClient,
+): Promise<HttpClientResponse> {
+  let totalDelay = 0;
+  for (let attempt = 1; ; attempt += 1) {
+    let response: HttpClientResponse;
+    try {
+      response = await client.head(LATEST_RELEASE_URL);
+    } catch (error) {
+      if (attempt === RELEASE_LOOKUP_ATTEMPTS) {
+        throw error;
+      }
+      const milliseconds = retryDelay(attempt);
+      totalDelay = addRetryDelay(totalDelay, milliseconds);
+      await delay(milliseconds);
+      continue;
+    }
+    const status = response.message.statusCode ?? 0;
+    if (!isTransientStatus(status) || attempt === RELEASE_LOOKUP_ATTEMPTS) {
+      return response;
+    }
+    await response.readBody();
+    const milliseconds = retryDelay(
+      attempt,
+      response.message.headers["retry-after"],
+    );
+    totalDelay = addRetryDelay(totalDelay, milliseconds);
+    await delay(milliseconds);
+  }
+}
+
+function releaseFromResponse(
+  response: HttpClientResponse,
+  releaseTarget: string,
+): Release {
   const status = response.message.statusCode ?? 0;
   if (![301, 302, 303, 307, 308].includes(status)) {
     throw new Error(`Latest prek release lookup returned HTTP ${status}`);

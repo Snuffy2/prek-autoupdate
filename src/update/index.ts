@@ -75,9 +75,7 @@ export async function runUpdate(
   const addPaths = await resolveAddPaths(execution);
   await proveBase(execution);
   const remote = await observeRemoteState(execution);
-  const temporaryRoot = await realpath(
-    await mkdtemp(path.join(tmpdir(), "prek-autoupdate-")),
-  );
+  const temporaryRoot = await createTemporaryRoot();
   const worktree = path.join(temporaryRoot, "worktree");
   let added = false;
   let installation: PrekInstallation | undefined;
@@ -337,6 +335,37 @@ export async function runUpdate(
       }
     }
     reportCleanupFailures(updateFailed, updateError, cleanupErrors);
+  }
+}
+
+export async function createTemporaryRoot(
+  create: (prefix: string) => Promise<string> = mkdtemp,
+  resolve: (candidate: string) => Promise<string> = realpath,
+  remove: (
+    candidate: string,
+    options: { force: boolean; recursive: boolean },
+  ) => Promise<void> = rm,
+): Promise<string> {
+  const rawRoot = await create(path.join(tmpdir(), "prek-autoupdate-"));
+  try {
+    return await resolve(rawRoot);
+  } catch (error) {
+    let cleanupFailed = false;
+    let cleanupError: unknown;
+    try {
+      await remove(rawRoot, { force: true, recursive: true });
+    } catch (caughtCleanupError) {
+      cleanupFailed = true;
+      cleanupError = caughtCleanupError;
+    }
+    if (cleanupFailed) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Temporary root resolution failed and cleanup also failed",
+        { cause: error },
+      );
+    }
+    throw error;
   }
 }
 

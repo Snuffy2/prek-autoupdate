@@ -39623,6 +39623,7 @@ const LATEST_RELEASE_URL = "https://github.com/j178/prek/releases/latest";
 const RELEASE_ROOT = "https://github.com/j178/prek/releases/download";
 const RELEASE_PATH_PATTERN = /^\/j178\/prek\/releases\/tag\/v(0|[1-9][0-9]*)\.([0-9]+)\.([0-9]+)$/u;
 const RELEASE_LOOKUP_ATTEMPTS = 3;
+const RELEASE_LOOKUP_DEADLINE_MS = 65_000;
 const RELEASE_LOOKUP_BACKOFF_MS = 100;
 const RELEASE_LOOKUP_MAX_DELAY_MS = 30_000;
 const RELEASE_LOOKUP_TOTAL_DELAY_MS = 30_000;
@@ -39699,8 +39700,14 @@ async function installPrek() {
     }
 }
 function cachedArchive(version, asset) {
-    const cached = find("prek-archive", version, process.arch);
-    return cached === "" ? undefined : path$1.join(cached, asset);
+    try {
+        const cached = find("prek-archive", version, process.arch);
+        return cached === "" ? undefined : path$1.join(cached, asset);
+    }
+    catch (error) {
+        warning(`Failed to read prek archive cache; continuing without cache: ${errorMessage$1(error)}`);
+        return undefined;
+    }
 }
 async function resolveLatestRelease(releaseTarget) {
     const client = new HttpClient("prek-autoupdate", [], {
@@ -39709,35 +39716,51 @@ async function resolveLatestRelease(releaseTarget) {
         keepAlive: true,
         socketTimeout: RELEASE_LOOKUP_TIMEOUT_MS,
     });
-    let response;
-    let totalDelay = 0;
+    const lookup = lookupLatestReleaseResponse(client);
+    let deadline;
     try {
-        for (let attempt = 1;; attempt += 1) {
-            try {
-                response = await client.head(LATEST_RELEASE_URL);
-            }
-            catch (error) {
-                if (attempt === RELEASE_LOOKUP_ATTEMPTS) {
-                    throw error;
-                }
-                const milliseconds = retryDelay(attempt);
-                totalDelay = addRetryDelay(totalDelay, milliseconds);
-                await delay(milliseconds);
-                continue;
-            }
-            const status = response.message.statusCode ?? 0;
-            if (!isTransientStatus(status) || attempt === RELEASE_LOOKUP_ATTEMPTS) {
-                break;
-            }
-            await response.readBody();
-            const milliseconds = retryDelay(attempt, response.message.headers["retry-after"]);
-            totalDelay = addRetryDelay(totalDelay, milliseconds);
-            await delay(milliseconds);
-        }
+        const timeout = new Promise((_resolve, reject) => {
+            deadline = setTimeout(() => {
+                reject(new Error(`Latest prek release lookup exceeded the ${RELEASE_LOOKUP_DEADLINE_MS}ms deadline`));
+            }, RELEASE_LOOKUP_DEADLINE_MS);
+        });
+        const response = await Promise.race([lookup, timeout]);
+        return releaseFromResponse(response, releaseTarget);
     }
     finally {
+        if (deadline !== undefined) {
+            clearTimeout(deadline);
+        }
         client.dispose();
     }
+}
+async function lookupLatestReleaseResponse(client) {
+    let totalDelay = 0;
+    for (let attempt = 1;; attempt += 1) {
+        let response;
+        try {
+            response = await client.head(LATEST_RELEASE_URL);
+        }
+        catch (error) {
+            if (attempt === RELEASE_LOOKUP_ATTEMPTS) {
+                throw error;
+            }
+            const milliseconds = retryDelay(attempt);
+            totalDelay = addRetryDelay(totalDelay, milliseconds);
+            await delay(milliseconds);
+            continue;
+        }
+        const status = response.message.statusCode ?? 0;
+        if (!isTransientStatus(status) || attempt === RELEASE_LOOKUP_ATTEMPTS) {
+            return response;
+        }
+        await response.readBody();
+        const milliseconds = retryDelay(attempt, response.message.headers["retry-after"]);
+        totalDelay = addRetryDelay(totalDelay, milliseconds);
+        await delay(milliseconds);
+    }
+}
+function releaseFromResponse(response, releaseTarget) {
     const status = response.message.statusCode ?? 0;
     if (![301, 302, 303, 307, 308].includes(status)) {
         throw new Error(`Latest prek release lookup returned HTTP ${status}`);
@@ -39849,7 +39872,7 @@ async function runUpdate(execution) {
     const addPaths = await resolveAddPaths(execution);
     await proveBase(execution);
     const remote = await observeRemoteState(execution);
-    const temporaryRoot = await realpath(await mkdtemp(path$1.join(tmpdir(), "prek-autoupdate-")));
+    const temporaryRoot = await createTemporaryRoot();
     const worktree = path$1.join(temporaryRoot, "worktree");
     let added = false;
     let installation;
@@ -40062,6 +40085,27 @@ async function runUpdate(execution) {
             }
         }
         reportCleanupFailures(updateFailed, updateError, cleanupErrors);
+    }
+}
+async function createTemporaryRoot(create = mkdtemp, resolve = realpath, remove = rm$1) {
+    const rawRoot = await create(path$1.join(tmpdir(), "prek-autoupdate-"));
+    try {
+        return await resolve(rawRoot);
+    }
+    catch (error) {
+        let cleanupFailed = false;
+        let cleanupError;
+        try {
+            await remove(rawRoot, { force: true, recursive: true });
+        }
+        catch (caughtCleanupError) {
+            cleanupFailed = true;
+            cleanupError = caughtCleanupError;
+        }
+        if (cleanupFailed) {
+            throw new AggregateError([error, cleanupError], "Temporary root resolution failed and cleanup also failed", { cause: error });
+        }
+        throw error;
     }
 }
 function reportCleanupFailures(updateFailed, updateError, cleanupErrors) {

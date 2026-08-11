@@ -120,8 +120,13 @@ beforeEach(() => {
   filesystemMock.missingCopySource = undefined;
   filesystemMock.removalErrorPath = undefined;
   vi.clearAllMocks();
-  vi.spyOn(global, "setTimeout").mockImplementation(((callback: () => void) => {
-    callback();
+  vi.spyOn(global, "setTimeout").mockImplementation(((
+    callback: () => void,
+    milliseconds?: number,
+  ) => {
+    if (milliseconds !== 65_000) {
+      callback();
+    }
     return 0 as unknown as NodeJS.Timeout;
   }) as typeof setTimeout);
   mockLatestRelease();
@@ -138,6 +143,13 @@ async function exists(candidate: string): Promise<boolean> {
     () => true,
     () => false,
   );
+}
+
+function retryTimerDelays(): number[] {
+  return vi
+    .mocked(setTimeout)
+    .mock.calls.map((call) => call[1])
+    .filter((milliseconds): milliseconds is number => milliseconds !== 65_000);
 }
 
 async function copyDownload(
@@ -267,8 +279,7 @@ describe("installPrek", () => {
 
     expect(httpMocks.head).toHaveBeenCalledTimes(3);
     expect(httpMocks.readBody).toHaveBeenCalledTimes(2);
-    expect(setTimeout).toHaveBeenNthCalledWith(1, expect.any(Function), 100);
-    expect(setTimeout).toHaveBeenNthCalledWith(2, expect.any(Function), 200);
+    expect(retryTimerDelays()).toEqual([100, 200]);
     expect(httpMocks.dispose).toHaveBeenCalledOnce();
     await installation.cleanup();
   });
@@ -282,7 +293,7 @@ describe("installPrek", () => {
     const installation = await installPrek();
 
     expect(httpMocks.head).toHaveBeenCalledTimes(2);
-    expect(setTimeout).toHaveBeenCalledWith(expect.any(Function), 100);
+    expect(retryTimerDelays()).toEqual([100]);
     await installation.cleanup();
   });
 
@@ -294,7 +305,7 @@ describe("installPrek", () => {
 
     const installation = await installPrek();
 
-    expect(setTimeout).toHaveBeenCalledWith(expect.any(Function), 30_000);
+    expect(retryTimerDelays()).toEqual([30_000]);
     await installation.cleanup();
   });
 
@@ -305,7 +316,7 @@ describe("installPrek", () => {
       "Retry-After exceeds the supported 30000ms delay bound",
     );
     expect(httpMocks.head).toHaveBeenCalledOnce();
-    expect(setTimeout).not.toHaveBeenCalled();
+    expect(retryTimerDelays()).toEqual([]);
   });
 
   it("propagates a terminal transient status after bounded retries", async () => {
@@ -324,7 +335,23 @@ describe("installPrek", () => {
 
     await expect(installPrek()).rejects.toBe(timeout);
     expect(httpMocks.head).toHaveBeenCalledTimes(3);
-    expect(setTimeout).toHaveBeenCalledTimes(2);
+    expect(retryTimerDelays()).toEqual([100, 200]);
+    expect(httpMocks.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("enforces an absolute deadline on a never-settling lookup", async () => {
+    httpMocks.head.mockReturnValue(new Promise(() => undefined));
+
+    const installation = installPrek();
+    const deadline = vi
+      .mocked(setTimeout)
+      .mock.calls.find((call) => call[1] === 65_000);
+    expect(deadline).toBeDefined();
+    (deadline![0] as () => void)();
+
+    await expect(installation).rejects.toThrow(
+      "Latest prek release lookup exceeded the 65000ms deadline",
+    );
     expect(httpMocks.dispose).toHaveBeenCalledOnce();
   });
 
@@ -341,6 +368,24 @@ describe("installPrek", () => {
     expect(installation.binary).toBe(extractedBinary);
     expect(toolCache.downloadTool).toHaveBeenCalledTimes(2);
     expect(toolCache.cacheFile).not.toHaveBeenCalled();
+    await installation.cleanup();
+  });
+
+  it("warns and treats cache discovery failure as a miss", async () => {
+    const { extractedBinary } = await arrangeDownload(
+      `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`,
+    );
+    vi.mocked(toolCache.find).mockImplementation(() => {
+      throw new Error("cache discovery failed");
+    });
+
+    const installation = await installPrek();
+
+    expect(installation.binary).toBe(extractedBinary);
+    expect(core.warning).toHaveBeenCalledWith(
+      "Failed to read prek archive cache; continuing without cache: cache discovery failed",
+    );
+    expect(toolCache.cacheFile).toHaveBeenCalledOnce();
     await installation.cleanup();
   });
 

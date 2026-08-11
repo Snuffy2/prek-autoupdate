@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -15,6 +15,7 @@ vi.mock("../../src/prek/index.js", () => ({ installPrek: prekMocks.install }));
 import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
 import {
   BODY_MARKER,
+  createTemporaryRoot,
   runUpdate,
   sanitizeOutput,
   validateAddPath,
@@ -37,6 +38,47 @@ prekMocks.install.mockImplementation(async () => ({
   binary: "/usr/bin/true",
   cleanup: prekMocks.cleanup,
 }));
+
+describe("temporary root creation", () => {
+  it("removes the raw root when canonicalization fails", async () => {
+    const rawRoot = await mkdtemp(path.join(tmpdir(), "prek-root-test-"));
+    const resolutionError = new Error("realpath failed");
+
+    await expect(
+      createTemporaryRoot(
+        async () => rawRoot,
+        async () => {
+          throw resolutionError;
+        },
+      ),
+    ).rejects.toBe(resolutionError);
+    await expect(access(rawRoot)).rejects.toThrow();
+  });
+
+  it("retains resolution and cleanup failures together", async () => {
+    const rawRoot = await mkdtemp(path.join(tmpdir(), "prek-root-test-"));
+    temporaryDirectories.push(rawRoot);
+    const resolutionError = new Error("realpath failed");
+    const cleanupError = new Error("cleanup failed");
+
+    await expect(
+      createTemporaryRoot(
+        async () => rawRoot,
+        async () => {
+          throw resolutionError;
+        },
+        async () => {
+          throw cleanupError;
+        },
+      ),
+    ).rejects.toMatchObject({
+      message: "Temporary root resolution failed and cleanup also failed",
+      cause: resolutionError,
+      errors: [resolutionError, cleanupError],
+    });
+    await expect(access(rawRoot)).resolves.toBeUndefined();
+  });
+});
 
 describe("update path validation", () => {
   it.each([
