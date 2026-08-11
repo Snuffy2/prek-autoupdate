@@ -50,9 +50,36 @@ types_or = ["javascript", "json", "markdown", "ts", "yaml"]
 [[repos.hooks]]
 id = "eslint"
 name = "eslint"
-entry = "npm run lint --"
+entry = "npm exec -- eslint"
 language = "system"
 types = ["ts"]
+
+[[repos.hooks]]
+id = "prettier-write"
+name = "prettier --write ."
+entry = "npm exec -- prettier --write ."
+language = "system"
+stages = ["manual"]
+always_run = true
+pass_filenames = false
+
+[[repos.hooks]]
+id = "prettier-check"
+name = "prettier --check ."
+entry = "npm exec -- prettier --check ."
+language = "system"
+stages = ["manual"]
+always_run = true
+pass_filenames = false
+
+[[repos.hooks]]
+id = "eslint-all"
+name = 'eslint "src/**/*.ts" "test/**/*.ts" "*.config.ts"'
+entry = 'npm exec -- eslint "src/**/*.ts" "test/**/*.ts" "*.config.ts"'
+language = "system"
+stages = ["manual"]
+always_run = true
+pass_filenames = false
 
 [[repos.hooks]]
 id = "typescript"

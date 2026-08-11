@@ -10,9 +10,9 @@
   "scripts": {
     "build": "rollup --config",
     "check:dist": "npm run build && git diff --exit-code -- dist/index.js",
-    "format": "prettier --write .",
-    "format:check": "prettier --check .",
-    "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\" \"*.config.ts\"",
+    "format": "prek run prettier-write --stage manual",
+    "format:check": "prek run prettier-check --stage manual",
+    "lint": "prek run eslint-all --stage manual",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit"
