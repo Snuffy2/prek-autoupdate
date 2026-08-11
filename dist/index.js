@@ -39676,42 +39676,53 @@ function _getGlobal(key, defaultValue) {
 const LATEST_RELEASE_URL = "https://github.com/j178/prek/releases/latest";
 const RELEASE_ROOT = "https://github.com/j178/prek/releases/download";
 const RELEASE_PATH_PATTERN = /^\/j178\/prek\/releases\/tag\/v(0|[1-9][0-9]*)\.([0-9]+)\.([0-9]+)$/u;
-function target() {
-    if (process.arch === "x64") {
+function targetForArchitecture(architecture) {
+    if (architecture === "x64") {
         return "x86_64-unknown-linux-gnu";
     }
-    if (process.arch === "arm64") {
+    if (architecture === "arm64") {
         return "aarch64-unknown-linux-gnu";
     }
-    throw new Error(`Unsupported prek architecture: ${process.arch}`);
+    throw new Error(`Unsupported prek architecture: ${architecture}`);
 }
 /** Install the latest official prek release and transfer cleanup ownership. */
 async function installPrek() {
-    const latest = await resolveLatestRelease(target());
+    const latest = await resolveLatestRelease(targetForArchitecture(process.arch));
     const asset = `prek-${latest.target}.tar.gz`;
-    const checksumFile = await downloadTool(`${latest.root}/${asset}.sha256`);
-    const checksumContents = await readFile(checksumFile, "utf8");
-    let archive = cachedArchive(latest.version, asset);
-    if (archive === undefined) {
-        const downloadedArchive = await downloadTool(`${latest.root}/${asset}`);
-        await verifySha256(downloadedArchive, checksumContents, asset);
-        const cacheDirectory = await cacheFile(downloadedArchive, asset, "prek-archive", latest.version, process.arch);
-        archive = path$1.join(cacheDirectory, asset);
-    }
-    await verifySha256(archive, checksumContents, asset);
-    const directory = await mkdtemp(path$1.join(tmpdir(), "prek-extract-"));
+    const directory = await mkdtemp(path$1.join(tmpdir(), "prek-install-"));
     const cleanup = async () => {
         await rm$1(directory, { force: true, recursive: true });
     };
     try {
-        const extracted = await extractTar(archive, directory);
+        const checksumFile = await downloadTool(`${latest.root}/${asset}.sha256`, path$1.join(directory, `${asset}.sha256`));
+        const checksumContents = await readFile(checksumFile, "utf8");
+        let archive = cachedArchive(latest.version, asset);
+        if (archive === undefined) {
+            const downloadedArchive = await downloadTool(`${latest.root}/${asset}`, path$1.join(directory, asset));
+            await verifySha256(downloadedArchive, checksumContents, asset);
+            const cacheDirectory = await cacheFile(downloadedArchive, asset, "prek-archive", latest.version, process.arch);
+            archive = path$1.join(cacheDirectory, asset);
+        }
+        await verifySha256(archive, checksumContents, asset);
+        const extracted = await extractTar(archive, path$1.join(directory, "extract"));
         const binary = path$1.join(extracted, `prek-${latest.target}`, "prek");
         await verifyExecutable(binary);
         await chmod$1(binary, 0o755);
         return { binary, cleanup };
     }
     catch (error) {
-        await cleanup();
+        let cleanupFailed = false;
+        let cleanupError;
+        try {
+            await cleanup();
+        }
+        catch (caughtCleanupError) {
+            cleanupFailed = true;
+            cleanupError = caughtCleanupError;
+        }
+        if (cleanupFailed) {
+            throw new AggregateError([error, cleanupError], "prek installation failed and cleanup also failed", { cause: error });
+        }
         throw error;
     }
 }
@@ -39800,6 +39811,8 @@ async function runUpdate(execution) {
     const worktree = path$1.join(temporaryRoot, "worktree");
     let added = false;
     let installation;
+    let updateFailed = false;
+    let updateError;
     try {
         await git(execution.context.workspace, [
             "worktree",
@@ -39897,7 +39910,7 @@ async function runUpdate(execution) {
         catch (error) {
             await rollbackExistingPush(execution, remote, newSha, error);
         }
-        let updateError;
+        let pullUpdateError;
         try {
             const response = await execution.client.rest.pulls.update({
                 owner: execution.context.owner,
@@ -39913,10 +39926,10 @@ async function runUpdate(execution) {
                     pullRequestNumber: remote.ownedPullRequest.number,
                 };
             }
-            updateError = new Error("GitHub returned an unexpected pull request after update");
+            pullUpdateError = new Error("GitHub returned an unexpected pull request after update");
         }
         catch (error) {
-            updateError = error;
+            pullUpdateError = error;
         }
         let verified;
         try {
@@ -39934,30 +39947,52 @@ async function runUpdate(execution) {
             }
         }
         catch (verificationError) {
-            throw new Error("Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved", { cause: new AggregateError([updateError, verificationError]) });
+            throw new Error("Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved", { cause: new AggregateError([pullUpdateError, verificationError]) });
         }
         const verificationError = new Error("Fresh pull request verification was not exact");
         if (isExactOriginalMetadataPull(execution, verified, remote, newSha)) {
-            return await rollbackExistingPush(execution, remote, newSha, new AggregateError([updateError, verificationError]));
+            return await rollbackExistingPush(execution, remote, newSha, new AggregateError([pullUpdateError, verificationError]));
         }
-        throw new Error("Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved", { cause: new AggregateError([updateError, verificationError]) });
+        throw new Error("Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved", { cause: new AggregateError([pullUpdateError, verificationError]) });
+    }
+    catch (error) {
+        updateFailed = true;
+        updateError = error;
+        throw error;
     }
     finally {
+        const cleanupErrors = [];
         try {
             await installation?.cleanup();
         }
-        finally {
-            if (added) {
-                await git(execution.context.workspace, [
-                    "worktree",
-                    "remove",
-                    "--force",
-                    worktree,
-                ]).catch(() => undefined);
-            }
+        catch (error) {
+            cleanupErrors.push(error);
+        }
+        if (added) {
+            await git(execution.context.workspace, [
+                "worktree",
+                "remove",
+                "--force",
+                worktree,
+            ]).catch(() => undefined);
+        }
+        try {
             await rm$1(temporaryRoot, { force: true, recursive: true });
         }
+        catch (error) {
+            cleanupErrors.push(error);
+        }
+        reportCleanupFailures(updateFailed, updateError, cleanupErrors);
     }
+}
+function reportCleanupFailures(updateFailed, updateError, cleanupErrors) {
+    if (cleanupErrors.length === 0) {
+        return;
+    }
+    if (updateFailed) {
+        throw new AggregateError([updateError, ...cleanupErrors], "Update failed and cleanup also failed", { cause: updateError });
+    }
+    throw new AggregateError(cleanupErrors, "Update operation completed but cleanup failed");
 }
 function isExactUpdatedPull(execution, pull, pullNumber, newSha, body) {
     return (isOwned(execution, pull) &&

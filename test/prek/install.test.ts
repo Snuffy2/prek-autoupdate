@@ -1,5 +1,6 @@
 import * as toolCache from "@actions/tool-cache";
 import type * as NodeCrypto from "node:crypto";
+import type * as NodeFsPromises from "node:fs/promises";
 import {
   access,
   mkdir,
@@ -12,7 +13,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { installPrek } from "../../src/prek/install.js";
+import { installPrek, targetForArchitecture } from "../../src/prek/install.js";
 
 vi.mock("@actions/tool-cache", () => ({
   cacheFile: vi.fn(),
@@ -20,6 +21,30 @@ vi.mock("@actions/tool-cache", () => ({
   extractTar: vi.fn(),
   find: vi.fn(),
 }));
+
+const filesystemMock = vi.hoisted(() => ({
+  cleanupError: undefined as Error | undefined,
+}));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof NodeFsPromises>();
+  return {
+    ...actual,
+    rm: vi.fn(
+      async (
+        candidate: Parameters<typeof actual.rm>[0],
+        options: Parameters<typeof actual.rm>[1],
+      ) => {
+        if (
+          filesystemMock.cleanupError !== undefined &&
+          candidate.toString().includes("prek-install-")
+        ) {
+          throw filesystemMock.cleanupError;
+        }
+        await actual.rm(candidate, options);
+      },
+    ),
+  };
+});
 
 const ARCHIVE_SHA256 =
   "038f67b69c1d1547e920532f975a0ec1a51453b962f1a2d9148abcb252a6d194";
@@ -59,6 +84,7 @@ vi.mock("node:crypto", async (importOriginal) => {
 });
 
 beforeEach(() => {
+  filesystemMock.cleanupError = undefined;
   vi.clearAllMocks();
   vi.stubGlobal("fetch", vi.fn());
   mockLatestRelease();
@@ -134,6 +160,19 @@ afterEach(async () => {
 });
 
 describe("installPrek", () => {
+  it.each([
+    ["x64", "x86_64-unknown-linux-gnu"],
+    ["arm64", "aarch64-unknown-linux-gnu"],
+  ] as const)("maps %s to %s", (architecture, expected) => {
+    expect(targetForArchitecture(architecture)).toBe(expected);
+  });
+
+  it("rejects unsupported architectures", () => {
+    expect(() => targetForArchitecture("ia32")).toThrow(
+      "Unsupported prek architecture: ia32",
+    );
+  });
+
   it("rejects a tampered cached archive", async () => {
     const downloadDirectory = await temporaryDirectory("prek-checksum-test-");
     const checksum = path.join(downloadDirectory, `${RELEASE.asset}.sha256`);
@@ -164,10 +203,12 @@ describe("installPrek", () => {
     expect(toolCache.downloadTool).toHaveBeenNthCalledWith(
       1,
       `https://github.com/j178/prek/releases/download/v${RELEASE.version}/${RELEASE.asset}.sha256`,
+      expect.stringContaining(`prek-install-`),
     );
     expect(toolCache.downloadTool).toHaveBeenNthCalledWith(
       2,
       `https://github.com/j178/prek/releases/download/v${RELEASE.version}/${RELEASE.asset}`,
+      expect.stringContaining(`prek-install-`),
     );
     expect(toolCache.cacheFile).toHaveBeenCalledWith(
       archive,
@@ -178,13 +219,86 @@ describe("installPrek", () => {
     );
     expect(toolCache.extractTar).toHaveBeenCalledWith(
       cachedArchive,
-      expect.stringContaining("prek-extract-"),
+      expect.stringContaining("prek-install-"),
     );
+    const checksumDestination = vi.mocked(toolCache.downloadTool).mock
+      .calls[0]![1]!;
+    const archiveDestination = vi.mocked(toolCache.downloadTool).mock
+      .calls[1]![1]!;
     const extractionDirectory = vi.mocked(toolCache.extractTar).mock
       .calls[0]![1]!;
+    const installationRoot = path.dirname(checksumDestination);
+    expect(path.dirname(archiveDestination)).toBe(installationRoot);
+    expect(path.dirname(extractionDirectory)).toBe(installationRoot);
     await installation.cleanup();
     await installation.cleanup();
-    expect(await exists(extractionDirectory)).toBe(false);
+    expect(await exists(installationRoot)).toBe(false);
+  });
+
+  it("uses the same owned root with a cached archive", async () => {
+    const { archive, extractedBinary } = await arrangeDownload(
+      `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`,
+    );
+    const cacheDirectory = path.dirname(archive);
+    vi.mocked(toolCache.find).mockReturnValue(cacheDirectory);
+    vi.mocked(toolCache.downloadTool)
+      .mockReset()
+      .mockResolvedValueOnce(
+        path.join(cacheDirectory, `${RELEASE.asset}.sha256`),
+      );
+    await writeFile(
+      path.join(cacheDirectory, `${RELEASE.asset}.sha256`),
+      `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`,
+    );
+
+    const installation = await installPrek();
+    expect(installation.binary).toBe(extractedBinary);
+    expect(toolCache.downloadTool).toHaveBeenCalledOnce();
+    const destination = vi.mocked(toolCache.downloadTool).mock.calls[0]![1]!;
+    const extraction = vi.mocked(toolCache.extractTar).mock.calls[0]![1]!;
+    expect(path.dirname(extraction)).toBe(path.dirname(destination));
+    await installation.cleanup();
+    expect(await exists(path.dirname(destination))).toBe(false);
+  });
+
+  it.each([
+    "checksum download",
+    "checksum read",
+    "archive download",
+    "cache",
+    "extraction",
+  ])("removes its owned root after a %s failure", async (stage) => {
+    const arranged = await arrangeDownload(
+      `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`,
+    );
+    if (stage === "checksum download") {
+      vi.mocked(toolCache.downloadTool)
+        .mockReset()
+        .mockRejectedValueOnce(new Error("checksum download failed"));
+    } else if (stage === "checksum read") {
+      vi.mocked(toolCache.downloadTool)
+        .mockReset()
+        .mockResolvedValueOnce(path.join(arranged.archive, "missing"));
+    } else if (stage === "archive download") {
+      vi.mocked(toolCache.downloadTool)
+        .mockReset()
+        .mockResolvedValueOnce(
+          path.join(path.dirname(arranged.archive), `${RELEASE.asset}.sha256`),
+        )
+        .mockRejectedValueOnce(new Error("archive download failed"));
+    } else if (stage === "cache") {
+      vi.mocked(toolCache.cacheFile).mockRejectedValueOnce(
+        new Error("cache failed"),
+      );
+    } else {
+      vi.mocked(toolCache.extractTar).mockRejectedValueOnce(
+        new Error("extraction failed"),
+      );
+    }
+
+    await expect(installPrek()).rejects.toThrow();
+    const destination = vi.mocked(toolCache.downloadTool).mock.calls[0]![1]!;
+    expect(await exists(path.dirname(destination))).toBe(false);
   });
 
   it.each([
@@ -196,6 +310,8 @@ describe("installPrek", () => {
       await arrangeDownload(checksum);
 
       await expect(installPrek()).rejects.toThrow(message);
+      const destination = vi.mocked(toolCache.downloadTool).mock.calls[0]![1]!;
+      expect(await exists(path.dirname(destination))).toBe(false);
       expect(toolCache.extractTar).not.toHaveBeenCalled();
       expect(toolCache.cacheFile).not.toHaveBeenCalled();
     },
@@ -210,6 +326,8 @@ describe("installPrek", () => {
     await expect(installPrek()).rejects.toThrow(
       `SHA256 verification failed for ${RELEASE.asset}`,
     );
+    const destination = vi.mocked(toolCache.downloadTool).mock.calls[0]![1]!;
+    expect(await exists(path.dirname(destination))).toBe(false);
     expect(toolCache.extractTar).not.toHaveBeenCalled();
     expect(toolCache.cacheFile).not.toHaveBeenCalled();
   });
@@ -256,8 +374,31 @@ describe("installPrek", () => {
     await expect(installPrek()).rejects.toThrow(
       "Extracted prek executable is not a regular file",
     );
-    const extractionDirectory = vi.mocked(toolCache.extractTar).mock
+    const checksumDestination = vi.mocked(toolCache.downloadTool).mock
       .calls[0]![1]!;
-    expect(await exists(extractionDirectory)).toBe(false);
+    expect(await exists(path.dirname(checksumDestination))).toBe(false);
+  });
+
+  it("retains installation and cleanup failures together", async () => {
+    const { extractedBinary } = await arrangeDownload(
+      `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`,
+    );
+    await rm(extractedBinary);
+    await symlink("/usr/bin/true", extractedBinary);
+    const cleanupError = new Error("cleanup failed");
+    filesystemMock.cleanupError = cleanupError;
+
+    const error = await installPrek().catch((caught: unknown) => caught);
+    filesystemMock.cleanupError = undefined;
+
+    expect(error).toMatchObject({
+      message: "prek installation failed and cleanup also failed",
+    });
+    expect((error as AggregateError).errors).toEqual([
+      expect.objectContaining({
+        message: "Extracted prek executable is not a regular file",
+      }),
+      cleanupError,
+    ]);
   });
 });

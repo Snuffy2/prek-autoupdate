@@ -263,6 +263,36 @@ describe("non-mutating update preflight", () => {
     await expect(runUpdate(execution)).rejects.toThrow();
     expect(prekMocks.cleanup).toHaveBeenCalledOnce();
   });
+
+  it("reports cleanup failure after a successful update operation", async () => {
+    const cleanupError = new Error("installation cleanup failed");
+    prekMocks.cleanup.mockRejectedValueOnce(cleanupError);
+    const execution = await makeExecution(["prek.toml"]);
+
+    await expect(runUpdate(execution)).rejects.toMatchObject({
+      message: "Update operation completed but cleanup failed",
+      errors: [cleanupError],
+    });
+  });
+
+  it("retains update and cleanup failures together", async () => {
+    const cleanupError = new Error("installation cleanup failed");
+    prekMocks.cleanup.mockRejectedValueOnce(cleanupError);
+    prekMocks.install.mockResolvedValueOnce({
+      binary: "/missing/prek",
+      cleanup: prekMocks.cleanup,
+    });
+    const execution = await makeExecution(["prek.toml"]);
+
+    const error = await runUpdate(execution).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      message: "Update failed and cleanup also failed",
+    });
+    expect((error as AggregateError).errors).toEqual([
+      expect.any(Error),
+      cleanupError,
+    ]);
+  });
 });
 
 async function makeExecution(

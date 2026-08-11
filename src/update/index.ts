@@ -79,6 +79,8 @@ export async function runUpdate(
   const worktree = path.join(temporaryRoot, "worktree");
   let added = false;
   let installation: PrekInstallation | undefined;
+  let updateFailed = false;
+  let updateError: unknown;
   try {
     await git(execution.context.workspace, [
       "worktree",
@@ -188,7 +190,7 @@ export async function runUpdate(
     } catch (error) {
       await rollbackExistingPush(execution, remote, newSha, error);
     }
-    let updateError: unknown;
+    let pullUpdateError: unknown;
     try {
       const response = await execution.client.rest.pulls.update({
         owner: execution.context.owner,
@@ -212,11 +214,11 @@ export async function runUpdate(
           pullRequestNumber: remote.ownedPullRequest.number,
         };
       }
-      updateError = new Error(
+      pullUpdateError = new Error(
         "GitHub returned an unexpected pull request after update",
       );
     } catch (error) {
-      updateError = error;
+      pullUpdateError = error;
     }
     let verified: PullRequest;
     try {
@@ -243,7 +245,7 @@ export async function runUpdate(
     } catch (verificationError) {
       throw new Error(
         "Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved",
-        { cause: new AggregateError([updateError, verificationError]) },
+        { cause: new AggregateError([pullUpdateError, verificationError]) },
       );
     }
     const verificationError = new Error(
@@ -254,28 +256,60 @@ export async function runUpdate(
         execution,
         remote,
         newSha,
-        new AggregateError([updateError, verificationError]),
+        new AggregateError([pullUpdateError, verificationError]),
       );
     }
     throw new Error(
       "Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved",
-      { cause: new AggregateError([updateError, verificationError]) },
+      { cause: new AggregateError([pullUpdateError, verificationError]) },
     );
+  } catch (error) {
+    updateFailed = true;
+    updateError = error;
+    throw error;
   } finally {
+    const cleanupErrors: unknown[] = [];
     try {
       await installation?.cleanup();
-    } finally {
-      if (added) {
-        await git(execution.context.workspace, [
-          "worktree",
-          "remove",
-          "--force",
-          worktree,
-        ]).catch(() => undefined);
-      }
-      await rm(temporaryRoot, { force: true, recursive: true });
+    } catch (error) {
+      cleanupErrors.push(error);
     }
+    if (added) {
+      await git(execution.context.workspace, [
+        "worktree",
+        "remove",
+        "--force",
+        worktree,
+      ]).catch(() => undefined);
+    }
+    try {
+      await rm(temporaryRoot, { force: true, recursive: true });
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    reportCleanupFailures(updateFailed, updateError, cleanupErrors);
   }
+}
+
+function reportCleanupFailures(
+  updateFailed: boolean,
+  updateError: unknown,
+  cleanupErrors: readonly unknown[],
+): void {
+  if (cleanupErrors.length === 0) {
+    return;
+  }
+  if (updateFailed) {
+    throw new AggregateError(
+      [updateError, ...cleanupErrors],
+      "Update failed and cleanup also failed",
+      { cause: updateError },
+    );
+  }
+  throw new AggregateError(
+    cleanupErrors,
+    "Update operation completed but cleanup failed",
+  );
 }
 
 function isExactUpdatedPull(

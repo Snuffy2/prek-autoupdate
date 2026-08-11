@@ -20,54 +20,77 @@ export interface PrekInstallation {
   readonly cleanup: () => Promise<void>;
 }
 
-function target(): string {
-  if (process.arch === "x64") {
+export function targetForArchitecture(
+  architecture: NodeJS.Architecture,
+): string {
+  if (architecture === "x64") {
     return "x86_64-unknown-linux-gnu";
   }
-  if (process.arch === "arm64") {
+  if (architecture === "arm64") {
     return "aarch64-unknown-linux-gnu";
   }
-  throw new Error(`Unsupported prek architecture: ${process.arch}`);
+  throw new Error(`Unsupported prek architecture: ${architecture}`);
 }
 
 /** Install the latest official prek release and transfer cleanup ownership. */
 export async function installPrek(): Promise<PrekInstallation> {
-  const latest = await resolveLatestRelease(target());
-  const asset = `prek-${latest.target}.tar.gz`;
-  const checksumFile = await toolCache.downloadTool(
-    `${latest.root}/${asset}.sha256`,
+  const latest = await resolveLatestRelease(
+    targetForArchitecture(process.arch),
   );
-  const checksumContents = await readFile(checksumFile, "utf8");
-  let archive = cachedArchive(latest.version, asset);
-
-  if (archive === undefined) {
-    const downloadedArchive = await toolCache.downloadTool(
-      `${latest.root}/${asset}`,
-    );
-    await verifySha256(downloadedArchive, checksumContents, asset);
-    const cacheDirectory = await toolCache.cacheFile(
-      downloadedArchive,
-      asset,
-      "prek-archive",
-      latest.version,
-      process.arch,
-    );
-    archive = path.join(cacheDirectory, asset);
-  }
-
-  await verifySha256(archive, checksumContents, asset);
-  const directory = await mkdtemp(path.join(tmpdir(), "prek-extract-"));
+  const asset = `prek-${latest.target}.tar.gz`;
+  const directory = await mkdtemp(path.join(tmpdir(), "prek-install-"));
   const cleanup = async (): Promise<void> => {
     await rm(directory, { force: true, recursive: true });
   };
   try {
-    const extracted = await toolCache.extractTar(archive, directory);
+    const checksumFile = await toolCache.downloadTool(
+      `${latest.root}/${asset}.sha256`,
+      path.join(directory, `${asset}.sha256`),
+    );
+    const checksumContents = await readFile(checksumFile, "utf8");
+    let archive = cachedArchive(latest.version, asset);
+
+    if (archive === undefined) {
+      const downloadedArchive = await toolCache.downloadTool(
+        `${latest.root}/${asset}`,
+        path.join(directory, asset),
+      );
+      await verifySha256(downloadedArchive, checksumContents, asset);
+      const cacheDirectory = await toolCache.cacheFile(
+        downloadedArchive,
+        asset,
+        "prek-archive",
+        latest.version,
+        process.arch,
+      );
+      archive = path.join(cacheDirectory, asset);
+    }
+
+    await verifySha256(archive, checksumContents, asset);
+    const extracted = await toolCache.extractTar(
+      archive,
+      path.join(directory, "extract"),
+    );
     const binary = path.join(extracted, `prek-${latest.target}`, "prek");
     await verifyExecutable(binary);
     await chmod(binary, 0o755);
     return { binary, cleanup };
   } catch (error) {
-    await cleanup();
+    let cleanupFailed = false;
+    let cleanupError: unknown;
+    try {
+      await cleanup();
+    } catch (caughtCleanupError) {
+      cleanupFailed = true;
+      cleanupError = caughtCleanupError;
+    }
+    if (cleanupFailed) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "prek installation failed and cleanup also failed",
+        { cause: error },
+      );
+    }
     throw error;
   }
 }
