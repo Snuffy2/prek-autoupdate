@@ -80,6 +80,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 
 const ARCHIVE_SHA256 =
   "038f67b69c1d1547e920532f975a0ec1a51453b962f1a2d9148abcb252a6d194";
+const RELEASE_LOOKUP_DEADLINE_MS = 65_000;
 const RELEASE = {
   asset:
     process.arch === "arm64"
@@ -124,7 +125,7 @@ beforeEach(() => {
     callback: () => void,
     milliseconds?: number,
   ) => {
-    if (milliseconds !== 65_000) {
+    if (milliseconds !== RELEASE_LOOKUP_DEADLINE_MS) {
       callback();
     }
     return 0 as unknown as NodeJS.Timeout;
@@ -149,7 +150,10 @@ function retryTimerDelays(): number[] {
   return vi
     .mocked(setTimeout)
     .mock.calls.map((call) => call[1])
-    .filter((milliseconds): milliseconds is number => milliseconds !== 65_000);
+    .filter(
+      (milliseconds): milliseconds is number =>
+        milliseconds !== RELEASE_LOOKUP_DEADLINE_MS,
+    );
 }
 
 async function copyDownload(
@@ -319,6 +323,47 @@ describe("installPrek", () => {
     expect(retryTimerDelays()).toEqual([]);
   });
 
+  it.each([" 20 ", "0x10", "1e1", "", " "])(
+    "does not interpret a non-decimal Retry-After as delay-seconds: %j",
+    async (retryAfter) => {
+      await arrangeDownload(`${ARCHIVE_SHA256}  ${RELEASE.asset}\n`);
+      httpMocks.head
+        .mockResolvedValueOnce(httpResponse(429, undefined, retryAfter))
+        .mockResolvedValueOnce(httpResponse(302, releaseUrl()));
+
+      const installation = await installPrek();
+
+      expect(retryTimerDelays()).toEqual([100]);
+      await installation.cleanup();
+    },
+  );
+
+  it("preserves HTTP-date Retry-After fallback", async () => {
+    await arrangeDownload(`${ARCHIVE_SHA256}  ${RELEASE.asset}\n`);
+    const now = Date.parse("2026-08-10T12:00:00Z");
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    httpMocks.head
+      .mockResolvedValueOnce(
+        httpResponse(429, undefined, new Date(now + 5_000).toUTCString()),
+      )
+      .mockResolvedValueOnce(httpResponse(302, releaseUrl()));
+
+    const installation = await installPrek();
+
+    expect(retryTimerDelays()).toEqual([5_000]);
+    await installation.cleanup();
+  });
+
+  it("rejects successive Retry-After delays beyond the total delay bound", async () => {
+    httpMocks.head.mockResolvedValue(httpResponse(429, undefined, "20"));
+
+    await expect(installPrek()).rejects.toThrow(
+      "Latest prek release retries exceed the supported 30000ms total delay bound",
+    );
+    expect(httpMocks.head).toHaveBeenCalledTimes(2);
+    expect(retryTimerDelays()).toEqual([20_000]);
+  });
+
   it("propagates a terminal transient status after bounded retries", async () => {
     httpMocks.head.mockResolvedValue(httpResponse(500));
 
@@ -345,12 +390,12 @@ describe("installPrek", () => {
     const installation = installPrek();
     const deadline = vi
       .mocked(setTimeout)
-      .mock.calls.find((call) => call[1] === 65_000);
+      .mock.calls.find((call) => call[1] === RELEASE_LOOKUP_DEADLINE_MS);
     expect(deadline).toBeDefined();
     (deadline![0] as () => void)();
 
     await expect(installation).rejects.toThrow(
-      "Latest prek release lookup exceeded the 65000ms deadline",
+      `Latest prek release lookup exceeded the ${RELEASE_LOOKUP_DEADLINE_MS}ms deadline`,
     );
     expect(httpMocks.dispose).toHaveBeenCalledOnce();
   });
@@ -615,6 +660,8 @@ describe("installPrek", () => {
     ["https://github.com/j178/prek/releases/tag/latest"],
     ["https://github.com/other/prek/releases/tag/v9.8.7"],
     ["https://github.com/j178/prek/releases/tag/v9.8.7?asset=other"],
+    ["https://github.com/j178/prek/releases/tag/v1.02.3"],
+    ["https://github.com/j178/prek/releases/tag/v1.2.03"],
   ])("rejects an invalid latest-release redirect: %s", async (location) => {
     mockLatestRelease(location);
 

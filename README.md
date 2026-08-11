@@ -77,15 +77,17 @@ Enterprise Server, including self-hosted Linux runners with system Git in
 runners are not supported.
 
 Each run resolves the latest stable `prek` release from the official GitHub
-release URL. It downloads that version's archive and published SHA-256 checksum,
-or restores the versioned archive from the runner tool cache. The action
-verifies the archive against the official checksum every time before extracting
-and running the executable. This detects download corruption or modification of
-a cached archive, but the checksum is published by the same upstream release and
-is not an independent trust anchor. Each compatible latest upstream `prek`
-release with a numeric `vN.N.N` tag and the expected Linux archive/checksum
-layout is trusted automatically, so a new `prek-autoupdate` release is not
-required to pick it up.
+release URL. The lookup uses bounded retries and the run fails if it cannot
+resolve a release: because the runner tool cache is keyed by the resolved
+version, it cannot supply a fallback version. The action downloads that
+version's archive and published SHA-256 checksum, or restores the versioned
+archive from the runner tool cache. It verifies the archive against the official
+checksum every time before extracting and running the executable. This detects
+download corruption or modification of a cached archive, but the checksum is
+published by the same upstream release and is not an independent trust anchor.
+Each compatible latest upstream `prek` release with a numeric `vN.N.N` tag and
+the expected Linux archive/checksum layout is trusted automatically, so a new
+`prek-autoupdate` release is not required to pick it up.
 
 ## Inputs
 

@@ -1,3 +1,4 @@
+import * as core from "@actions/core";
 import { execFile } from "node:child_process";
 import {
   access,
@@ -16,6 +17,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type * as EnvironmentModule from "../../src/environment.js";
 
+vi.mock("@actions/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof core>();
+  return { ...actual, warning: vi.fn() };
+});
 const installPrek = vi.hoisted(() =>
   vi.fn<() => Promise<{ binary: string; cleanup: () => Promise<void> }>>(),
 );
@@ -48,11 +53,13 @@ afterEach(async () => {
   delete process.env.TEST_GIT_FAIL_PUSH;
   delete process.env.TEST_GIT_FAIL_DIFF;
   delete process.env.TEST_GIT_FAIL_WORKTREE_REMOVE;
+  delete process.env.TEST_GIT_UNREGISTER_WORKTREE_ON_REMOVE;
   delete process.env.TEST_GIT_FAIL_WORKTREE_ADD_AFTER;
   delete process.env.TEST_GIT_FAIL_WORKTREE_ADD_BEFORE;
   delete process.env.TEST_GIT_WORKTREE_ADD_LOG;
   delete process.env.TEST_GIT_WORKTREE_REMOVE_LOG;
   installPrek.mockReset();
+  vi.mocked(core.warning).mockReset();
   await Promise.all(
     cleanups
       .splice(0)
@@ -154,6 +161,37 @@ describe("update publication races", () => {
       preservedPath,
     ]);
     await rm(path.dirname(preservedPath), { force: true, recursive: true });
+  });
+
+  it("warns when failed removals are reconciled by an absent registration", async () => {
+    const harness = await makeHarness({ noChange: true });
+    const initial = await worktrees(harness.execution.context.workspace);
+    process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "always";
+    process.env.TEST_GIT_UNREGISTER_WORKTREE_ON_REMOVE = "1";
+    process.env.TEST_GIT_WORKTREE_REMOVE_LOG = `${harness.log}.worktree`;
+    await expect(runUpdate(harness.execution)).resolves.toEqual({
+      operation: "none",
+    });
+
+    expect(await worktrees(harness.execution.context.workspace)).toEqual(
+      initial,
+    );
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /Failed to remove action-owned worktree, but its registration was already absent; continuing cleanup: Error: Command failed/u,
+      ),
+    );
+    const removals = await readFile(
+      process.env.TEST_GIT_WORKTREE_REMOVE_LOG,
+      "utf8",
+    );
+    const worktreePath = removals
+      .trim()
+      .split("\n")[0]!
+      .trim()
+      .split(" ")
+      .at(-1)!;
+    await expect(access(path.dirname(worktreePath))).rejects.toThrow();
   });
 
   it("scopes authenticated pushes to the configured Actions server", async () => {
@@ -914,6 +952,9 @@ case " $* " in
     if [ -n "$TEST_GIT_FAIL_WORKTREE_REMOVE" ]; then
       printf '%s\n' "$*" >> "$TEST_GIT_WORKTREE_REMOVE_LOG"
       count=$(wc -l < "$TEST_GIT_WORKTREE_REMOVE_LOG" | tr -d ' ')
+      if [ "$TEST_GIT_UNREGISTER_WORKTREE_ON_REMOVE" = "1" ] && [ "$count" = "1" ]; then
+        eval ${JSON.stringify(realGit)} "$args" || exit $?
+      fi
       { [ "$TEST_GIT_FAIL_WORKTREE_REMOVE" = "always" ] || [ "$count" = "$TEST_GIT_FAIL_WORKTREE_REMOVE" ]; } && exit 1
     fi
     ;;

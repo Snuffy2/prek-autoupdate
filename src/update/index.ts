@@ -313,6 +313,10 @@ export async function runUpdate(
                 { cause: removalError },
               ),
             );
+          } else {
+            core.warning(
+              `Failed to remove action-owned worktree, but its registration was already absent; continuing cleanup: ${String(removalError)}`,
+            );
           }
         } catch (inspectionError) {
           preserveTemporaryRoot = true;

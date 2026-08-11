@@ -17,7 +17,7 @@ import path from "node:path";
 const LATEST_RELEASE_URL = "https://github.com/j178/prek/releases/latest";
 const RELEASE_ROOT = "https://github.com/j178/prek/releases/download";
 const RELEASE_PATH_PATTERN =
-  /^\/j178\/prek\/releases\/tag\/v(0|[1-9][0-9]*)\.([0-9]+)\.([0-9]+)$/u;
+  /^\/j178\/prek\/releases\/tag\/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/u;
 const RELEASE_LOOKUP_ATTEMPTS = 3;
 const RELEASE_LOOKUP_DEADLINE_MS = 65_000;
 const RELEASE_LOOKUP_BACKOFF_MS = 100;
@@ -242,9 +242,8 @@ function retryDelay(attempt: number, retryAfter?: string | string[]): number {
   const header = Array.isArray(retryAfter) ? retryAfter[0] : retryAfter;
   let requestedDelay: number | undefined;
   if (header !== undefined) {
-    const seconds = Number(header);
-    if (Number.isFinite(seconds)) {
-      requestedDelay = seconds * 1_000;
+    if (/^[0-9]+$/u.test(header)) {
+      requestedDelay = Number(header) * 1_000;
     } else {
       const parsedDate = Date.parse(header);
       if (Number.isFinite(parsedDate)) {

@@ -39621,7 +39621,7 @@ function _getGlobal(key, defaultValue) {
 
 const LATEST_RELEASE_URL = "https://github.com/j178/prek/releases/latest";
 const RELEASE_ROOT = "https://github.com/j178/prek/releases/download";
-const RELEASE_PATH_PATTERN = /^\/j178\/prek\/releases\/tag\/v(0|[1-9][0-9]*)\.([0-9]+)\.([0-9]+)$/u;
+const RELEASE_PATH_PATTERN = /^\/j178\/prek\/releases\/tag\/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/u;
 const RELEASE_LOOKUP_ATTEMPTS = 3;
 const RELEASE_LOOKUP_DEADLINE_MS = 65_000;
 const RELEASE_LOOKUP_BACKOFF_MS = 100;
@@ -39791,9 +39791,8 @@ function retryDelay(attempt, retryAfter) {
     const header = Array.isArray(retryAfter) ? retryAfter[0] : retryAfter;
     let requestedDelay;
     if (header !== undefined) {
-        const seconds = Number(header);
-        if (Number.isFinite(seconds)) {
-            requestedDelay = seconds * 1_000;
+        if (/^[0-9]+$/u.test(header)) {
+            requestedDelay = Number(header) * 1_000;
         }
         else {
             const parsedDate = Date.parse(header);
@@ -40066,6 +40065,9 @@ async function runUpdate(execution) {
                         .some((line) => line === `worktree ${worktree}`)) {
                         preserveTemporaryRoot = true;
                         cleanupErrors.push(new Error(`Failed to remove action-owned worktree; ${worktree} was preserved for inspection`, { cause: removalError }));
+                    }
+                    else {
+                        warning(`Failed to remove action-owned worktree, but its registration was already absent; continuing cleanup: ${String(removalError)}`);
                     }
                 }
                 catch (inspectionError) {
