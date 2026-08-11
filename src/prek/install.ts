@@ -17,6 +17,8 @@ const RELEASE_ROOT = "https://github.com/j178/prek/releases/download";
 const RELEASE_PATH_PATTERN =
   /^\/j178\/prek\/releases\/tag\/v(0|[1-9][0-9]*)\.([0-9]+)\.([0-9]+)$/u;
 const RELEASE_LOOKUP_ATTEMPTS = 3;
+const RELEASE_LOOKUP_BACKOFF_MS = 100;
+const RELEASE_LOOKUP_MAX_DELAY_MS = 1_000;
 const RELEASE_LOOKUP_TIMEOUT_MS = 10_000;
 
 interface Release {
@@ -61,22 +63,35 @@ export async function installPrek(): Promise<PrekInstallation> {
     const checksumContents = await readFile(checksumFile, "utf8");
     const archive = path.join(directory, asset);
     const cached = cachedArchive(latest.version, asset);
+    let useCached = false;
 
-    if (cached === undefined) {
-      await toolCache.downloadTool(`${latest.root}/${asset}`, archive);
-      await verifySha256(archive, checksumContents, asset);
-      await toolCache.cacheFile(
-        archive,
-        asset,
-        "prek-archive",
-        latest.version,
-        process.arch,
-      );
-    } else {
-      await copyFile(cached, archive);
+    if (cached !== undefined) {
+      try {
+        await copyFile(cached, archive);
+        await verifySha256(archive, checksumContents, asset);
+        useCached = true;
+      } catch {
+        // The shared cache is optional; recover from its immutable release URL.
+      }
     }
 
-    await verifySha256(archive, checksumContents, asset);
+    if (!useCached) {
+      if (cached !== undefined) {
+        await rm(archive, { force: true });
+      }
+      await toolCache.downloadTool(`${latest.root}/${asset}`, archive);
+      await verifySha256(archive, checksumContents, asset);
+      if (cached === undefined) {
+        await toolCache.cacheFile(
+          archive,
+          asset,
+          "prek-archive",
+          latest.version,
+          process.arch,
+        );
+      }
+    }
+
     const extracted = await toolCache.extractTar(
       archive,
       path.join(directory, "extract"),
@@ -120,12 +135,21 @@ async function resolveLatestRelease(releaseTarget: string): Promise<Release> {
   let response;
   try {
     for (let attempt = 1; ; attempt += 1) {
-      response = await client.head(LATEST_RELEASE_URL);
+      try {
+        response = await client.head(LATEST_RELEASE_URL);
+      } catch (error) {
+        if (attempt === RELEASE_LOOKUP_ATTEMPTS) {
+          throw error;
+        }
+        await delay(retryDelay(attempt));
+        continue;
+      }
       const status = response.message.statusCode ?? 0;
       if (!isTransientStatus(status) || attempt === RELEASE_LOOKUP_ATTEMPTS) {
         break;
       }
       await response.readBody();
+      await delay(retryDelay(attempt, response.message.headers["retry-after"]));
     }
   } finally {
     client.dispose();
@@ -160,6 +184,31 @@ async function resolveLatestRelease(releaseTarget: string): Promise<Release> {
 
 function isTransientStatus(status: number): boolean {
   return status === 429 || (status >= 500 && status <= 599);
+}
+
+function retryDelay(attempt: number, retryAfter?: string | string[]): number {
+  const header = Array.isArray(retryAfter) ? retryAfter[0] : retryAfter;
+  let requestedDelay: number | undefined;
+  if (header !== undefined) {
+    const seconds = Number(header);
+    if (Number.isFinite(seconds)) {
+      requestedDelay = seconds * 1_000;
+    } else {
+      const parsedDate = Date.parse(header);
+      if (Number.isFinite(parsedDate)) {
+        requestedDelay = parsedDate - Date.now();
+      }
+    }
+  }
+  const backoff = RELEASE_LOOKUP_BACKOFF_MS * 2 ** (attempt - 1);
+  return Math.min(
+    Math.max(requestedDelay ?? backoff, 0),
+    RELEASE_LOOKUP_MAX_DELAY_MS,
+  );
+}
+
+async function delay(milliseconds: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 async function verifyExecutable(binary: string): Promise<void> {

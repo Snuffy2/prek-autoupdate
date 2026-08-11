@@ -39615,6 +39615,8 @@ const LATEST_RELEASE_URL = "https://github.com/j178/prek/releases/latest";
 const RELEASE_ROOT = "https://github.com/j178/prek/releases/download";
 const RELEASE_PATH_PATTERN = /^\/j178\/prek\/releases\/tag\/v(0|[1-9][0-9]*)\.([0-9]+)\.([0-9]+)$/u;
 const RELEASE_LOOKUP_ATTEMPTS = 3;
+const RELEASE_LOOKUP_BACKOFF_MS = 100;
+const RELEASE_LOOKUP_MAX_DELAY_MS = 1_000;
 const RELEASE_LOOKUP_TIMEOUT_MS = 10_000;
 function targetForArchitecture(architecture) {
     if (architecture === "x64") {
@@ -39639,15 +39641,27 @@ async function installPrek() {
         const checksumContents = await readFile(checksumFile, "utf8");
         const archive = path$1.join(directory, asset);
         const cached = cachedArchive(latest.version, asset);
-        if (cached === undefined) {
+        let useCached = false;
+        if (cached !== undefined) {
+            try {
+                await copyFile$2(cached, archive);
+                await verifySha256(archive, checksumContents, asset);
+                useCached = true;
+            }
+            catch {
+                // The shared cache is optional; recover from its immutable release URL.
+            }
+        }
+        if (!useCached) {
+            if (cached !== undefined) {
+                await rm$1(archive, { force: true });
+            }
             await downloadTool(`${latest.root}/${asset}`, archive);
             await verifySha256(archive, checksumContents, asset);
-            await cacheFile(archive, asset, "prek-archive", latest.version, process.arch);
+            if (cached === undefined) {
+                await cacheFile(archive, asset, "prek-archive", latest.version, process.arch);
+            }
         }
-        else {
-            await copyFile$2(cached, archive);
-        }
-        await verifySha256(archive, checksumContents, asset);
         const extracted = await extractTar(archive, path$1.join(directory, "extract"));
         const binary = path$1.join(extracted, `prek-${latest.target}`, "prek");
         await verifyExecutable(binary);
@@ -39684,12 +39698,22 @@ async function resolveLatestRelease(releaseTarget) {
     let response;
     try {
         for (let attempt = 1;; attempt += 1) {
-            response = await client.head(LATEST_RELEASE_URL);
+            try {
+                response = await client.head(LATEST_RELEASE_URL);
+            }
+            catch (error) {
+                if (attempt === RELEASE_LOOKUP_ATTEMPTS) {
+                    throw error;
+                }
+                await delay(retryDelay(attempt));
+                continue;
+            }
             const status = response.message.statusCode ?? 0;
             if (!isTransientStatus(status) || attempt === RELEASE_LOOKUP_ATTEMPTS) {
                 break;
             }
             await response.readBody();
+            await delay(retryDelay(attempt, response.message.headers["retry-after"]));
         }
     }
     finally {
@@ -39720,6 +39744,27 @@ async function resolveLatestRelease(releaseTarget) {
 }
 function isTransientStatus(status) {
     return status === 429 || (status >= 500 && status <= 599);
+}
+function retryDelay(attempt, retryAfter) {
+    const header = Array.isArray(retryAfter) ? retryAfter[0] : retryAfter;
+    let requestedDelay;
+    if (header !== undefined) {
+        const seconds = Number(header);
+        if (Number.isFinite(seconds)) {
+            requestedDelay = seconds * 1_000;
+        }
+        else {
+            const parsedDate = Date.parse(header);
+            if (Number.isFinite(parsedDate)) {
+                requestedDelay = parsedDate - Date.now();
+            }
+        }
+    }
+    const backoff = RELEASE_LOOKUP_BACKOFF_MS * 2 ** (attempt - 1);
+    return Math.min(Math.max(requestedDelay ?? backoff, 0), RELEASE_LOOKUP_MAX_DELAY_MS);
+}
+async function delay(milliseconds) {
+    await new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 async function verifyExecutable(binary) {
     const metadata = await lstat$1(binary);
@@ -39933,16 +39978,26 @@ async function runUpdate(execution) {
             cleanupErrors.push(error);
         }
         if (added) {
-            try {
-                await git(execution.context.workspace, [
-                    "worktree",
-                    "remove",
-                    "--force",
-                    worktree,
-                ]);
+            let removalFailed = false;
+            let removalError;
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+                try {
+                    await git(execution.context.workspace, [
+                        "worktree",
+                        "remove",
+                        "--force",
+                        worktree,
+                    ]);
+                    removalFailed = false;
+                    break;
+                }
+                catch (error) {
+                    removalFailed = true;
+                    removalError = error;
+                }
             }
-            catch (error) {
-                cleanupErrors.push(error);
+            if (removalFailed) {
+                cleanupErrors.push(removalError);
             }
         }
         try {

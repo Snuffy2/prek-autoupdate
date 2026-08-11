@@ -47,6 +47,7 @@ afterEach(async () => {
   delete process.env.TEST_GIT_FAIL_PUSH;
   delete process.env.TEST_GIT_FAIL_DIFF;
   delete process.env.TEST_GIT_FAIL_WORKTREE_REMOVE;
+  delete process.env.TEST_GIT_WORKTREE_REMOVE_LOG;
   installPrek.mockReset();
   await Promise.all(
     cleanups
@@ -56,9 +57,25 @@ afterEach(async () => {
 });
 
 describe("update publication races", () => {
-  it("reports worktree removal failure after completing filesystem cleanup", async () => {
+  it("retries worktree removal once and restores the initial worktree list", async () => {
     const harness = await makeHarness({ noChange: true });
+    const initial = await worktrees(harness.execution.context.workspace);
     process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "1";
+    process.env.TEST_GIT_WORKTREE_REMOVE_LOG = `${harness.log}.worktree`;
+
+    await expect(runUpdate(harness.execution)).resolves.toEqual({
+      operation: "none",
+    });
+
+    expect(await worktrees(harness.execution.context.workspace)).toEqual(
+      initial,
+    );
+  });
+
+  it("aggregates persistent worktree removal failure", async () => {
+    const harness = await makeHarness({ noChange: true });
+    process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "always";
+    process.env.TEST_GIT_WORKTREE_REMOVE_LOG = `${harness.log}.worktree`;
 
     const error = await runUpdate(harness.execution).catch(
       (caught: unknown) => caught,
@@ -819,7 +836,11 @@ for arg in "$@"; do
 done
 case " $* " in
   *" worktree remove --force "*)
-    [ "$TEST_GIT_FAIL_WORKTREE_REMOVE" = "1" ] && exit 1
+    if [ -n "$TEST_GIT_FAIL_WORKTREE_REMOVE" ]; then
+      printf '%s\n' "$*" >> "$TEST_GIT_WORKTREE_REMOVE_LOG"
+      count=$(wc -l < "$TEST_GIT_WORKTREE_REMOVE_LOG" | tr -d ' ')
+      { [ "$TEST_GIT_FAIL_WORKTREE_REMOVE" = "always" ] || [ "$count" = "$TEST_GIT_FAIL_WORKTREE_REMOVE" ]; } && exit 1
+    fi
     ;;
   *" diff --cached --quiet "*)
     [ "$TEST_GIT_FAIL_DIFF" = "1" ] && exit 2
@@ -839,6 +860,17 @@ eval exec ${JSON.stringify(realGit)} "$args"
 async function pushes(log: string): Promise<string[]> {
   const value = await readFile(log, "utf8");
   return value.trim().split("\n").filter(Boolean);
+}
+
+async function worktrees(workspace: string): Promise<string[]> {
+  const result = await exec("git", [
+    "-C",
+    workspace,
+    "worktree",
+    "list",
+    "--porcelain",
+  ]);
+  return result.stdout.match(/^worktree .+$/gmu) ?? [];
 }
 
 async function remoteSha(remote: string): Promise<string> {

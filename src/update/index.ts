@@ -275,15 +275,25 @@ export async function runUpdate(
       cleanupErrors.push(error);
     }
     if (added) {
-      try {
-        await git(execution.context.workspace, [
-          "worktree",
-          "remove",
-          "--force",
-          worktree,
-        ]);
-      } catch (error) {
-        cleanupErrors.push(error);
+      let removalFailed = false;
+      let removalError: unknown;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          await git(execution.context.workspace, [
+            "worktree",
+            "remove",
+            "--force",
+            worktree,
+          ]);
+          removalFailed = false;
+          break;
+        } catch (error) {
+          removalFailed = true;
+          removalError = error;
+        }
+      }
+      if (removalFailed) {
+        cleanupErrors.push(removalError);
       }
     }
     try {
