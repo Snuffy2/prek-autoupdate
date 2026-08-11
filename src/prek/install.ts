@@ -1,6 +1,14 @@
 import * as toolCache from "@actions/tool-cache";
+import { HttpClient } from "@actions/http-client";
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  chmod,
+  copyFile,
+  lstat,
+  mkdtemp,
+  readFile,
+  rm,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -8,6 +16,8 @@ const LATEST_RELEASE_URL = "https://github.com/j178/prek/releases/latest";
 const RELEASE_ROOT = "https://github.com/j178/prek/releases/download";
 const RELEASE_PATH_PATTERN =
   /^\/j178\/prek\/releases\/tag\/v(0|[1-9][0-9]*)\.([0-9]+)\.([0-9]+)$/u;
+const RELEASE_LOOKUP_ATTEMPTS = 3;
+const RELEASE_LOOKUP_TIMEOUT_MS = 10_000;
 
 interface Release {
   readonly root: string;
@@ -43,27 +53,27 @@ export async function installPrek(): Promise<PrekInstallation> {
     await rm(directory, { force: true, recursive: true });
   };
   try {
-    const checksumFile = await toolCache.downloadTool(
+    const checksumFile = path.join(directory, `${asset}.sha256`);
+    await toolCache.downloadTool(
       `${latest.root}/${asset}.sha256`,
-      path.join(directory, `${asset}.sha256`),
+      checksumFile,
     );
     const checksumContents = await readFile(checksumFile, "utf8");
-    let archive = cachedArchive(latest.version, asset);
+    const archive = path.join(directory, asset);
+    const cached = cachedArchive(latest.version, asset);
 
-    if (archive === undefined) {
-      const downloadedArchive = await toolCache.downloadTool(
-        `${latest.root}/${asset}`,
-        path.join(directory, asset),
-      );
-      await verifySha256(downloadedArchive, checksumContents, asset);
-      const cacheDirectory = await toolCache.cacheFile(
-        downloadedArchive,
+    if (cached === undefined) {
+      await toolCache.downloadTool(`${latest.root}/${asset}`, archive);
+      await verifySha256(archive, checksumContents, asset);
+      await toolCache.cacheFile(
+        archive,
         asset,
         "prek-archive",
         latest.version,
         process.arch,
       );
-      archive = path.join(cacheDirectory, asset);
+    } else {
+      await copyFile(cached, archive);
     }
 
     await verifySha256(archive, checksumContents, asset);
@@ -101,17 +111,31 @@ function cachedArchive(version: string, asset: string): string | undefined {
 }
 
 async function resolveLatestRelease(releaseTarget: string): Promise<Release> {
-  const response = await fetch(LATEST_RELEASE_URL, {
-    method: "HEAD",
-    redirect: "manual",
+  const client = new HttpClient("prek-autoupdate", [], {
+    allowRedirects: false,
+    allowRetries: false,
+    keepAlive: true,
+    socketTimeout: RELEASE_LOOKUP_TIMEOUT_MS,
   });
-  if (![301, 302, 303, 307, 308].includes(response.status)) {
-    throw new Error(
-      `Latest prek release lookup returned HTTP ${response.status}`,
-    );
+  let response;
+  try {
+    for (let attempt = 1; ; attempt += 1) {
+      response = await client.head(LATEST_RELEASE_URL);
+      const status = response.message.statusCode ?? 0;
+      if (!isTransientStatus(status) || attempt === RELEASE_LOOKUP_ATTEMPTS) {
+        break;
+      }
+      await response.readBody();
+    }
+  } finally {
+    client.dispose();
   }
-  const location = response.headers.get("location");
-  if (location === null) {
+  const status = response.message.statusCode ?? 0;
+  if (![301, 302, 303, 307, 308].includes(status)) {
+    throw new Error(`Latest prek release lookup returned HTTP ${status}`);
+  }
+  const location = response.message.headers.location;
+  if (location === undefined) {
     throw new Error("Latest prek release did not provide a redirect");
   }
 
@@ -132,6 +156,10 @@ async function resolveLatestRelease(releaseTarget: string): Promise<Release> {
     target: releaseTarget,
     version,
   };
+}
+
+function isTransientStatus(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599);
 }
 
 async function verifyExecutable(binary: string): Promise<void> {

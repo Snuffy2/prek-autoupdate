@@ -46,6 +46,7 @@ afterEach(async () => {
   delete process.env.TEST_GIT_URL;
   delete process.env.TEST_GIT_FAIL_PUSH;
   delete process.env.TEST_GIT_FAIL_DIFF;
+  delete process.env.TEST_GIT_FAIL_WORKTREE_REMOVE;
   installPrek.mockReset();
   await Promise.all(
     cleanups
@@ -55,6 +56,22 @@ afterEach(async () => {
 });
 
 describe("update publication races", () => {
+  it("reports worktree removal failure after completing filesystem cleanup", async () => {
+    const harness = await makeHarness({ noChange: true });
+    process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "1";
+
+    const error = await runUpdate(harness.execution).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toMatchObject({
+      message: "Update operation completed but cleanup failed",
+    });
+    expect((error as AggregateError).errors).toEqual([
+      expect.objectContaining({ message: expect.stringMatching(/worktree/u) }),
+    ]);
+  });
+
   it("scopes authenticated pushes to the configured Actions server", async () => {
     const harness = await makeHarness();
     const serverUrl = "https://github.example.com";
@@ -801,6 +818,9 @@ for arg in "$@"; do
   args="$args '$arg'"
 done
 case " $* " in
+  *" worktree remove --force "*)
+    [ "$TEST_GIT_FAIL_WORKTREE_REMOVE" = "1" ] && exit 1
+    ;;
   *" diff --cached --quiet "*)
     [ "$TEST_GIT_FAIL_DIFF" = "1" ] && exit 2
     ;;

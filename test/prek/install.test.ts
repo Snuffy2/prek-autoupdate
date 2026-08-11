@@ -1,10 +1,13 @@
 import * as toolCache from "@actions/tool-cache";
+import { HttpClient } from "@actions/http-client";
 import type * as NodeCrypto from "node:crypto";
 import type * as NodeFsPromises from "node:fs/promises";
 import {
   access,
+  copyFile,
   mkdir,
   mkdtemp,
+  readFile,
   rm,
   symlink,
   writeFile,
@@ -20,6 +23,17 @@ vi.mock("@actions/tool-cache", () => ({
   downloadTool: vi.fn(),
   extractTar: vi.fn(),
   find: vi.fn(),
+}));
+
+const httpMocks = vi.hoisted(() => ({
+  dispose: vi.fn(),
+  head: vi.fn(),
+  readBody: vi.fn(async () => ""),
+}));
+vi.mock("@actions/http-client", () => ({
+  HttpClient: vi.fn(function HttpClient() {
+    return { dispose: httpMocks.dispose, head: httpMocks.head };
+  }),
 }));
 
 const filesystemMock = vi.hoisted(() => ({
@@ -86,7 +100,6 @@ vi.mock("node:crypto", async (importOriginal) => {
 beforeEach(() => {
   filesystemMock.cleanupError = undefined;
   vi.clearAllMocks();
-  vi.stubGlobal("fetch", vi.fn());
   mockLatestRelease();
 });
 
@@ -104,12 +117,17 @@ async function exists(candidate: string): Promise<boolean> {
 }
 
 function mockLatestRelease(location = releaseUrl()): void {
-  vi.mocked(fetch).mockResolvedValue(
-    new Response(null, {
-      status: 302,
-      headers: { location },
-    }),
-  );
+  httpMocks.head.mockResolvedValue(httpResponse(302, location));
+}
+
+function httpResponse(statusCode: number, location?: string) {
+  return {
+    message: {
+      headers: location === undefined ? {} : { location },
+      statusCode,
+    },
+    readBody: httpMocks.readBody,
+  };
 }
 
 function releaseUrl(): string {
@@ -142,8 +160,14 @@ async function arrangeDownload(
   await writeFile(extractedBinary, "valid binary");
   vi.mocked(toolCache.find).mockReturnValue("");
   vi.mocked(toolCache.downloadTool)
-    .mockResolvedValueOnce(checksum)
-    .mockResolvedValueOnce(archive);
+    .mockImplementationOnce(async (_url, destination) => {
+      await copyFile(checksum, destination!);
+      return destination!;
+    })
+    .mockImplementationOnce(async (_url, destination) => {
+      await copyFile(archive, destination!);
+      return destination!;
+    });
   vi.mocked(toolCache.cacheFile).mockResolvedValue(cacheDirectory);
   vi.mocked(toolCache.extractTar).mockResolvedValue(extractDirectory);
   return { archive, cachedArchive, extractedBinary };
@@ -173,6 +197,58 @@ describe("installPrek", () => {
     );
   });
 
+  it("configures a bounded proxy-aware release lookup without redirects", async () => {
+    const { extractedBinary } = await arrangeDownload(
+      `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`,
+    );
+
+    const installation = await installPrek();
+
+    expect(installation.binary).toBe(extractedBinary);
+    expect(HttpClient).toHaveBeenCalledWith("prek-autoupdate", [], {
+      allowRedirects: false,
+      allowRetries: false,
+      keepAlive: true,
+      socketTimeout: 10_000,
+    });
+    expect(httpMocks.dispose).toHaveBeenCalledOnce();
+    await installation.cleanup();
+  });
+
+  it("retries transient latest-release responses within the bound", async () => {
+    await arrangeDownload(`${ARCHIVE_SHA256}  ${RELEASE.asset}\n`);
+    httpMocks.head
+      .mockResolvedValueOnce(httpResponse(429))
+      .mockResolvedValueOnce(httpResponse(503))
+      .mockResolvedValueOnce(httpResponse(302, releaseUrl()));
+
+    const installation = await installPrek();
+
+    expect(httpMocks.head).toHaveBeenCalledTimes(3);
+    expect(httpMocks.readBody).toHaveBeenCalledTimes(2);
+    expect(httpMocks.dispose).toHaveBeenCalledOnce();
+    await installation.cleanup();
+  });
+
+  it("propagates a terminal transient status after bounded retries", async () => {
+    httpMocks.head.mockResolvedValue(httpResponse(500));
+
+    await expect(installPrek()).rejects.toThrow(
+      "Latest prek release lookup returned HTTP 500",
+    );
+    expect(httpMocks.head).toHaveBeenCalledTimes(3);
+    expect(httpMocks.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("propagates release lookup timeouts and disposes the client", async () => {
+    const timeout = new Error("socket timeout");
+    httpMocks.head.mockRejectedValue(timeout);
+
+    await expect(installPrek()).rejects.toBe(timeout);
+    expect(httpMocks.head).toHaveBeenCalledOnce();
+    expect(httpMocks.dispose).toHaveBeenCalledOnce();
+  });
+
   it("rejects a tampered cached archive", async () => {
     const downloadDirectory = await temporaryDirectory("prek-checksum-test-");
     const checksum = path.join(downloadDirectory, `${RELEASE.asset}.sha256`);
@@ -180,7 +256,12 @@ describe("installPrek", () => {
     const cacheDirectory = await temporaryDirectory("prek-cache-test-");
     await writeFile(path.join(cacheDirectory, RELEASE.asset), "tampered");
     vi.mocked(toolCache.find).mockReturnValue(cacheDirectory);
-    vi.mocked(toolCache.downloadTool).mockResolvedValue(checksum);
+    vi.mocked(toolCache.downloadTool).mockImplementation(
+      async (_url, destination) => {
+        await copyFile(checksum, destination!);
+        return destination!;
+      },
+    );
 
     await expect(installPrek()).rejects.toThrow(
       `SHA256 verification failed for ${RELEASE.asset}`,
@@ -190,15 +271,14 @@ describe("installPrek", () => {
   });
 
   it("resolves, downloads, verifies, extracts, and caches the latest release", async () => {
-    const { archive, cachedArchive, extractedBinary } = await arrangeDownload(
+    const { extractedBinary } = await arrangeDownload(
       `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`,
     );
 
     const installation = await installPrek();
     expect(installation.binary).toBe(extractedBinary);
-    expect(fetch).toHaveBeenCalledWith(
+    expect(httpMocks.head).toHaveBeenCalledWith(
       "https://github.com/j178/prek/releases/latest",
-      { method: "HEAD", redirect: "manual" },
     );
     expect(toolCache.downloadTool).toHaveBeenNthCalledWith(
       1,
@@ -210,21 +290,21 @@ describe("installPrek", () => {
       `https://github.com/j178/prek/releases/download/v${RELEASE.version}/${RELEASE.asset}`,
       expect.stringContaining(`prek-install-`),
     );
+    const checksumDestination = vi.mocked(toolCache.downloadTool).mock
+      .calls[0]![1]!;
+    const archiveDestination = vi.mocked(toolCache.downloadTool).mock
+      .calls[1]![1]!;
     expect(toolCache.cacheFile).toHaveBeenCalledWith(
-      archive,
+      archiveDestination,
       RELEASE.asset,
       "prek-archive",
       RELEASE.version,
       process.arch,
     );
     expect(toolCache.extractTar).toHaveBeenCalledWith(
-      cachedArchive,
+      archiveDestination,
       expect.stringContaining("prek-install-"),
     );
-    const checksumDestination = vi.mocked(toolCache.downloadTool).mock
-      .calls[0]![1]!;
-    const archiveDestination = vi.mocked(toolCache.downloadTool).mock
-      .calls[1]![1]!;
     const extractionDirectory = vi.mocked(toolCache.extractTar).mock
       .calls[0]![1]!;
     const installationRoot = path.dirname(checksumDestination);
@@ -241,14 +321,22 @@ describe("installPrek", () => {
     );
     const cacheDirectory = path.dirname(archive);
     vi.mocked(toolCache.find).mockReturnValue(cacheDirectory);
+    const checksum = path.join(cacheDirectory, `${RELEASE.asset}.sha256`);
+    await writeFile(checksum, `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`);
     vi.mocked(toolCache.downloadTool)
       .mockReset()
-      .mockResolvedValueOnce(
-        path.join(cacheDirectory, `${RELEASE.asset}.sha256`),
-      );
-    await writeFile(
-      path.join(cacheDirectory, `${RELEASE.asset}.sha256`),
-      `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`,
+      .mockImplementationOnce(async (_url, destination) => {
+        await copyFile(checksum, destination!);
+        return destination!;
+      });
+    vi.mocked(toolCache.extractTar).mockImplementationOnce(
+      async (ownedArchive, destination) => {
+        await writeFile(archive, "replaced shared cache");
+        expect(await readFile(ownedArchive, "utf8")).toBe("valid archive");
+        return destination === undefined
+          ? path.dirname(extractedBinary)
+          : path.dirname(path.dirname(extractedBinary));
+      },
     );
 
     const installation = await installPrek();
@@ -282,9 +370,13 @@ describe("installPrek", () => {
     } else if (stage === "archive download") {
       vi.mocked(toolCache.downloadTool)
         .mockReset()
-        .mockResolvedValueOnce(
-          path.join(path.dirname(arranged.archive), `${RELEASE.asset}.sha256`),
-        )
+        .mockImplementationOnce(async (_url, destination) => {
+          await writeFile(
+            destination!,
+            `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`,
+          );
+          return destination!;
+        })
         .mockRejectedValueOnce(new Error("archive download failed"));
     } else if (stage === "cache") {
       vi.mocked(toolCache.cacheFile).mockRejectedValueOnce(
@@ -347,7 +439,7 @@ describe("installPrek", () => {
   });
 
   it("rejects a latest-release response without a redirect", async () => {
-    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 200 }));
+    httpMocks.head.mockResolvedValue(httpResponse(200));
 
     await expect(installPrek()).rejects.toThrow(
       "Latest prek release lookup returned HTTP 200",
@@ -356,7 +448,7 @@ describe("installPrek", () => {
   });
 
   it("rejects a redirect without a release location", async () => {
-    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 302 }));
+    httpMocks.head.mockResolvedValue(httpResponse(302));
 
     await expect(installPrek()).rejects.toThrow(
       "Latest prek release did not provide a redirect",

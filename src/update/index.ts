@@ -275,12 +275,16 @@ export async function runUpdate(
       cleanupErrors.push(error);
     }
     if (added) {
-      await git(execution.context.workspace, [
-        "worktree",
-        "remove",
-        "--force",
-        worktree,
-      ]).catch(() => undefined);
+      try {
+        await git(execution.context.workspace, [
+          "worktree",
+          "remove",
+          "--force",
+          worktree,
+        ]);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
     }
     try {
       await rm(temporaryRoot, { force: true, recursive: true });
