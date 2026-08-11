@@ -1,3 +1,4 @@
+import * as core from "@actions/core";
 import * as toolCache from "@actions/tool-cache";
 import { HttpClient } from "@actions/http-client";
 import type * as NodeCrypto from "node:crypto";
@@ -24,6 +25,7 @@ vi.mock("@actions/tool-cache", () => ({
   extractTar: vi.fn(),
   find: vi.fn(),
 }));
+vi.mock("@actions/core", () => ({ warning: vi.fn() }));
 
 const httpMocks = vi.hoisted(() => ({
   dispose: vi.fn(),
@@ -284,16 +286,26 @@ describe("installPrek", () => {
     await installation.cleanup();
   });
 
-  it("caps Retry-After before retrying", async () => {
+  it("honors Retry-After within the explicit delay budget", async () => {
     await arrangeDownload(`${ARCHIVE_SHA256}  ${RELEASE.asset}\n`);
     httpMocks.head
-      .mockResolvedValueOnce(httpResponse(429, undefined, "999"))
+      .mockResolvedValueOnce(httpResponse(429, undefined, "30"))
       .mockResolvedValueOnce(httpResponse(302, releaseUrl()));
 
     const installation = await installPrek();
 
-    expect(setTimeout).toHaveBeenCalledWith(expect.any(Function), 1_000);
+    expect(setTimeout).toHaveBeenCalledWith(expect.any(Function), 30_000);
     await installation.cleanup();
+  });
+
+  it("rejects Retry-After beyond the supported delay budget", async () => {
+    httpMocks.head.mockResolvedValue(httpResponse(429, undefined, "31"));
+
+    await expect(installPrek()).rejects.toThrow(
+      "Retry-After exceeds the supported 30000ms delay bound",
+    );
+    expect(httpMocks.head).toHaveBeenCalledOnce();
+    expect(setTimeout).not.toHaveBeenCalled();
   });
 
   it("propagates a terminal transient status after bounded retries", async () => {
@@ -465,7 +477,6 @@ describe("installPrek", () => {
     "checksum download",
     "checksum read",
     "archive download",
-    "cache",
     "extraction",
   ])("removes its owned root after a %s failure", async (stage) => {
     const arranged = await arrangeDownload(
@@ -495,10 +506,6 @@ describe("installPrek", () => {
           return destination!;
         })
         .mockRejectedValueOnce(new Error("archive download failed"));
-    } else if (stage === "cache") {
-      vi.mocked(toolCache.cacheFile).mockRejectedValueOnce(
-        new Error("cache failed"),
-      );
     } else {
       vi.mocked(toolCache.extractTar).mockRejectedValueOnce(
         new Error("extraction failed"),
@@ -508,6 +515,23 @@ describe("installPrek", () => {
     await expect(installPrek()).rejects.toThrow();
     const destination = vi.mocked(toolCache.downloadTool).mock.calls[0]![1]!;
     expect(await exists(path.dirname(destination))).toBe(false);
+  });
+
+  it("warns and continues when publishing the verified cache fails", async () => {
+    const { extractedBinary } = await arrangeDownload(
+      `${ARCHIVE_SHA256}  ${RELEASE.asset}\n`,
+    );
+    vi.mocked(toolCache.cacheFile).mockRejectedValueOnce(
+      new Error("cache failed"),
+    );
+
+    const installation = await installPrek();
+
+    expect(installation.binary).toBe(extractedBinary);
+    expect(core.warning).toHaveBeenCalledWith(
+      "Failed to cache verified prek archive; continuing without cache: cache failed",
+    );
+    await installation.cleanup();
   });
 
   it.each([

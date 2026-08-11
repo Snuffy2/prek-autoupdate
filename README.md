@@ -82,9 +82,10 @@ or restores the versioned archive from the runner tool cache. The action
 verifies the archive against the official checksum every time before extracting
 and running the executable. This detects download corruption or modification of
 a cached archive, but the checksum is published by the same upstream release and
-is not an independent trust anchor. Every new latest upstream `prek` release is
-trusted automatically, so a new `prek-autoupdate` release is not required to
-pick it up.
+is not an independent trust anchor. Each compatible latest upstream `prek`
+release with a numeric `vN.N.N` tag and the expected Linux archive/checksum
+layout is trusted automatically, so a new `prek-autoupdate` release is not
+required to pick it up.
 
 ## Inputs
 

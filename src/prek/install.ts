@@ -1,3 +1,4 @@
+import * as core from "@actions/core";
 import * as toolCache from "@actions/tool-cache";
 import { HttpClient } from "@actions/http-client";
 import { createHash } from "node:crypto";
@@ -18,7 +19,8 @@ const RELEASE_PATH_PATTERN =
   /^\/j178\/prek\/releases\/tag\/v(0|[1-9][0-9]*)\.([0-9]+)\.([0-9]+)$/u;
 const RELEASE_LOOKUP_ATTEMPTS = 3;
 const RELEASE_LOOKUP_BACKOFF_MS = 100;
-const RELEASE_LOOKUP_MAX_DELAY_MS = 1_000;
+const RELEASE_LOOKUP_MAX_DELAY_MS = 30_000;
+const RELEASE_LOOKUP_TOTAL_DELAY_MS = 30_000;
 const RELEASE_LOOKUP_TIMEOUT_MS = 10_000;
 
 interface Release {
@@ -82,13 +84,19 @@ export async function installPrek(): Promise<PrekInstallation> {
       await toolCache.downloadTool(`${latest.root}/${asset}`, archive);
       await verifySha256(archive, checksumContents, asset);
       if (cached === undefined) {
-        await toolCache.cacheFile(
-          archive,
-          asset,
-          "prek-archive",
-          latest.version,
-          process.arch,
-        );
+        try {
+          await toolCache.cacheFile(
+            archive,
+            asset,
+            "prek-archive",
+            latest.version,
+            process.arch,
+          );
+        } catch (error) {
+          core.warning(
+            `Failed to cache verified prek archive; continuing without cache: ${errorMessage(error)}`,
+          );
+        }
       }
     }
 
@@ -133,6 +141,7 @@ async function resolveLatestRelease(releaseTarget: string): Promise<Release> {
     socketTimeout: RELEASE_LOOKUP_TIMEOUT_MS,
   });
   let response;
+  let totalDelay = 0;
   try {
     for (let attempt = 1; ; attempt += 1) {
       try {
@@ -141,7 +150,9 @@ async function resolveLatestRelease(releaseTarget: string): Promise<Release> {
         if (attempt === RELEASE_LOOKUP_ATTEMPTS) {
           throw error;
         }
-        await delay(retryDelay(attempt));
+        const milliseconds = retryDelay(attempt);
+        totalDelay = addRetryDelay(totalDelay, milliseconds);
+        await delay(milliseconds);
         continue;
       }
       const status = response.message.statusCode ?? 0;
@@ -149,7 +160,12 @@ async function resolveLatestRelease(releaseTarget: string): Promise<Release> {
         break;
       }
       await response.readBody();
-      await delay(retryDelay(attempt, response.message.headers["retry-after"]));
+      const milliseconds = retryDelay(
+        attempt,
+        response.message.headers["retry-after"],
+      );
+      totalDelay = addRetryDelay(totalDelay, milliseconds);
+      await delay(milliseconds);
     }
   } finally {
     client.dispose();
@@ -201,14 +217,31 @@ function retryDelay(attempt: number, retryAfter?: string | string[]): number {
     }
   }
   const backoff = RELEASE_LOOKUP_BACKOFF_MS * 2 ** (attempt - 1);
-  return Math.min(
-    Math.max(requestedDelay ?? backoff, 0),
-    RELEASE_LOOKUP_MAX_DELAY_MS,
-  );
+  const milliseconds = Math.max(requestedDelay ?? backoff, 0);
+  if (milliseconds > RELEASE_LOOKUP_MAX_DELAY_MS) {
+    throw new Error(
+      `Latest prek release Retry-After exceeds the supported ${RELEASE_LOOKUP_MAX_DELAY_MS}ms delay bound`,
+    );
+  }
+  return milliseconds;
+}
+
+function addRetryDelay(total: number, milliseconds: number): number {
+  const nextTotal = total + milliseconds;
+  if (nextTotal > RELEASE_LOOKUP_TOTAL_DELAY_MS) {
+    throw new Error(
+      `Latest prek release retries exceed the supported ${RELEASE_LOOKUP_TOTAL_DELAY_MS}ms total delay bound`,
+    );
+  }
+  return nextTotal;
 }
 
 async function delay(milliseconds: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function verifyExecutable(binary: string): Promise<void> {

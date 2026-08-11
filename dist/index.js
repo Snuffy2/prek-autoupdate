@@ -37,7 +37,7 @@ import require$$5$3 from 'string_decoder';
 import * as child from 'child_process';
 import { setTimeout as setTimeout$1 } from 'timers';
 import { execFile } from 'node:child_process';
-import { mkdtemp, rm as rm$1, readFile, copyFile as copyFile$2, chmod as chmod$1, lstat as lstat$1 } from 'node:fs/promises';
+import { mkdtemp, rm as rm$1, readFile, copyFile as copyFile$2, chmod as chmod$1, lstat as lstat$1, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path$1, { join } from 'node:path';
 import * as stream from 'stream';
@@ -30148,6 +30148,14 @@ function error(message, properties = {}) {
     issueCommand('error', toCommandProperties(properties), message instanceof Error ? message.toString() : message);
 }
 /**
+ * Adds a warning issue
+ * @param message warning issue message. Errors will be converted to string via toString()
+ * @param properties optional properties to add to the annotation.
+ */
+function warning(message, properties = {}) {
+    issueCommand('warning', toCommandProperties(properties), message instanceof Error ? message.toString() : message);
+}
+/**
  * Writes info to log with console.log.
  * @param message info message
  */
@@ -39616,7 +39624,8 @@ const RELEASE_ROOT = "https://github.com/j178/prek/releases/download";
 const RELEASE_PATH_PATTERN = /^\/j178\/prek\/releases\/tag\/v(0|[1-9][0-9]*)\.([0-9]+)\.([0-9]+)$/u;
 const RELEASE_LOOKUP_ATTEMPTS = 3;
 const RELEASE_LOOKUP_BACKOFF_MS = 100;
-const RELEASE_LOOKUP_MAX_DELAY_MS = 1_000;
+const RELEASE_LOOKUP_MAX_DELAY_MS = 30_000;
+const RELEASE_LOOKUP_TOTAL_DELAY_MS = 30_000;
 const RELEASE_LOOKUP_TIMEOUT_MS = 10_000;
 function targetForArchitecture(architecture) {
     if (architecture === "x64") {
@@ -39659,7 +39668,12 @@ async function installPrek() {
             await downloadTool(`${latest.root}/${asset}`, archive);
             await verifySha256(archive, checksumContents, asset);
             if (cached === undefined) {
-                await cacheFile(archive, asset, "prek-archive", latest.version, process.arch);
+                try {
+                    await cacheFile(archive, asset, "prek-archive", latest.version, process.arch);
+                }
+                catch (error) {
+                    warning(`Failed to cache verified prek archive; continuing without cache: ${errorMessage$1(error)}`);
+                }
             }
         }
         const extracted = await extractTar(archive, path$1.join(directory, "extract"));
@@ -39696,6 +39710,7 @@ async function resolveLatestRelease(releaseTarget) {
         socketTimeout: RELEASE_LOOKUP_TIMEOUT_MS,
     });
     let response;
+    let totalDelay = 0;
     try {
         for (let attempt = 1;; attempt += 1) {
             try {
@@ -39705,7 +39720,9 @@ async function resolveLatestRelease(releaseTarget) {
                 if (attempt === RELEASE_LOOKUP_ATTEMPTS) {
                     throw error;
                 }
-                await delay(retryDelay(attempt));
+                const milliseconds = retryDelay(attempt);
+                totalDelay = addRetryDelay(totalDelay, milliseconds);
+                await delay(milliseconds);
                 continue;
             }
             const status = response.message.statusCode ?? 0;
@@ -39713,7 +39730,9 @@ async function resolveLatestRelease(releaseTarget) {
                 break;
             }
             await response.readBody();
-            await delay(retryDelay(attempt, response.message.headers["retry-after"]));
+            const milliseconds = retryDelay(attempt, response.message.headers["retry-after"]);
+            totalDelay = addRetryDelay(totalDelay, milliseconds);
+            await delay(milliseconds);
         }
     }
     finally {
@@ -39761,10 +39780,24 @@ function retryDelay(attempt, retryAfter) {
         }
     }
     const backoff = RELEASE_LOOKUP_BACKOFF_MS * 2 ** (attempt - 1);
-    return Math.min(Math.max(requestedDelay ?? backoff, 0), RELEASE_LOOKUP_MAX_DELAY_MS);
+    const milliseconds = Math.max(requestedDelay ?? backoff, 0);
+    if (milliseconds > RELEASE_LOOKUP_MAX_DELAY_MS) {
+        throw new Error(`Latest prek release Retry-After exceeds the supported ${RELEASE_LOOKUP_MAX_DELAY_MS}ms delay bound`);
+    }
+    return milliseconds;
+}
+function addRetryDelay(total, milliseconds) {
+    const nextTotal = total + milliseconds;
+    if (nextTotal > RELEASE_LOOKUP_TOTAL_DELAY_MS) {
+        throw new Error(`Latest prek release retries exceed the supported ${RELEASE_LOOKUP_TOTAL_DELAY_MS}ms total delay bound`);
+    }
+    return nextTotal;
 }
 async function delay(milliseconds) {
     await new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+function errorMessage$1(error) {
+    return error instanceof Error ? error.message : String(error);
 }
 async function verifyExecutable(binary) {
     const metadata = await lstat$1(binary);
@@ -39816,13 +39849,14 @@ async function runUpdate(execution) {
     const addPaths = await resolveAddPaths(execution);
     await proveBase(execution);
     const remote = await observeRemoteState(execution);
-    const temporaryRoot = await mkdtemp(path$1.join(tmpdir(), "prek-autoupdate-"));
+    const temporaryRoot = await realpath(await mkdtemp(path$1.join(tmpdir(), "prek-autoupdate-")));
     const worktree = path$1.join(temporaryRoot, "worktree");
     let added = false;
     let installation;
     let updateFailed = false;
     let updateError;
     try {
+        added = true;
         await git(execution.context.workspace, [
             "worktree",
             "add",
@@ -39830,7 +39864,6 @@ async function runUpdate(execution) {
             worktree,
             execution.context.baseSha,
         ]);
-        added = true;
         installation = await installPrek();
         const output = await runPrek(installation.binary, worktree, execution.inputs.cooldownDays);
         await git(worktree, ["add", "--", ...addPaths]);
@@ -39971,6 +40004,7 @@ async function runUpdate(execution) {
     }
     finally {
         const cleanupErrors = [];
+        let preserveTemporaryRoot = false;
         try {
             await installation?.cleanup();
         }
@@ -39986,6 +40020,7 @@ async function runUpdate(execution) {
                         "worktree",
                         "remove",
                         "--force",
+                        ...(attempt === 0 ? [] : ["--force"]),
                         worktree,
                     ]);
                     removalFailed = false;
@@ -39997,14 +40032,34 @@ async function runUpdate(execution) {
                 }
             }
             if (removalFailed) {
-                cleanupErrors.push(removalError);
+                try {
+                    const registeredWorktrees = await git(execution.context.workspace, [
+                        "worktree",
+                        "list",
+                        "--porcelain",
+                    ]);
+                    if (registeredWorktrees
+                        .split("\n")
+                        .some((line) => line === `worktree ${worktree}`)) {
+                        preserveTemporaryRoot = true;
+                        cleanupErrors.push(new Error(`Failed to remove action-owned worktree; ${worktree} was preserved for inspection`, { cause: removalError }));
+                    }
+                }
+                catch (inspectionError) {
+                    preserveTemporaryRoot = true;
+                    cleanupErrors.push(new Error(`Failed to reconcile action-owned worktree registration; ${worktree} was preserved for inspection`, {
+                        cause: new AggregateError([removalError, inspectionError]),
+                    }));
+                }
             }
         }
-        try {
-            await rm$1(temporaryRoot, { force: true, recursive: true });
-        }
-        catch (error) {
-            cleanupErrors.push(error);
+        if (!preserveTemporaryRoot) {
+            try {
+                await rm$1(temporaryRoot, { force: true, recursive: true });
+            }
+            catch (error) {
+                cleanupErrors.push(error);
+            }
         }
         reportCleanupFailures(updateFailed, updateError, cleanupErrors);
     }
