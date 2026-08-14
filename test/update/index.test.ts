@@ -1,18 +1,21 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../../src/prek/index.js", () => ({
-  installPrek: vi.fn(async () => "/usr/bin/true"),
+const prekMocks = vi.hoisted(() => ({
+  cleanup: vi.fn(async () => undefined),
+  install: vi.fn(),
 }));
+vi.mock("../../src/prek/index.js", () => ({ installPrek: prekMocks.install }));
 
 import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
 import {
   BODY_MARKER,
+  createTemporaryRoot,
   runUpdate,
   sanitizeOutput,
   validateAddPath,
@@ -23,11 +26,58 @@ const exec = promisify(execFile);
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  vi.clearAllMocks();
   await Promise.all(
     temporaryDirectories
       .splice(0)
       .map((directory) => rm(directory, { force: true, recursive: true })),
   );
+});
+
+prekMocks.install.mockImplementation(async () => ({
+  binary: "/usr/bin/true",
+  cleanup: prekMocks.cleanup,
+}));
+
+describe("temporary root creation", () => {
+  it("removes the raw root when canonicalization fails", async () => {
+    const rawRoot = await mkdtemp(path.join(tmpdir(), "prek-root-test-"));
+    const resolutionError = new Error("realpath failed");
+
+    await expect(
+      createTemporaryRoot(
+        async () => rawRoot,
+        async () => {
+          throw resolutionError;
+        },
+      ),
+    ).rejects.toBe(resolutionError);
+    await expect(access(rawRoot)).rejects.toThrow();
+  });
+
+  it("retains resolution and cleanup failures together", async () => {
+    const rawRoot = await mkdtemp(path.join(tmpdir(), "prek-root-test-"));
+    temporaryDirectories.push(rawRoot);
+    const resolutionError = new Error("realpath failed");
+    const cleanupError = new Error("cleanup failed");
+
+    await expect(
+      createTemporaryRoot(
+        async () => rawRoot,
+        async () => {
+          throw resolutionError;
+        },
+        async () => {
+          throw cleanupError;
+        },
+      ),
+    ).rejects.toMatchObject({
+      message: "Temporary root resolution failed and cleanup also failed",
+      cause: resolutionError,
+      errors: [resolutionError, cleanupError],
+    });
+    await expect(access(rawRoot)).resolves.toBeUndefined();
+  });
 });
 
 describe("update path validation", () => {
@@ -242,6 +292,48 @@ describe("non-mutating update preflight", () => {
     ]);
     expect(status).toBe("");
     expect(worktrees.match(/^worktree /gmu)).toHaveLength(1);
+    expect(prekMocks.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("cleans the installation when running prek fails", async () => {
+    prekMocks.install.mockResolvedValueOnce({
+      binary: "/missing/prek",
+      cleanup: prekMocks.cleanup,
+    });
+    const execution = await makeExecution(["prek.toml"]);
+
+    await expect(runUpdate(execution)).rejects.toThrow();
+    expect(prekMocks.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("reports cleanup failure after a successful update operation", async () => {
+    const cleanupError = new Error("installation cleanup failed");
+    prekMocks.cleanup.mockRejectedValueOnce(cleanupError);
+    const execution = await makeExecution(["prek.toml"]);
+
+    await expect(runUpdate(execution)).rejects.toMatchObject({
+      message: "Update operation completed but cleanup failed",
+      errors: [cleanupError],
+    });
+  });
+
+  it("retains update and cleanup failures together", async () => {
+    const cleanupError = new Error("installation cleanup failed");
+    prekMocks.cleanup.mockRejectedValueOnce(cleanupError);
+    prekMocks.install.mockResolvedValueOnce({
+      binary: "/missing/prek",
+      cleanup: prekMocks.cleanup,
+    });
+    const execution = await makeExecution(["prek.toml"]);
+
+    const error = await runUpdate(execution).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      message: "Update failed and cleanup also failed",
+    });
+    expect((error as AggregateError).errors).toEqual([
+      expect.any(Error),
+      cleanupError,
+    ]);
   });
 });
 

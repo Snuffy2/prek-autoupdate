@@ -1,6 +1,6 @@
 import * as core from "@actions/core";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -10,7 +10,7 @@ import {
   hardenedGitArguments,
   sanitizedChildEnvironment,
 } from "../environment.js";
-import { installPrek } from "../prek/index.js";
+import { installPrek, type PrekInstallation } from "../prek/index.js";
 
 const execFileAsync = promisify(execFile);
 export const BODY_MARKER = "Automated update of `prek` hooks.";
@@ -75,10 +75,14 @@ export async function runUpdate(
   const addPaths = await resolveAddPaths(execution);
   await proveBase(execution);
   const remote = await observeRemoteState(execution);
-  const temporaryRoot = await mkdtemp(path.join(tmpdir(), "prek-autoupdate-"));
+  const temporaryRoot = await createTemporaryRoot();
   const worktree = path.join(temporaryRoot, "worktree");
   let added = false;
+  let installation: PrekInstallation | undefined;
+  let updateFailed = false;
+  let updateError: unknown;
   try {
+    added = true;
     await git(execution.context.workspace, [
       "worktree",
       "add",
@@ -86,9 +90,12 @@ export async function runUpdate(
       worktree,
       execution.context.baseSha,
     ]);
-    added = true;
-    const prek = await installPrek();
-    const output = await runPrek(prek, worktree, execution.inputs.cooldownDays);
+    installation = await installPrek();
+    const output = await runPrek(
+      installation.binary,
+      worktree,
+      execution.inputs.cooldownDays,
+    );
     await git(worktree, ["add", "--", ...addPaths]);
     const diffStatus = await gitExit(worktree, [
       "diff",
@@ -183,7 +190,7 @@ export async function runUpdate(
     } catch (error) {
       await rollbackExistingPush(execution, remote, newSha, error);
     }
-    let updateError: unknown;
+    let pullUpdateError: unknown;
     try {
       const response = await execution.client.rest.pulls.update({
         owner: execution.context.owner,
@@ -207,11 +214,11 @@ export async function runUpdate(
           pullRequestNumber: remote.ownedPullRequest.number,
         };
       }
-      updateError = new Error(
+      pullUpdateError = new Error(
         "GitHub returned an unexpected pull request after update",
       );
     } catch (error) {
-      updateError = error;
+      pullUpdateError = error;
     }
     let verified: PullRequest;
     try {
@@ -238,7 +245,7 @@ export async function runUpdate(
     } catch (verificationError) {
       throw new Error(
         "Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved",
-        { cause: new AggregateError([updateError, verificationError]) },
+        { cause: new AggregateError([pullUpdateError, verificationError]) },
       );
     }
     const verificationError = new Error(
@@ -249,24 +256,142 @@ export async function runUpdate(
         execution,
         remote,
         newSha,
-        new AggregateError([updateError, verificationError]),
+        new AggregateError([pullUpdateError, verificationError]),
       );
     }
     throw new Error(
       "Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved",
-      { cause: new AggregateError([updateError, verificationError]) },
+      { cause: new AggregateError([pullUpdateError, verificationError]) },
     );
+  } catch (error) {
+    updateFailed = true;
+    updateError = error;
+    throw error;
   } finally {
-    if (added) {
-      await git(execution.context.workspace, [
-        "worktree",
-        "remove",
-        "--force",
-        worktree,
-      ]).catch(() => undefined);
+    const cleanupErrors: unknown[] = [];
+    let preserveTemporaryRoot = false;
+    try {
+      await installation?.cleanup();
+    } catch (error) {
+      cleanupErrors.push(error);
     }
-    await rm(temporaryRoot, { force: true, recursive: true });
+    if (added) {
+      let removalFailed = false;
+      let removalError: unknown;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          await git(execution.context.workspace, [
+            "worktree",
+            "remove",
+            "--force",
+            ...(attempt === 0 ? [] : ["--force"]),
+            worktree,
+          ]);
+          removalFailed = false;
+          break;
+        } catch (error) {
+          removalFailed = true;
+          removalError = error;
+        }
+      }
+      if (removalFailed) {
+        try {
+          const registeredWorktrees = await git(execution.context.workspace, [
+            "worktree",
+            "list",
+            "--porcelain",
+          ]);
+          if (
+            registeredWorktrees
+              .split("\n")
+              .some((line) => line === `worktree ${worktree}`)
+          ) {
+            preserveTemporaryRoot = true;
+            cleanupErrors.push(
+              new Error(
+                `Failed to remove action-owned worktree; ${worktree} was preserved for inspection`,
+                { cause: removalError },
+              ),
+            );
+          } else {
+            core.warning(
+              `Failed to remove action-owned worktree, but its registration was already absent; continuing cleanup: ${String(removalError)}`,
+            );
+          }
+        } catch (inspectionError) {
+          preserveTemporaryRoot = true;
+          cleanupErrors.push(
+            new Error(
+              `Failed to reconcile action-owned worktree registration; ${worktree} was preserved for inspection`,
+              {
+                cause: new AggregateError([removalError, inspectionError]),
+              },
+            ),
+          );
+        }
+      }
+    }
+    if (!preserveTemporaryRoot) {
+      try {
+        await rm(temporaryRoot, { force: true, recursive: true });
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    reportCleanupFailures(updateFailed, updateError, cleanupErrors);
   }
+}
+
+export async function createTemporaryRoot(
+  create: (prefix: string) => Promise<string> = mkdtemp,
+  resolve: (candidate: string) => Promise<string> = realpath,
+  remove: (
+    candidate: string,
+    options: { force: boolean; recursive: boolean },
+  ) => Promise<void> = rm,
+): Promise<string> {
+  const rawRoot = await create(path.join(tmpdir(), "prek-autoupdate-"));
+  try {
+    return await resolve(rawRoot);
+  } catch (error) {
+    let cleanupFailed = false;
+    let cleanupError: unknown;
+    try {
+      await remove(rawRoot, { force: true, recursive: true });
+    } catch (caughtCleanupError) {
+      cleanupFailed = true;
+      cleanupError = caughtCleanupError;
+    }
+    if (cleanupFailed) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Temporary root resolution failed and cleanup also failed",
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+}
+
+function reportCleanupFailures(
+  updateFailed: boolean,
+  updateError: unknown,
+  cleanupErrors: readonly unknown[],
+): void {
+  if (cleanupErrors.length === 0) {
+    return;
+  }
+  if (updateFailed) {
+    throw new AggregateError(
+      [updateError, ...cleanupErrors],
+      "Update failed and cleanup also failed",
+      { cause: updateError },
+    );
+  }
+  throw new AggregateError(
+    cleanupErrors,
+    "Update operation completed but cleanup failed",
+  );
 }
 
 function isExactUpdatedPull(
