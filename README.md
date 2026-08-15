@@ -87,7 +87,9 @@ download corruption or modification of a cached archive, but the checksum is
 published by the same upstream release and is not an independent trust anchor.
 Each compatible latest upstream `prek` release with a numeric `vN.N.N` tag and
 the expected Linux archive/checksum layout is trusted automatically, so a new
-`prek-autoupdate` release is not required to pick it up.
+`prek-autoupdate` release is not required to pick it up. The workflow log
+reports the exact `prek-autoupdate` release and resolved `prek` release
+immediately before each is run.
 
 ## Inputs
 

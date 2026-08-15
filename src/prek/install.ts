@@ -109,6 +109,7 @@ export async function installPrek(): Promise<PrekInstallation> {
     const binary = path.join(extracted, `prek-${latest.target}`, "prek");
     await verifyExecutable(binary);
     await chmod(binary, 0o755);
+    core.info(`Running prek v${latest.version}`);
     return { binary, cleanup };
   } catch (error) {
     let cleanupFailed = false;

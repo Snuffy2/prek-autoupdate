@@ -39681,6 +39681,7 @@ async function installPrek() {
         const binary = path$1.join(extracted, `prek-${latest.target}`, "prek");
         await verifyExecutable(binary);
         await chmod$1(binary, 0o755);
+        info(`Running prek v${latest.version}`);
         return { binary, cleanup };
     }
     catch (error) {
@@ -40639,7 +40640,11 @@ async function gitExit(workspace, arguments_) {
     }
 }
 
+/** Exact prek-autoupdate release version embedded in the action bundle. */
+const ACTION_VERSION = "2.0.2";
+
 async function runAction(now = new Date()) {
+    info(`Running prek-autoupdate v${ACTION_VERSION}`);
     const inputs = parseInputs();
     const client = getOctokit(inputs.token);
     const context = await resolveContext(client, inputs);

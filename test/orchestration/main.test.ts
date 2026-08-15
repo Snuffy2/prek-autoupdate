@@ -84,6 +84,12 @@ describe("runAction", () => {
     });
   });
 
+  it("logs the exact prek-autoupdate release version", async () => {
+    await runAction(new Date("2026-07-27T02:00:00Z"));
+
+    expect(core.info).toHaveBeenCalledWith("Running prek-autoupdate v2.0.2");
+  });
+
   it("keeps the updated pull request during scheduled cleanup", async () => {
     await runAction(new Date("2026-07-27T02:00:00Z"));
 
