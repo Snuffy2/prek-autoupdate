@@ -40,5 +40,8 @@
     "typescript-eslint": "^8.66.0",
     "vitest": "^4.0.0",
     "yaml": "^2.0.0"
+  },
+  "allowScripts": {
+    "fsevents": true
   }
 }
