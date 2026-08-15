@@ -156,4 +156,13 @@ login automatically, so `author-login` is not required.
 Use the moving major tag for stable updates. Each published, non-prerelease
 `v<major>.<minor>.<patch>` release creates or moves its corresponding `v<major>`
 tag to that release commit. For example, publishing `v3.1.0` creates or moves
-`v3`. Immutable release tags are never rewritten.
+`v3`.
+
+The release workflow validates the published source, prepares the package
+metadata and bundled Action, then atomically commits those files and retargets
+the newly published point tag to the final release commit. Because GitHub
+publishes the point tag before this workflow runs, an exact
+`v<major>.<minor>.<patch>` tag may briefly resolve first to the original tagged
+commit and then to the final release commit. Later releases do not retarget it
+again. Wait for the release workflow to finish before recording an exact release
+ref; use the final commit SHA when a permanently immutable pin is required.

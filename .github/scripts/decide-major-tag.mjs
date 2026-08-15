@@ -74,7 +74,7 @@ function decide() {
   );
   if (currentVersions.length === 0) {
     throw new Error(
-      `${majorTag} does not point to a known immutable stable release`,
+      `${majorTag} does not point to a known finalized stable release`,
     );
   }
   const currentVersion = currentVersions.reduce((left, right) =>

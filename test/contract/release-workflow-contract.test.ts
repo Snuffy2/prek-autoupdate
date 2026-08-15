@@ -498,7 +498,7 @@ describe("release workflow", () => {
     expect(calls).toContain(`-f majorAfterOid=${targetSha}`);
   });
 
-  it("verifies the exact immutable release ref before reading tag lists", () => {
+  it("verifies the exact finalized release ref before reading tag lists", () => {
     const targetSha = "2".repeat(40);
     const calls = runReleaseUpdate(
       "v1.10.0",
@@ -544,7 +544,7 @@ describe("release workflow", () => {
     expect(calls).toContain(`-f majorAfterOid=${targetSha}`);
   });
 
-  it("fails closed when the exact immutable release ref does not match", () => {
+  it("fails closed when the exact finalized release ref does not match", () => {
     const targetSha = "2".repeat(40);
 
     expect(() =>
@@ -557,10 +557,10 @@ describe("release workflow", () => {
         undefined,
         "3".repeat(40),
       ),
-    ).toThrow(/does not match its exact immutable tag ref/u);
+    ).toThrow(/does not match its exact finalized tag ref/u);
   });
 
-  it("fails closed when immutable release tag peeling exceeds the safe limit", () => {
+  it("fails closed when finalized release tag peeling exceeds the safe limit", () => {
     const targetSha = "2".repeat(40);
 
     expect(() =>
@@ -672,7 +672,7 @@ describe("release workflow", () => {
         { name: "v2", commit: { sha: "f".repeat(40) } },
         { name: "v2.10.12", commit: { sha: targetSha } },
       ]),
-    ).toThrow(/known immutable stable release/);
+    ).toThrow(/known finalized stable release/);
   });
 
   it("ignores tags without a successfully published stable release", () => {

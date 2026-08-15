@@ -51,7 +51,7 @@ verify_point_tag() {
       sleep "$attempt"
     fi
   done
-  echo "Verified release SHA does not match its exact immutable tag ref" >&2
+  echo "Verified release SHA does not match its exact finalized tag ref" >&2
   exit 1
 }
 
