@@ -215,7 +215,14 @@ function runReleaseUpdate(
     prerelease: boolean;
     published_at: string | null;
   }>,
-  failure: "none" | "release-tag-move" | "create-race" = "none",
+  failure:
+    | "none"
+    | "release-tag-move"
+    | "create-race"
+    | "major-ref-read"
+    | "major-ref-malformed"
+    | "major-peel-read"
+    | "major-peel-malformed" = "none",
   directRefOid?: string,
   pointRefOid = targetSha,
   pointTagDepth = 0,
@@ -235,9 +242,16 @@ function runReleaseUpdate(
   const majorTag = `v${releaseMatch[1]}`;
   const movingTagCommitSha =
     tags.find((tag) => tag.name === majorTag)?.commit.sha ?? "";
-  const tagChain = (firstOid: string, depth: number, finalOid: string) => {
+  const tagChain = (
+    firstOid: string,
+    depth: number,
+    finalOid: string,
+    namespace: string,
+  ) => {
     const tagOids = Array.from({ length: depth }, (_, index) =>
-      index === 0 ? firstOid : (index + 1).toString(16).padStart(40, "0"),
+      index === 0
+        ? firstOid
+        : `${namespace}${(index + 1).toString(16).padStart(39, "0")}`,
     );
     return tagOids.map((oid, index) => ({
       oid,
@@ -247,16 +261,23 @@ function runReleaseUpdate(
   };
   const pointTagOid = "e".repeat(40);
   const observedDirectRefOid = directRefOid ?? movingTagCommitSha;
-  const pointChain = tagChain(pointTagOid, pointTagDepth, pointRefOid);
+  const pointChain = tagChain(pointTagOid, pointTagDepth, pointRefOid, "1");
   const movingChain = tagChain(
     observedDirectRefOid,
     movingTagDepth,
     movingTagCommitSha,
+    "2",
   );
-  const tagResponses = [...pointChain, ...movingChain]
+  const pointTagResponses = pointChain
     .map(
       ({ oid, nextOid, nextType }) =>
         `elif [[ "$*" == "api repos/$GITHUB_REPOSITORY/git/tags/${oid} --jq .object | [.sha, .type] | @tsv" ]]; then\n  printf '%s\\t%s\\n' '${nextOid}' '${nextType}'`,
+    )
+    .join("\n");
+  const movingTagResponses = movingChain
+    .map(
+      ({ oid, nextOid, nextType }) =>
+        `elif [[ "$*" == "api repos/$GITHUB_REPOSITORY/git/tags/${oid} --jq .object | [.sha, .type] | @tsv" ]]; then\n  [[ "$FAILURE" != "major-peel-read" ]] || exit 32\n  if [[ "$FAILURE" == "major-peel-malformed" ]]; then printf '%s\\n' 'incomplete'; exit 0; fi\n  printf '%s\\t%s\\n' '${nextOid}' '${nextType}'`,
     )
     .join("\n");
   writeFileSync(
@@ -271,8 +292,11 @@ elif [[ "$*" == *"releases?per_page=100"* ]]; then
 elif [[ "$*" == "api repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG --jq .object | [.sha, .type] | @tsv" ]]; then
   printf '%s\t%s\n' "$POINT_DIRECT_REF_OID" "$POINT_DIRECT_REF_TYPE"
 elif [[ "$*" == "api repos/$GITHUB_REPOSITORY/git/ref/tags/$MAJOR_TAG --jq .object | [.sha, .type] | @tsv" ]]; then
+  [[ "$FAILURE" != "major-ref-read" ]] || exit 31
+  if [[ "$FAILURE" == "major-ref-malformed" ]]; then printf '%s\n' 'not-an-object'; exit 0; fi
   printf '%s\t%s\n' "$DIRECT_REF_OID" "$DIRECT_REF_TYPE"
-${tagResponses}
+${pointTagResponses}
+${movingTagResponses}
 elif [[ "$*" == "api repos/$GITHUB_REPOSITORY --jq .node_id" ]]; then
   printf '%s\n' 'R_repo_node'
 elif [[ "$*" == api\\ graphql* ]]; then
@@ -358,6 +382,10 @@ describe("release workflow", () => {
     );
 
     expect(releaseWorkflow.permissions).toEqual({ contents: "read" });
+    expect({
+      ...releaseWorkflow.permissions,
+      ...releaseWorkflow.jobs.prepare.permissions,
+    }).toEqual({ contents: "read" });
     expect(releaseWorkflow.jobs.finalize.permissions).toEqual({
       actions: "read",
       contents: "write",
@@ -498,6 +526,38 @@ describe("release workflow", () => {
     expect(calls).toContain(`-f majorAfterOid=${targetSha}`);
   });
 
+  it("keeps multi-level point and moving tag peel chains distinct", () => {
+    const oldSha = "1".repeat(40);
+    const targetSha = "2".repeat(40);
+    const releases = ["v1.9.9", "v1.10.0"].map((tagName) => ({
+      tag_name: tagName,
+      draft: false,
+      prerelease: false,
+      published_at: "2026-01-01T00:00:00Z",
+    }));
+    const calls = runReleaseUpdate(
+      "v1.10.0",
+      targetSha,
+      [
+        { name: "v1", commit: { sha: oldSha } },
+        { name: "v1.9.9", commit: { sha: oldSha } },
+        { name: "v1.10.0", commit: { sha: targetSha } },
+      ],
+      releases,
+      "none",
+      "a".repeat(40),
+      targetSha,
+      2,
+      2,
+    );
+
+    const pointChainOid = `1${"2".padStart(39, "0")}`;
+    const movingChainOid = `2${"2".padStart(39, "0")}`;
+    expect(calls).toContain(`git/tags/${pointChainOid}`);
+    expect(calls).toContain(`git/tags/${movingChainOid}`);
+    expect(calls).toContain("api graphql");
+  });
+
   it("verifies the exact finalized release ref before reading tag lists", () => {
     const targetSha = "2".repeat(40);
     const calls = runReleaseUpdate(
@@ -575,6 +635,40 @@ describe("release workflow", () => {
         17,
       ),
     ).toThrow(/Annotated release tag exceeds maximum peel depth of 16/u);
+  });
+
+  it.each([
+    ["major-ref-read", /Unable to read major tag ref v1 from GitHub/u],
+    ["major-ref-malformed", /GitHub returned an invalid major tag ref v1/u],
+    ["major-peel-read", /Unable to read annotated major tag object/u],
+    [
+      "major-peel-malformed",
+      /GitHub returned an invalid annotated major tag object/u,
+    ],
+  ] as const)("fails closed with diagnostics for %s", (failure, message) => {
+    const oldSha = "1".repeat(40);
+    const targetSha = "2".repeat(40);
+    const releases = ["v1.9.9", "v1.10.0"].map((tagName) => ({
+      tag_name: tagName,
+      draft: false,
+      prerelease: false,
+      published_at: "2026-01-01T00:00:00Z",
+    }));
+
+    expect(() =>
+      runReleaseUpdate(
+        "v1.10.0",
+        targetSha,
+        [
+          { name: "v1", commit: { sha: oldSha } },
+          { name: "v1.9.9", commit: { sha: oldSha } },
+          { name: "v1.10.0", commit: { sha: targetSha } },
+        ],
+        releases,
+        failure,
+        "a".repeat(40),
+      ),
+    ).toThrow(message);
   });
 
   it("fails closed when moving major tag peeling exceeds the safe limit", () => {

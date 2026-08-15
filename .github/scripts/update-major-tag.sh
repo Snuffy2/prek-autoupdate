@@ -17,6 +17,19 @@ tags_file="$(mktemp)"
 releases_file="$(mktemp)"
 trap 'rm -f "$tags_file" "$releases_file"' EXIT
 
+read_git_object() {
+  local description="$1" endpoint="$2" response
+  if ! response="$(gh api "$endpoint" --jq '.object | [.sha, .type] | @tsv')"; then
+    echo "Unable to read $description from GitHub" >&2
+    return 1
+  fi
+  if [[ ! "$response" =~ ^([0-9a-f]{40})$'\t'(tag|commit)$ ]]; then
+    echo "GitHub returned an invalid $description; expected a 40-character object ID and tag or commit type" >&2
+    return 1
+  fi
+  printf '%s\n' "$response"
+}
+
 verify_point_tag() {
   local attempt depth direct_ref direct_oid object_oid object_type
   for attempt in 1 2 3 4 5; do
@@ -80,18 +93,18 @@ update)
     echo "$RELEASE_TAG changed while its update was being prepared" >&2
     exit 1
   fi
-  IFS=$'\t' read -r direct_before_oid direct_type < <(
-    gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$major_tag" \
-      --jq '.object | [.sha, .type] | @tsv'
-  )
+  major_ref="$(read_git_object \
+    "major tag ref $major_tag" \
+    "repos/$GITHUB_REPOSITORY/git/ref/tags/$major_tag")" || exit 1
+  IFS=$'\t' read -r direct_before_oid direct_type <<< "$major_ref"
   peeled_oid="$direct_before_oid"
   peeled_type="$direct_type"
   depth=0
   while [[ "$peeled_type" == "tag" && "$depth" -lt "$MAX_TAG_PEEL_DEPTH" ]]; do
-    IFS=$'\t' read -r peeled_oid peeled_type < <(
-      gh api "repos/$GITHUB_REPOSITORY/git/tags/$peeled_oid" \
-        --jq '.object | [.sha, .type] | @tsv'
-    )
+    peeled_object="$(read_git_object \
+      "annotated major tag object $peeled_oid" \
+      "repos/$GITHUB_REPOSITORY/git/tags/$peeled_oid")" || exit 1
+    IFS=$'\t' read -r peeled_oid peeled_type <<< "$peeled_object"
     ((depth += 1))
   done
   if [[ "$peeled_type" == "tag" ]]; then
