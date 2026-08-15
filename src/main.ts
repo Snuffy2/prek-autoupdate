@@ -18,8 +18,10 @@ import {
   validateCleanupConfiguration,
   validateUpdateConfiguration,
 } from "./update/index.js";
+import { versionBanner } from "./version.js";
 
 export async function runAction(now: Date = new Date()): Promise<void> {
+  core.info(versionBanner());
   const inputs = parseInputs();
   const client = github.getOctokit(inputs.token);
   const context = await resolveContext(client, inputs);

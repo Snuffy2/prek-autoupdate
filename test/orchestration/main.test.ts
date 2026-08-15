@@ -38,6 +38,9 @@ vi.mock("../../src/update/index.js", () => ({
 vi.mock("../../src/cleanup/index.js", () => ({
   cleanupUpdateBranches: vi.fn(),
 }));
+vi.mock("../../src/version.js", () => ({
+  versionBanner: vi.fn(() => "prek-autoupdate version sentinel"),
+}));
 
 const inputs: ActionInputs = {
   token: "token",
@@ -82,6 +85,13 @@ describe("runAction", () => {
       closedPullRequests: [],
       deletedBranches: [],
     });
+  });
+
+  it("logs the prek-autoupdate release version", async () => {
+    await runAction(new Date("2026-07-27T02:00:00Z"));
+
+    expect(core.info).toHaveBeenCalledWith("prek-autoupdate version sentinel");
+    expect(core.info).toHaveBeenCalledBefore(vi.mocked(parseInputs));
   });
 
   it("keeps the updated pull request during scheduled cleanup", async () => {

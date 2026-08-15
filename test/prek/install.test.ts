@@ -25,7 +25,7 @@ vi.mock("@actions/tool-cache", () => ({
   extractTar: vi.fn(),
   find: vi.fn(),
 }));
-vi.mock("@actions/core", () => ({ warning: vi.fn() }));
+vi.mock("@actions/core", () => ({ info: vi.fn(), warning: vi.fn() }));
 
 const httpMocks = vi.hoisted(() => ({
   dispose: vi.fn(),
@@ -262,6 +262,7 @@ describe("installPrek", () => {
     const installation = await installPrek();
 
     expect(installation.binary).toBe(extractedBinary);
+    expect(core.info).toHaveBeenCalledWith(`Running prek v${RELEASE.version}`);
     expect(HttpClient).toHaveBeenCalledWith("prek-autoupdate", [], {
       allowRedirects: false,
       allowRetries: false,

@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import commonjs from "@rollup/plugin-commonjs";
+import json from "@rollup/plugin-json";
 import { nodeResolve } from "@rollup/plugin-node-resolve";
 import ts from "typescript";
 
@@ -55,6 +56,7 @@ const config = {
   },
   plugins: [
     nodeResolve({ preferBuiltins: true }),
+    json(),
     commonjs(),
     typescript,
     stripTrailingWhitespace,

@@ -87,7 +87,9 @@ download corruption or modification of a cached archive, but the checksum is
 published by the same upstream release and is not an independent trust anchor.
 Each compatible latest upstream `prek` release with a numeric `vN.N.N` tag and
 the expected Linux archive/checksum layout is trusted automatically, so a new
-`prek-autoupdate` release is not required to pick it up.
+`prek-autoupdate` release is not required to pick it up. The workflow log
+reports the exact `prek-autoupdate` release and resolved `prek` release
+immediately before each is run.
 
 ## Inputs
 
@@ -154,4 +156,13 @@ login automatically, so `author-login` is not required.
 Use the moving major tag for stable updates. Each published, non-prerelease
 `v<major>.<minor>.<patch>` release creates or moves its corresponding `v<major>`
 tag to that release commit. For example, publishing `v3.1.0` creates or moves
-`v3`. Immutable release tags are never rewritten.
+`v3`.
+
+The release workflow validates the published source, prepares the package
+metadata and bundled Action, then atomically commits those files and retargets
+the newly published point tag to the final release commit. Because GitHub
+publishes the point tag before this workflow runs, an exact
+`v<major>.<minor>.<patch>` tag may briefly resolve first to the original tagged
+commit and then to the final release commit. Later releases do not retarget it
+again. Wait for the release workflow to finish before recording an exact release
+ref; use the final commit SHA when a permanently immutable pin is required.

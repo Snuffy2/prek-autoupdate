@@ -1,6 +1,6 @@
 {
   "name": "prek-autoupdate",
-  "version": "2.0.0",
+  "version": "2.0.2",
   "private": true,
   "description": "GitHub Action that opens and maintains prek auto-update pull requests",
   "type": "module",
@@ -26,6 +26,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@rollup/plugin-commonjs": "^29.0.0",
+    "@rollup/plugin-json": "^6.1.0",
     "@rollup/plugin-node-resolve": "^16.0.0",
     "@types/node": "^26.1.2",
     "@vitest/coverage-v8": "^4.0.0",
@@ -39,5 +40,8 @@
     "typescript-eslint": "^8.66.0",
     "vitest": "^4.0.0",
     "yaml": "^2.0.0"
+  },
+  "allowScripts": {
+    "fsevents": true
   }
 }
