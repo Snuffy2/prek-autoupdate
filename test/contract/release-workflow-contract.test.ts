@@ -13,6 +13,7 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
 interface WorkflowStep {
+  readonly id?: string;
   readonly uses?: string;
   readonly with?: Record<string, unknown>;
 }
@@ -373,6 +374,18 @@ describe("release workflow", () => {
     expect(() => prepareRelease("v2", "2.0.2")).toThrow(
       /vMAJOR\.MINOR\.PATCH/u,
     );
+  });
+
+  it("provisions prek before preparing release files", () => {
+    const steps = workflow().jobs.prepare.steps;
+    const setupIndex = steps.findIndex((step) =>
+      step.uses?.startsWith("j178/prek-action@"),
+    );
+    const preparationIndex = steps.findIndex((step) => step.id === "release");
+
+    expect(setupIndex).toBeGreaterThanOrEqual(0);
+    expect(steps[setupIndex]?.with?.["install-only"]).toBe(true);
+    expect(preparationIndex).toBeGreaterThan(setupIndex);
   });
 
   it("keeps release credentials scoped to write-capable jobs", () => {
