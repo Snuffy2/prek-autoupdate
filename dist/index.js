@@ -31659,16 +31659,17 @@ function requireDist () {
 	 * Parse a `Content-Type` header.
 	 */
 	function parse(header, options) {
+	    const stopChar = options?.comma === true ? COMMA : 65536; // Sentinel for "no stop char".
 	    const len = header.length;
-	    let index = skipOWS(header, 0, len);
+	    let index = skipOWS(header, options?.start ?? 0, len);
 	    const valueStart = index;
-	    index = skipValue(header, index, len);
+	    index = skipValue(header, index, len, stopChar);
 	    const valueEnd = trailingOWS(header, valueStart, index);
 	    const type = header.slice(valueStart, valueEnd).toLowerCase();
-	    const parameters = options?.parameters === false
-	        ? new NullObject()
-	        : parseParameters(header, index, len);
-	    return { type, parameters };
+	    if (options?.parameters === false) {
+	        return { type, index, parameters: new NullObject() };
+	    }
+	    return parseParameters(header, type, index, len, stopChar);
 	}
 	const SP = 32; // " "
 	const HTAB = 9; // "\t"
@@ -31676,16 +31677,21 @@ function requireDist () {
 	const EQ = 61; // "="
 	const DQUOTE = 34; // '"'
 	const BSLASH = 92; // "\\"
+	const COMMA = 44; // ","
 	/**
 	 * Parses the parameters of a `Content-Type` header starting at the given index.
 	 */
-	function parseParameters(header, index, len) {
+	function parseParameters(header, type, index, len, stopChar) {
 	    const parameters = new NullObject();
 	    parameter: while (index < len) {
+	        if (header.charCodeAt(index) === stopChar)
+	            break;
 	        index = skipOWS(header, index + 1 /* Skip over ; */, len);
 	        const keyStart = index;
 	        while (index < len) {
 	            const code = header.charCodeAt(index);
+	            if (code === stopChar)
+	                break parameter;
 	            if (code === SEMI)
 	                continue parameter;
 	            if (code === EQ) {
@@ -31698,7 +31704,7 @@ function requireDist () {
 	                    while (index < len) {
 	                        const code = header.charCodeAt(index++);
 	                        if (code === DQUOTE) {
-	                            index = skipValue(header, index, len);
+	                            index = skipValue(header, index, len, stopChar);
 	                            if (parameters[key] === undefined)
 	                                parameters[key] = value;
 	                            break;
@@ -31712,7 +31718,7 @@ function requireDist () {
 	                    continue parameter;
 	                }
 	                const valueStart = index;
-	                index = skipValue(header, index, len);
+	                index = skipValue(header, index, len, stopChar);
 	                if (parameters[key] === undefined) {
 	                    const valueEnd = trailingOWS(header, valueStart, index);
 	                    parameters[key] = header.slice(valueStart, valueEnd);
@@ -31722,15 +31728,15 @@ function requireDist () {
 	            index++;
 	        }
 	    }
-	    return parameters;
+	    return { type, index, parameters };
 	}
 	/**
-	 * Skip over characters until a semicolon.
+	 * Skip over characters until a semicolon or other exit character.
 	 */
-	function skipValue(str, index, len) {
+	function skipValue(str, index, len, stopChar) {
 	    while (index < len) {
-	        const char = str.charCodeAt(index);
-	        if (char === SEMI)
+	        const code = str.charCodeAt(index);
+	        if (code === SEMI || code === stopChar)
 	            break;
 	        index++;
 	    }
@@ -32387,7 +32393,7 @@ class RequestError extends Error {
 // pkg/dist-src/index.js
 
 // pkg/dist-src/version.js
-var VERSION$4 = "10.0.11";
+var VERSION$4 = "10.0.13";
 
 // pkg/dist-src/defaults.js
 var defaults_default = {
@@ -32518,7 +32524,10 @@ async function getResponseData(response) {
     } catch (err) {
       return text;
     }
-  } else if (mimetype.type.startsWith("text/") || mimetype.parameters.charset?.toLowerCase() === "utf-8") {
+  } else if (mimetype.type.startsWith("text/") || // `application/octet-stream` is the canonical "arbitrary binary" type
+  // (RFC 2046) and must never be decoded as text, even when the response
+  // carries a (misleading) `charset=utf-8` parameter — see #751.
+  mimetype.parameters.charset?.toLowerCase() === "utf-8" && mimetype.type !== "application/octet-stream") {
     return response.text().catch(noop$1);
   } else {
     return response.arrayBuffer().catch(
@@ -32597,6 +32606,9 @@ var GraphqlResponseError = class extends Error {
       Error.captureStackTrace(this, this.constructor);
     }
   }
+  request;
+  headers;
+  response;
   name = "GraphqlResponseError";
   errors;
   data;
@@ -32691,6 +32703,7 @@ function withCustomRequest(customRequest) {
     url: "/graphql"
   });
 }
+/* v8 ignore if -- @preserve */
 
 // pkg/dist-src/is-jwt.js
 var b64url = "(?:[a-zA-Z0-9_-]+)";
@@ -32745,7 +32758,7 @@ var createTokenAuth = function createTokenAuth2(token) {
   });
 };
 
-const VERSION$2 = "7.0.6";
+const VERSION$2 = "7.0.7";
 
 const noop = () => {
 };
