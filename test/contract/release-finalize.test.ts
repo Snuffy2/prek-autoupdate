@@ -41,6 +41,7 @@ function writeReleaseFiles(
 
 interface FinalizerOptions {
   branchSha?: string;
+  cachedDiffStatus?: number;
   changedPaths?: string[];
   noChanges?: boolean;
   mutatePrepared?: (directory: string) => void;
@@ -77,7 +78,7 @@ diff)
   fi
   if [[ "$2" == "--cached" && "$3" == "--quiet" ]]; then
     [[ "$NO_CHANGES" == "true" ]] && exit 0
-    exit 1
+    exit "$CACHED_DIFF_STATUS"
   fi
   ;;
 ls-remote)
@@ -116,6 +117,7 @@ exit 2
           env: {
             ...process.env,
             BRANCH_SHA: options.branchSha ?? SOURCE_SHA,
+            CACHED_DIFF_STATUS: String(options.cachedDiffStatus ?? 1),
             CALLS_PATH: callsPath,
             CHANGED_PATHS: (options.changedPaths ?? RELEASE_FILES).join("\n"),
             DEFAULT_BRANCH: "main",
@@ -187,6 +189,12 @@ describe("release finalization", () => {
 
     expect(result.output).toBe(`sha=${SOURCE_SHA}\n`);
     expect(result.calls).not.toContain("push --atomic");
+  });
+
+  it("does not mask an unexpected cached diff failure", () => {
+    expect(() => runFinalizer({ cachedDiffStatus: 2 })).toThrow(
+      "Command failed: git diff --cached --quiet",
+    );
   });
 
   it("rejects a prepared symlink", () => {

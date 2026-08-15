@@ -91,6 +91,7 @@ describe("runAction", () => {
     await runAction(new Date("2026-07-27T02:00:00Z"));
 
     expect(core.info).toHaveBeenCalledWith("prek-autoupdate version sentinel");
+    expect(core.info).toHaveBeenCalledBefore(vi.mocked(parseInputs));
   });
 
   it("keeps the updated pull request during scheduled cleanup", async () => {

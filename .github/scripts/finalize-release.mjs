@@ -119,8 +119,9 @@ function main() {
     git(["diff", "--cached", "--quiet"]);
     appendFileSync(outputPath, `sha=${sourceSha}\n`);
     return;
-  } catch {
-    // A nonzero diff result means the release commit still needs to be created.
+  } catch (error) {
+    if (error?.status !== 1) throw error;
+    // Exit status 1 means the release commit still needs to be created.
   }
 
   git(["config", "user.name", "github-actions[bot]"]);
