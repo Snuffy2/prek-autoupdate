@@ -264,6 +264,9 @@ describe("release workflow", () => {
     expect(releaseUpdateScript(releaseWorkflow)).toBe(
       "bash .github/scripts/update-major-tag.sh",
     );
+    expect(readFileSync(".github/scripts/prepare-release.sh", "utf8")).toMatch(
+      /^npm run test:coverage$/mu,
+    );
     expect(JSON.stringify(releaseWorkflow)).not.toContain("node <<");
   });
 
