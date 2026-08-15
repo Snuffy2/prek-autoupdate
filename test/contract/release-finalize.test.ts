@@ -45,6 +45,9 @@ interface FinalizerOptions {
   changedPaths?: string[];
   noChanges?: boolean;
   mutatePrepared?: (directory: string) => void;
+  statusOutput?: string;
+  tagCommitSha?: string;
+  tagSha?: string;
 }
 
 function runFinalizer(options: FinalizerOptions = {}): {
@@ -69,6 +72,7 @@ set -euo pipefail
 printf '%s\n' "$*" >> "$CALLS_PATH"
 case "$1" in
 status)
+  printf '%s' "$STATUS_OUTPUT"
   exit 0
   ;;
 diff)
@@ -83,7 +87,8 @@ diff)
   ;;
 ls-remote)
   printf '%s\trefs/heads/main\n' "$BRANCH_SHA"
-  printf '%s\trefs/tags/v2.0.3\n' "$SOURCE_SHA"
+  printf '%s\trefs/tags/v2.0.3\n' "$TAG_SHA"
+  printf '%s\trefs/tags/v2.0.3^{}\n' "$TAG_COMMIT_SHA"
   exit 0
   ;;
 add|config|commit)
@@ -130,6 +135,9 @@ exit 2
             RELEASE_TAG: "v2.0.3",
             NO_CHANGES: String(options.noChanges ?? false),
             SOURCE_SHA,
+            STATUS_OUTPUT: options.statusOutput ?? "",
+            TAG_COMMIT_SHA: options.tagCommitSha ?? SOURCE_SHA,
+            TAG_SHA: options.tagSha ?? SOURCE_SHA,
           },
           stdio: ["ignore", "pipe", "pipe"],
         },
@@ -181,6 +189,27 @@ describe("release finalization", () => {
   it("fails if the default branch advances during preparation", () => {
     expect(() => runFinalizer({ branchSha: "3".repeat(40) })).toThrow(
       "Default branch or release tag advanced during preparation",
+    );
+  });
+
+  it("fails if the release tag advances during preparation", () => {
+    expect(() => runFinalizer({ tagCommitSha: "3".repeat(40) })).toThrow(
+      "Default branch or release tag advanced during preparation",
+    );
+  });
+
+  it("uses an annotated tag's peeled commit for freshness and tag object for the lease", () => {
+    const tagSha = "3".repeat(40);
+    const result = runFinalizer({ tagCommitSha: SOURCE_SHA, tagSha });
+
+    expect(result.calls).toContain(
+      `--force-with-lease=refs/tags/v2.0.3:${tagSha}`,
+    );
+  });
+
+  it("rejects a dirty release checkout", () => {
+    expect(() => runFinalizer({ statusOutput: " M package.json\n" })).toThrow(
+      "Release checkout must start clean",
     );
   });
 

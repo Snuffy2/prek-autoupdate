@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "Release source checkout must start clean" >&2
   exit 1
 fi
 
-node .github/scripts/prepare-release.mjs
+node "$script_directory/prepare-release.mjs"
 npm run build
 npm run format:check
 npm run lint
