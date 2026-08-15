@@ -18,10 +18,10 @@ import {
   validateCleanupConfiguration,
   validateUpdateConfiguration,
 } from "./update/index.js";
-import { ACTION_VERSION } from "./version.js";
+import { versionBanner } from "./version.js";
 
 export async function runAction(now: Date = new Date()): Promise<void> {
-  core.info(`Running prek-autoupdate v${ACTION_VERSION}`);
+  core.info(versionBanner());
   const inputs = parseInputs();
   const client = github.getOctokit(inputs.token);
   const context = await resolveContext(client, inputs);

@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
-import { ACTION_VERSION } from "../../src/version.js";
+import { versionBanner } from "../../src/version.js";
 
 interface PackageMetadata {
   readonly version: string;
@@ -14,6 +14,8 @@ describe("release version", () => {
       readFileSync("package.json", "utf8"),
     ) as PackageMetadata;
 
-    expect(ACTION_VERSION).toBe(packageMetadata.version);
+    expect(versionBanner()).toBe(
+      `prek-autoupdate version v${packageMetadata.version}`,
+    );
   });
 });

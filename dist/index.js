@@ -40640,11 +40640,17 @@ async function gitExit(workspace, arguments_) {
     }
 }
 
-/** Exact prek-autoupdate release version embedded in the action bundle. */
-const ACTION_VERSION = "2.0.2";
+var version = "2.0.2";
+var packageMetadata = {
+	version: version};
+
+/** Return the version banner shown at the start of each action run. */
+function versionBanner() {
+    return `prek-autoupdate version v${packageMetadata.version}`;
+}
 
 async function runAction(now = new Date()) {
-    info(`Running prek-autoupdate v${ACTION_VERSION}`);
+    info(versionBanner());
     const inputs = parseInputs();
     const client = getOctokit(inputs.token);
     const context = await resolveContext(client, inputs);

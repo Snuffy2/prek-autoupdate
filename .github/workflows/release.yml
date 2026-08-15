@@ -1,21 +1,26 @@
-name: Update Major Version Tag
+name: Release
 
 on:
   release:
-    types: [published]
+    types:
+      - published
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
-  verify:
-    name: Verify immutable release
-    if: ${{ !github.event.release.draft && !github.event.release.prerelease }}
+  prepare:
+    if: github.event.release.prerelease == false
     outputs:
-      release-sha: ${{ steps.release.outputs.sha }}
+      major-tag: ${{ steps.release.outputs.major-tag }}
+      source-sha: ${{ steps.release.outputs.source-sha }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout immutable release
+      - name: Check out published release source
         uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name }}
@@ -25,121 +30,93 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: 24
           cache: npm
 
-      - name: Install dependencies
-        run: npm ci
+      - run: npm ci
 
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Test with coverage
-        run: npm run test:coverage
-
-      - name: Verify bundled action
-        run: npm run check:dist
-
-      - name: Record verified release
+      - name: Prepare and validate release files
         id: release
-        run: echo "sha=$(git rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: bash .github/scripts/prepare-release.sh
 
-  update-major:
-    name: Move major version tag
-    needs: verify
-    concurrency:
-      group: update-major-version-tag-${{ github.repository }}
-      cancel-in-progress: false
+      - name: Upload prepared release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/index.js
+            package-lock.json
+            package.json
+          if-no-files-found: error
+          retention-days: 1
+
+  finalize:
+    needs: prepare
+    # Read the prepared artifact, then rewrite the default branch and release tag.
     permissions:
+      actions: read
       contents: write
+    outputs:
+      release-sha: ${{ steps.release.outputs.sha }}
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve major version tag
-        id: version
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          set -euo pipefail
-
-          if [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "major_tag=v${BASH_REMATCH[1]}" >>"${GITHUB_OUTPUT}"
-            echo "valid=true" >>"${GITHUB_OUTPUT}"
-          else
-            echo "::notice::${RELEASE_TAG} is not a stable v-prefixed semantic version tag; no major tag will be moved."
-            echo "valid=false" >>"${GITHUB_OUTPUT}"
-          fi
-
-      - name: Checkout release
-        if: ${{ steps.version.outputs.valid == 'true' }}
+      - name: Check out trusted release tooling
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name }}
-          fetch-depth: 0
-          persist-credentials: true
+          ref: ${{ github.workflow_sha }}
+          path: tooling
+          sparse-checkout: .github/scripts
+          persist-credentials: false
 
-      - name: Move major tag to the released commit
-        if: ${{ steps.version.outputs.valid == 'true' }}
+      - name: Check out release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.source-sha }}
+          path: release
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download prepared release files
+        uses: actions/download-artifact@v8
+        with:
+          name: release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: prepared
+
+      - name: Commit release files and rewrite published tag
+        id: release
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          PREPARED_DIRECTORY: ${{ github.workspace }}/prepared
+          RELEASE_DIRECTORY: ${{ github.workspace }}/release
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source-sha }}
+        run: node tooling/.github/scripts/finalize-release.mjs
+
+  update-major:
+    needs: [prepare, finalize]
+    # Move or create the verified major tag; no other repository writes are needed.
+    permissions:
+      contents: write
+    concurrency:
+      group:
+        release-major-${{ github.repository }}-${{
+        needs.prepare.outputs.major-tag }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Update moving major tag
         env:
           GH_TOKEN: ${{ github.token }}
-          MAJOR_TAG: ${{ steps.version.outputs.major_tag }}
-          REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-          TARGET_SHA: ${{ needs.verify.outputs.release-sha }}
-        run: |
-          set -euo pipefail
-
-          if [[ ! "${TARGET_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::Verified release SHA is invalid."
-            exit 1
-          fi
-
-          release_sha="$(git rev-parse "${RELEASE_TAG}^{commit}")"
-          if [[ "${release_sha}" != "${TARGET_SHA}" ]]; then
-            echo "::error::Verified release SHA does not match ${RELEASE_TAG}."
-            exit 1
-          fi
-
-          releases='[]'
-          page=1
-          while true; do
-            response="$(
-              curl --fail-with-body --silent --show-error \
-                --header "Accept: application/vnd.github+json" \
-                --header "Authorization: Bearer ${GH_TOKEN}" \
-                --header "X-GitHub-Api-Version: 2022-11-28" \
-                "https://api.github.com/repos/${REPOSITORY}/releases?per_page=100&page=${page}"
-            )"
-            releases="$(jq --compact-output \
-              --argjson page_releases "${response}" \
-              '. + $page_releases' <<<"${releases}")"
-            if [[ "$(jq 'length' <<<"${response}")" -lt 100 ]]; then
-              break
-            fi
-            page=$((page + 1))
-          done
-
-          newest_major_release="$(
-            jq --raw-output --arg major_tag "${MAJOR_TAG}" '
-              map(select(
-                (.draft | not) and
-                (.prerelease | not) and
-                (.tag_name | test(
-                  "^" + $major_tag + "\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
-                ))
-              ))
-              | if length == 0 then "" else max_by(.published_at).tag_name end
-            ' <<<"${releases}"
-          )"
-          if [[ "${RELEASE_TAG}" != "${newest_major_release}" ]]; then
-            echo "::error::${RELEASE_TAG} is not the newest published stable ${MAJOR_TAG} release (${newest_major_release:-none})."
-            exit 1
-          fi
-
-          observed_major="$(
-            git ls-remote --refs origin "refs/tags/${MAJOR_TAG}" |
-              awk 'NR == 1 { print $1 }'
-          )"
-          git tag --force "${MAJOR_TAG}" "${TARGET_SHA}"
-          git push \
-            --force-with-lease="refs/tags/${MAJOR_TAG}:${observed_major}" \
-            origin "refs/tags/${MAJOR_TAG}"
+          TARGET_SHA: ${{ needs.finalize.outputs.release-sha }}
+        run: bash .github/scripts/update-major-tag.sh
