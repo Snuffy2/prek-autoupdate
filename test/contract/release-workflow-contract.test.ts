@@ -154,6 +154,72 @@ function prepareRelease(
   }
 }
 
+function runPreparationWithGitFailure(failure: "diff" | "ls-files"): void {
+  const directory = mkdtempSync(
+    join(tmpdir(), "prek-autoupdate-prepare-script-"),
+  );
+  const gitPath = join(directory, "git");
+  const nodePath = join(directory, "node");
+  const npmPath = join(directory, "npm");
+  writeFileSync(
+    gitPath,
+    `#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+"status --porcelain"|"diff --check")
+  exit 0
+  ;;
+"diff --name-only")
+  if [[ "$FAILURE" == "diff" ]]; then
+    echo "simulated git diff failure" >&2
+    exit 23
+  fi
+  exit 0
+  ;;
+"ls-files --others --exclude-standard")
+  if [[ "$FAILURE" == "ls-files" ]]; then
+    echo "simulated git ls-files failure" >&2
+    exit 24
+  fi
+  exit 0
+  ;;
+*)
+  echo "unexpected git call: $*" >&2
+  exit 2
+  ;;
+esac
+`,
+  );
+  writeFileSync(nodePath, "#!/usr/bin/env bash\nexit 0\n");
+  writeFileSync(npmPath, "#!/usr/bin/env bash\nexit 0\n");
+  chmodSync(gitPath, 0o755);
+  chmodSync(nodePath, 0o755);
+  chmodSync(npmPath, 0o755);
+  try {
+    try {
+      execFileSync("bash", [resolve(".github/scripts/prepare-release.sh")], {
+        cwd: directory,
+        env: {
+          ...process.env,
+          FAILURE: failure,
+          PATH: `${directory}:${process.env.PATH}`,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      const stderr = (error as { stderr?: Buffer | string }).stderr;
+      throw new Error(
+        stderr?.toString().trim() || "release preparation failed",
+        {
+          cause: error,
+        },
+      );
+    }
+  } finally {
+    rmSync(directory, { recursive: true });
+  }
+}
+
 function runReleaseUpdate(
   releaseWorkflow: Workflow,
   releaseTag: string,
@@ -308,6 +374,16 @@ describe("release workflow", () => {
     expect(JSON.stringify(releaseWorkflow)).not.toContain("node <<");
   });
 
+  it.each([
+    ["diff", "simulated git diff failure"],
+    ["ls-files", "simulated git ls-files failure"],
+  ] as const)(
+    "fails closed when git %s path collection fails",
+    (failure, message) => {
+      expect(() => runPreparationWithGitFailure(failure)).toThrow(message);
+    },
+  );
+
   it("updates package metadata to the published release version", () => {
     const prepared = prepareRelease("v2.0.3", "2.0.2");
 
@@ -327,6 +403,9 @@ describe("release workflow", () => {
 
   it("isolates release preparation from repository write credentials", () => {
     const releaseWorkflow = workflow();
+    const setupNode = releaseWorkflow.jobs.prepare.steps.find(
+      (step: { uses?: string }) => step.uses?.startsWith("actions/setup-node@"),
+    );
     const prepareCheckouts = releaseWorkflow.jobs.prepare.steps.filter(
       (step: { uses?: string }) => step.uses?.startsWith("actions/checkout@"),
     );
@@ -338,6 +417,11 @@ describe("release workflow", () => {
     );
 
     expect(releaseWorkflow.permissions).toEqual({ contents: "read" });
+    expect(setupNode?.with?.["node-version"]).toBe(24);
+    expect([undefined, false]).toContain(setupNode?.with?.cache);
+    expect([undefined, false]).toContain(
+      setupNode?.with?.["package-manager-cache"],
+    );
     expect(prepareCheckouts).toHaveLength(2);
     expect(prepareCheckouts[0]?.with).toMatchObject({
       "ref": "${{ github.event.release.tag_name }}",
@@ -543,9 +627,36 @@ describe("release workflow", () => {
       ],
     );
 
-    expect(calls.indexOf("git/ref/tags/v1.10.0")).toBeLessThan(
-      calls.indexOf("tags?per_page=100"),
+    const exactRefCall = "git/ref/tags/v1.10.0";
+    const tagListCall = "tags?per_page=100";
+    expect(calls).toContain(exactRefCall);
+    expect(calls).toContain(tagListCall);
+    expect(calls.indexOf(exactRefCall)).toBeLessThan(
+      calls.indexOf(tagListCall),
     );
+  });
+
+  it("accepts a stale paginated SHA after verifying the exact release ref", () => {
+    const releaseWorkflow = workflow();
+    const staleSha = "1".repeat(40);
+    const targetSha = "2".repeat(40);
+    const calls = runReleaseUpdate(
+      releaseWorkflow,
+      "v1.10.0",
+      targetSha,
+      [{ name: "v1.10.0", commit: { sha: staleSha } }],
+      [
+        {
+          tag_name: "v1.10.0",
+          draft: false,
+          prerelease: false,
+          published_at: "2026-01-01T00:00:00Z",
+        },
+      ],
+    );
+
+    expect(calls).toContain("git/ref/tags/v1.10.0");
+    expect(calls).toContain(`-f sha=${targetSha}`);
   });
 
   it("fails closed when the exact immutable release ref does not match", () => {
@@ -680,11 +791,6 @@ describe("release workflow", () => {
         { name: "v2.10.12", commit: { sha: targetSha } },
       ]),
     ).toThrow(/known immutable stable release/);
-    expect(() =>
-      decideRelease("v2.10.12", targetSha, [
-        { name: "v2.10.12", commit: { sha: "e".repeat(40) } },
-      ]),
-    ).toThrow(/does not match its immutable tag/);
   });
 
   it("ignores tags without a successfully published stable release", () => {

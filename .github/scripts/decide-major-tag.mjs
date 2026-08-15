@@ -61,8 +61,8 @@ function decide() {
     ];
   });
   const releaseRef = stableTags.find((tag) => tag.name === releaseTag);
-  if (!releaseRef || releaseRef.sha !== targetSha) {
-    throw new Error("Verified release SHA does not match its immutable tag");
+  if (!releaseRef) {
+    throw new Error("Verified release tag is missing from the stable tag list");
   }
 
   const current = tags.find((tag) => tag.name === majorTag);
