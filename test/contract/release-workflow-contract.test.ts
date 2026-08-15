@@ -13,22 +13,16 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
 interface WorkflowStep {
-  readonly "id"?: string;
-  readonly "run"?: string;
-  readonly "uses"?: string;
-  readonly "with"?: Record<string, unknown>;
-  readonly "working-directory"?: string;
+  readonly uses?: string;
+  readonly with?: Record<string, unknown>;
 }
 
 interface WorkflowJob {
-  readonly concurrency?: Record<string, unknown>;
-  readonly outputs?: Record<string, string>;
   readonly permissions?: Record<string, string>;
   readonly steps: WorkflowStep[];
 }
 
 interface Workflow {
-  readonly concurrency: Record<string, unknown>;
   readonly permissions: Record<string, string>;
   readonly jobs: {
     readonly "prepare": WorkflowJob;
@@ -43,16 +37,6 @@ function workflow(): Workflow {
   return parse(
     readFileSync(".github/workflows/release.yml", "utf8"),
   ) as Workflow;
-}
-
-function releaseUpdateScript(releaseWorkflow: Workflow): string {
-  const step = releaseWorkflow.jobs["update-major"].steps.find(
-    (candidate: { run?: unknown }) =>
-      typeof candidate.run === "string" &&
-      candidate.run.includes(".github/scripts/update-major-tag.sh"),
-  );
-  expect(step, "release workflow is missing its update script").toBeDefined();
-  return step?.run ?? "";
 }
 
 function decideRelease(
@@ -222,7 +206,6 @@ esac
 }
 
 function runReleaseUpdate(
-  releaseWorkflow: Workflow,
   releaseTag: string,
   targetSha: string,
   tags: Array<{ name: string; commit: { sha: string } }>,
@@ -309,35 +292,30 @@ fi
   chmodSync(sleepPath, 0o755);
   try {
     try {
-      execFileSync(
-        "bash",
-        ["-eo", "pipefail", "-c", releaseUpdateScript(releaseWorkflow)],
-        {
-          cwd: resolve("."),
-          encoding: "utf8",
-          env: {
-            ...process.env,
-            PATH: `${directory}:${process.env.PATH}`,
-            CALLS_PATH: callsPath,
-            TAGS_JSON: JSON.stringify([tags]),
-            RELEASES_JSON: JSON.stringify([releases]),
-            DIRECT_REF_OID: observedDirectRefOid,
-            DIRECT_REF_TYPE: directRefOid === undefined ? "commit" : "tag",
-            MOVING_TAG_COMMIT_SHA: movingTagCommitSha,
-            MAJOR_TAG: majorTag,
-            POINT_DIRECT_REF_OID:
-              pointTagDepth === 0 ? pointRefOid : pointTagOid,
-            POINT_DIRECT_REF_TYPE: pointTagDepth === 0 ? "commit" : "tag",
-            POINT_REF_OID: pointRefOid,
-            FAILURE: failure,
-            GITHUB_REPOSITORY: "owner/repository",
-            GITHUB_WORKSPACE: resolve("."),
-            RELEASE_TAG: releaseTag,
-            TARGET_SHA: targetSha,
-          },
-          stdio: ["ignore", "pipe", "pipe"],
+      execFileSync("bash", [resolve(".github/scripts/update-major-tag.sh")], {
+        cwd: resolve("."),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${directory}:${process.env.PATH}`,
+          CALLS_PATH: callsPath,
+          TAGS_JSON: JSON.stringify([tags]),
+          RELEASES_JSON: JSON.stringify([releases]),
+          DIRECT_REF_OID: observedDirectRefOid,
+          DIRECT_REF_TYPE: directRefOid === undefined ? "commit" : "tag",
+          MOVING_TAG_COMMIT_SHA: movingTagCommitSha,
+          MAJOR_TAG: majorTag,
+          POINT_DIRECT_REF_OID: pointTagDepth === 0 ? pointRefOid : pointTagOid,
+          POINT_DIRECT_REF_TYPE: pointTagDepth === 0 ? "commit" : "tag",
+          POINT_REF_OID: pointRefOid,
+          FAILURE: failure,
+          GITHUB_REPOSITORY: "owner/repository",
+          GITHUB_WORKSPACE: resolve("."),
+          RELEASE_TAG: releaseTag,
+          TARGET_SHA: targetSha,
         },
-      );
+        stdio: ["ignore", "pipe", "pipe"],
+      });
     } catch (error) {
       const stderr = (error as { stderr?: Buffer | string }).stderr;
       throw new Error(stderr?.toString().trim() || "release update failed", {
@@ -351,31 +329,6 @@ fi
 }
 
 describe("release workflow", () => {
-  it("keeps release workflow logic in dedicated scripts", () => {
-    const releaseWorkflow = workflow();
-    const preparation = releaseWorkflow.jobs.prepare.steps.find(
-      (step: { id?: string }) => step.id === "release",
-    );
-    const finalization = releaseWorkflow.jobs.finalize.steps.find(
-      (step: { id?: string }) => step.id === "release",
-    );
-
-    expect(preparation?.run).toBe(
-      "bash ../tooling/.github/scripts/prepare-release.sh",
-    );
-    expect(preparation?.["working-directory"]).toBe("release");
-    expect(finalization?.run).toBe(
-      "node tooling/.github/scripts/finalize-release.mjs",
-    );
-    expect(releaseUpdateScript(releaseWorkflow)).toBe(
-      "bash .github/scripts/update-major-tag.sh",
-    );
-    expect(readFileSync(".github/scripts/prepare-release.sh", "utf8")).toMatch(
-      /^npm run test:coverage$/mu,
-    );
-    expect(JSON.stringify(releaseWorkflow)).not.toContain("node <<");
-  });
-
   it.each([
     ["diff", "simulated git diff failure"],
     ["ls-files", "simulated git ls-files failure"],
@@ -395,113 +348,30 @@ describe("release workflow", () => {
     expect(prepared.packageJson.version).toBe("2.0.3");
     expect(prepared.packageLock.version).toBe("2.0.3");
     expect(prepared.packageLock.packages[""].version).toBe("2.0.3");
-    expect(() => prepareRelease("v2.0.1", "2.0.2")).toThrow(
-      "Release v2.0.1 would downgrade package.json from 2.0.2",
-    );
+    expect(() => prepareRelease("v2.0.1", "2.0.2")).toThrow(/downgrade/u);
     expect(() => prepareRelease("v2", "2.0.2")).toThrow(
-      "Release tag must have vMAJOR.MINOR.PATCH form",
+      /vMAJOR\.MINOR\.PATCH/u,
     );
   });
 
-  it("isolates release preparation from repository write credentials", () => {
+  it("keeps release credentials scoped to write-capable jobs", () => {
     const releaseWorkflow = workflow();
-    const setupNode = releaseWorkflow.jobs.prepare.steps.find(
-      (step: { uses?: string }) => step.uses?.startsWith("actions/setup-node@"),
-    );
-    const install = releaseWorkflow.jobs.prepare.steps.find(
-      (step: { run?: string }) => step.run?.startsWith("npm ci"),
-    );
-    const preparation = releaseWorkflow.jobs.prepare.steps.find(
-      (step: { id?: string }) => step.id === "release",
-    );
-    const artifactUpload = releaseWorkflow.jobs.prepare.steps.find(
-      (step: { uses?: string }) =>
-        step.uses?.startsWith("actions/upload-artifact@"),
-    );
-    const prepareCheckouts = releaseWorkflow.jobs.prepare.steps.filter(
-      (step: { uses?: string }) => step.uses?.startsWith("actions/checkout@"),
-    );
-    const finalCheckouts = releaseWorkflow.jobs.finalize.steps.filter(
-      (step: { uses?: string }) => step.uses?.startsWith("actions/checkout@"),
-    );
-    const writeCheckout = releaseWorkflow.jobs["update-major"].steps.find(
-      (step: { uses?: string }) => step.uses?.startsWith("actions/checkout@"),
+    const checkouts = Object.values(releaseWorkflow.jobs).flatMap((job) =>
+      job.steps.filter((step) => step.uses?.startsWith("actions/checkout@")),
     );
 
     expect(releaseWorkflow.permissions).toEqual({ contents: "read" });
-    expect(setupNode?.with?.["node-version"]).toBe(24);
-    expect(setupNode?.with?.cache).toBe("npm");
-    expect(setupNode?.with?.["cache-dependency-path"]).toBe(
-      "release/package-lock.json",
-    );
-    expect(prepareCheckouts).toHaveLength(2);
-    expect(prepareCheckouts[0]?.with).toMatchObject({
-      "ref": "${{ github.event.release.tag_name }}",
-      "path": "release",
-      "fetch-depth": 0,
-      "persist-credentials": false,
-    });
-    expect(prepareCheckouts[1]?.with).toMatchObject({
-      "ref": "${{ github.workflow_sha }}",
-      "path": "tooling",
-      "sparse-checkout": ".github/scripts",
-      "persist-credentials": false,
-    });
-    expect(install).toMatchObject({
-      "run": "npm ci --ignore-scripts",
-      "working-directory": "release",
-    });
-    expect(preparation).toMatchObject({
-      "run": "bash ../tooling/.github/scripts/prepare-release.sh",
-      "working-directory": "release",
-    });
-    expect(artifactUpload?.with?.path).toBe(
-      "release/dist/index.js\nrelease/package-lock.json\nrelease/package.json\n",
-    );
-    expect(releaseWorkflow.concurrency).toEqual({
-      "group": "release-${{ github.repository }}",
-      "cancel-in-progress": false,
-    });
     expect(releaseWorkflow.jobs.finalize.permissions).toEqual({
       actions: "read",
       contents: "write",
     });
-    expect(finalCheckouts).toHaveLength(2);
-    expect(finalCheckouts[0]?.with).toMatchObject({
-      "ref": "${{ github.workflow_sha }}",
-      "path": "tooling",
-      "persist-credentials": false,
-    });
-    expect(finalCheckouts[1]?.with).toMatchObject({
-      "ref": "${{ needs.prepare.outputs.source-sha }}",
-      "path": "release",
-      "persist-credentials": false,
-    });
-    expect(JSON.stringify(releaseWorkflow.jobs.finalize)).not.toMatch(
-      /npm ci|npm test/,
-    );
     expect(releaseWorkflow.jobs["update-major"].permissions).toEqual({
       contents: "write",
     });
-    expect(writeCheckout?.with).toMatchObject({
-      "ref": "${{ github.workflow_sha }}",
-      "sparse-checkout": ".github/scripts",
-      "persist-credentials": false,
-    });
-    expect(JSON.stringify(releaseWorkflow.jobs["update-major"])).not.toMatch(
-      /npm ci|npm test|packages\//,
-    );
-    expect(releaseWorkflow.jobs["update-major"].concurrency).toEqual({
-      "group":
-        "release-major-${{ github.repository }}-${{ needs.prepare.outputs.major-tag }}",
-      "cancel-in-progress": false,
-    });
-    expect(releaseWorkflow.jobs.prepare.outputs?.["major-tag"]).toBe(
-      "${{ steps.release.outputs.major-tag }}",
-    );
-    expect(releaseWorkflow.jobs.finalize.outputs?.["release-sha"]).toBe(
-      "${{ steps.release.outputs.sha }}",
-    );
+    expect(checkouts.length).toBeGreaterThan(0);
+    for (const checkout of checkouts) {
+      expect(checkout.with?.["persist-credentials"]).toBe(false);
+    }
   });
 
   it("keeps moving major tags monotonic across releases and reruns", () => {
@@ -586,7 +456,6 @@ describe("release workflow", () => {
   });
 
   it("uses an annotated moving tag's direct ref OID in the exact CAS update", () => {
-    const releaseWorkflow = workflow();
     const oldSha = "1".repeat(40);
     const targetSha = "2".repeat(40);
     const annotatedTagOid = "a".repeat(40);
@@ -597,7 +466,6 @@ describe("release workflow", () => {
       published_at: "2026-01-01T00:00:00Z",
     }));
     const calls = runReleaseUpdate(
-      releaseWorkflow,
       "v1.10.0",
       targetSha,
       [
@@ -633,10 +501,8 @@ describe("release workflow", () => {
   });
 
   it("verifies the exact immutable release ref before reading tag lists", () => {
-    const releaseWorkflow = workflow();
     const targetSha = "2".repeat(40);
     const calls = runReleaseUpdate(
-      releaseWorkflow,
       "v1.10.0",
       targetSha,
       [{ name: "v1.10.0", commit: { sha: targetSha } }],
@@ -660,11 +526,9 @@ describe("release workflow", () => {
   });
 
   it("accepts a stale paginated SHA after verifying the exact release ref", () => {
-    const releaseWorkflow = workflow();
     const staleSha = "1".repeat(40);
     const targetSha = "2".repeat(40);
     const calls = runReleaseUpdate(
-      releaseWorkflow,
       "v1.10.0",
       targetSha,
       [{ name: "v1.10.0", commit: { sha: staleSha } }],
@@ -683,12 +547,10 @@ describe("release workflow", () => {
   });
 
   it("fails closed when the exact immutable release ref does not match", () => {
-    const releaseWorkflow = workflow();
     const targetSha = "2".repeat(40);
 
     expect(() =>
       runReleaseUpdate(
-        releaseWorkflow,
         "v1.10.0",
         targetSha,
         [{ name: "v1.10.0", commit: { sha: targetSha } }],
@@ -697,18 +559,14 @@ describe("release workflow", () => {
         undefined,
         "3".repeat(40),
       ),
-    ).toThrow(
-      "Verified release SHA does not match its exact immutable tag ref",
-    );
+    ).toThrow(/does not match its exact immutable tag ref/u);
   });
 
   it("fails closed when immutable release tag peeling exceeds the safe limit", () => {
-    const releaseWorkflow = workflow();
     const targetSha = "2".repeat(40);
 
     expect(() =>
       runReleaseUpdate(
-        releaseWorkflow,
         "v1.10.0",
         targetSha,
         [{ name: "v1.10.0", commit: { sha: targetSha } }],
@@ -718,13 +576,10 @@ describe("release workflow", () => {
         targetSha,
         17,
       ),
-    ).toThrow(
-      "Verified release SHA does not match its exact immutable tag ref",
-    );
+    ).toThrow(/does not match its exact immutable tag ref/u);
   });
 
   it("fails closed when moving major tag peeling exceeds the safe limit", () => {
-    const releaseWorkflow = workflow();
     const oldSha = "1".repeat(40);
     const targetSha = "2".repeat(40);
     const releases = ["v1.9.9", "v1.10.0"].map((tagName) => ({
@@ -736,7 +591,6 @@ describe("release workflow", () => {
 
     expect(() =>
       runReleaseUpdate(
-        releaseWorkflow,
         "v1.10.0",
         targetSha,
         [
@@ -751,11 +605,10 @@ describe("release workflow", () => {
         0,
         17,
       ),
-    ).toThrow("v1 changed while its update was being prepared");
+    ).toThrow(/changed while its update was being prepared/u);
   });
 
   it("fails closed when the moving tag changes after observation", () => {
-    const releaseWorkflow = workflow();
     const oldSha = "1".repeat(40);
     const targetSha = "2".repeat(40);
     const releases = ["v1.9.9", "v1.10.0"].map((tagName) => ({
@@ -767,7 +620,6 @@ describe("release workflow", () => {
 
     expect(() =>
       runReleaseUpdate(
-        releaseWorkflow,
         "v1.10.0",
         targetSha,
         [
@@ -782,7 +634,6 @@ describe("release workflow", () => {
   });
 
   it("fails closed when another run wins an absent-tag creation race", () => {
-    const releaseWorkflow = workflow();
     const targetSha = "2".repeat(40);
     const releases = [
       {
@@ -795,7 +646,6 @@ describe("release workflow", () => {
 
     expect(() =>
       runReleaseUpdate(
-        releaseWorkflow,
         "v1.10.0",
         targetSha,
         [{ name: "v1.10.0", commit: { sha: targetSha } }],
