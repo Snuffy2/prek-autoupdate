@@ -24,6 +24,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name }}
+          path: release
           fetch-depth: 0
           persist-credentials: false
 
@@ -40,23 +41,26 @@ jobs:
         with:
           node-version: 24
           cache: npm
+          cache-dependency-path: release/package-lock.json
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
+        working-directory: release
 
       - name: Prepare and validate release files
         id: release
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: bash tooling/.github/scripts/prepare-release.sh
+        run: bash ../tooling/.github/scripts/prepare-release.sh
+        working-directory: release
 
       - name: Upload prepared release files
         uses: actions/upload-artifact@v7
         with:
           name: release-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            dist/index.js
-            package-lock.json
-            package.json
+            release/dist/index.js
+            release/package-lock.json
+            release/package.json
           if-no-files-found: error
           retention-days: 1
 

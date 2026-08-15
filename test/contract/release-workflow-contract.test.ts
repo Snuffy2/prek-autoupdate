@@ -13,10 +13,11 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
 interface WorkflowStep {
-  readonly id?: string;
-  readonly run?: string;
-  readonly uses?: string;
-  readonly with?: Record<string, unknown>;
+  readonly "id"?: string;
+  readonly "run"?: string;
+  readonly "uses"?: string;
+  readonly "with"?: Record<string, unknown>;
+  readonly "working-directory"?: string;
 }
 
 interface WorkflowJob {
@@ -360,8 +361,9 @@ describe("release workflow", () => {
     );
 
     expect(preparation?.run).toBe(
-      "bash tooling/.github/scripts/prepare-release.sh",
+      "bash ../tooling/.github/scripts/prepare-release.sh",
     );
+    expect(preparation?.["working-directory"]).toBe("release");
     expect(finalization?.run).toBe(
       "node tooling/.github/scripts/finalize-release.mjs",
     );
@@ -406,6 +408,16 @@ describe("release workflow", () => {
     const setupNode = releaseWorkflow.jobs.prepare.steps.find(
       (step: { uses?: string }) => step.uses?.startsWith("actions/setup-node@"),
     );
+    const install = releaseWorkflow.jobs.prepare.steps.find(
+      (step: { run?: string }) => step.run?.startsWith("npm ci"),
+    );
+    const preparation = releaseWorkflow.jobs.prepare.steps.find(
+      (step: { id?: string }) => step.id === "release",
+    );
+    const artifactUpload = releaseWorkflow.jobs.prepare.steps.find(
+      (step: { uses?: string }) =>
+        step.uses?.startsWith("actions/upload-artifact@"),
+    );
     const prepareCheckouts = releaseWorkflow.jobs.prepare.steps.filter(
       (step: { uses?: string }) => step.uses?.startsWith("actions/checkout@"),
     );
@@ -418,23 +430,34 @@ describe("release workflow", () => {
 
     expect(releaseWorkflow.permissions).toEqual({ contents: "read" });
     expect(setupNode?.with?.["node-version"]).toBe(24);
-    expect([undefined, false]).toContain(setupNode?.with?.cache);
-    expect([undefined, false]).toContain(
-      setupNode?.with?.["package-manager-cache"],
+    expect(setupNode?.with?.cache).toBe("npm");
+    expect(setupNode?.with?.["cache-dependency-path"]).toBe(
+      "release/package-lock.json",
     );
     expect(prepareCheckouts).toHaveLength(2);
     expect(prepareCheckouts[0]?.with).toMatchObject({
       "ref": "${{ github.event.release.tag_name }}",
+      "path": "release",
       "fetch-depth": 0,
       "persist-credentials": false,
     });
-    expect(prepareCheckouts[0]?.with?.path).toBeUndefined();
     expect(prepareCheckouts[1]?.with).toMatchObject({
       "ref": "${{ github.workflow_sha }}",
       "path": "tooling",
       "sparse-checkout": ".github/scripts",
       "persist-credentials": false,
     });
+    expect(install).toMatchObject({
+      "run": "npm ci --ignore-scripts",
+      "working-directory": "release",
+    });
+    expect(preparation).toMatchObject({
+      "run": "bash ../tooling/.github/scripts/prepare-release.sh",
+      "working-directory": "release",
+    });
+    expect(artifactUpload?.with?.path).toBe(
+      "release/dist/index.js\nrelease/package-lock.json\nrelease/package.json\n",
+    );
     expect(releaseWorkflow.concurrency).toEqual({
       "group": "release-${{ github.repository }}",
       "cancel-in-progress": false,
