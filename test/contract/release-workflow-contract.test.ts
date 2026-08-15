@@ -168,6 +168,8 @@ function runReleaseUpdate(
   failure: "none" | "external-move" | "create-race" = "none",
   directRefOid?: string,
   pointRefOid = targetSha,
+  pointTagDepth = 0,
+  movingTagDepth = directRefOid === undefined ? 0 : 1,
 ): string {
   const directory = mkdtempSync(
     join(tmpdir(), "prek-autoupdate-release-write-"),
@@ -183,7 +185,30 @@ function runReleaseUpdate(
   const majorTag = `v${releaseMatch[1]}`;
   const movingTagCommitSha =
     tags.find((tag) => tag.name === majorTag)?.commit.sha ?? "";
+  const tagChain = (firstOid: string, depth: number, finalOid: string) => {
+    const tagOids = Array.from({ length: depth }, (_, index) =>
+      index === 0 ? firstOid : (index + 1).toString(16).padStart(40, "0"),
+    );
+    return tagOids.map((oid, index) => ({
+      oid,
+      nextOid: tagOids[index + 1] ?? finalOid,
+      nextType: index + 1 < tagOids.length ? "tag" : "commit",
+    }));
+  };
+  const pointTagOid = "e".repeat(40);
   const observedDirectRefOid = directRefOid ?? movingTagCommitSha;
+  const pointChain = tagChain(pointTagOid, pointTagDepth, pointRefOid);
+  const movingChain = tagChain(
+    observedDirectRefOid,
+    movingTagDepth,
+    movingTagCommitSha,
+  );
+  const tagResponses = [...pointChain, ...movingChain]
+    .map(
+      ({ oid, nextOid, nextType }) =>
+        `elif [[ "$*" == "api repos/$GITHUB_REPOSITORY/git/tags/${oid} --jq .object | [.sha, .type] | @tsv" ]]; then\n  printf '%s\\t%s\\n' '${nextOid}' '${nextType}'`,
+    )
+    .join("\n");
   writeFileSync(
     ghPath,
     `#!/usr/bin/env bash
@@ -194,11 +219,10 @@ if [[ "$*" == *"tags?per_page=100"* ]]; then
 elif [[ "$*" == *"releases?per_page=100"* ]]; then
   printf '%s' "$RELEASES_JSON"
 elif [[ "$*" == "api repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG --jq .object | [.sha, .type] | @tsv" ]]; then
-  printf '%s\tcommit\n' "$POINT_REF_OID"
+  printf '%s\t%s\n' "$POINT_DIRECT_REF_OID" "$POINT_DIRECT_REF_TYPE"
 elif [[ "$*" == "api repos/$GITHUB_REPOSITORY/git/ref/tags/$MAJOR_TAG --jq .object | [.sha, .type] | @tsv" ]]; then
   printf '%s\t%s\n' "$DIRECT_REF_OID" "$DIRECT_REF_TYPE"
-elif [[ "$*" == "api repos/$GITHUB_REPOSITORY/git/tags/$DIRECT_REF_OID --jq .object | [.sha, .type] | @tsv" ]]; then
-  printf '%s\tcommit\n' "$MOVING_TAG_COMMIT_SHA"
+${tagResponses}
 elif [[ "$*" == "api repos/$GITHUB_REPOSITORY --jq .node_id" ]]; then
   printf '%s\n' 'R_repo_node'
 elif [[ "$*" == api\\ graphql* ]]; then
@@ -234,6 +258,9 @@ fi
             DIRECT_REF_TYPE: directRefOid === undefined ? "commit" : "tag",
             MOVING_TAG_COMMIT_SHA: movingTagCommitSha,
             MAJOR_TAG: majorTag,
+            POINT_DIRECT_REF_OID:
+              pointTagDepth === 0 ? pointRefOid : pointTagOid,
+            POINT_DIRECT_REF_TYPE: pointTagDepth === 0 ? "commit" : "tag",
             POINT_REF_OID: pointRefOid,
             FAILURE: failure,
             GITHUB_REPOSITORY: "owner/repository",
@@ -539,6 +566,58 @@ describe("release workflow", () => {
     ).toThrow(
       "Verified release SHA does not match its exact immutable tag ref",
     );
+  });
+
+  it("fails closed when immutable release tag peeling exceeds the safe limit", () => {
+    const releaseWorkflow = workflow();
+    const targetSha = "2".repeat(40);
+
+    expect(() =>
+      runReleaseUpdate(
+        releaseWorkflow,
+        "v1.10.0",
+        targetSha,
+        [{ name: "v1.10.0", commit: { sha: targetSha } }],
+        [],
+        "none",
+        undefined,
+        targetSha,
+        17,
+      ),
+    ).toThrow(
+      "Verified release SHA does not match its exact immutable tag ref",
+    );
+  });
+
+  it("fails closed when moving major tag peeling exceeds the safe limit", () => {
+    const releaseWorkflow = workflow();
+    const oldSha = "1".repeat(40);
+    const targetSha = "2".repeat(40);
+    const releases = ["v1.9.9", "v1.10.0"].map((tagName) => ({
+      tag_name: tagName,
+      draft: false,
+      prerelease: false,
+      published_at: "2026-01-01T00:00:00Z",
+    }));
+
+    expect(() =>
+      runReleaseUpdate(
+        releaseWorkflow,
+        "v1.10.0",
+        targetSha,
+        [
+          { name: "v1", commit: { sha: oldSha } },
+          { name: "v1.9.9", commit: { sha: oldSha } },
+          { name: "v1.10.0", commit: { sha: targetSha } },
+        ],
+        releases,
+        "none",
+        "a".repeat(40),
+        targetSha,
+        0,
+        17,
+      ),
+    ).toThrow("v1 changed while its update was being prepared");
   });
 
   it("fails closed when the moving tag changes after observation", () => {

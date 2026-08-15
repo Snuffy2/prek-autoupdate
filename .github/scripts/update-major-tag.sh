@@ -6,6 +6,7 @@ if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]
   exit 1
 fi
 major_tag="v${BASH_REMATCH[1]}"
+readonly MAX_ANNOTATED_TAG_PEELS=16
 if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Verified release SHA is invalid" >&2
   exit 1
@@ -17,14 +18,19 @@ releases_file="$(mktemp)"
 trap 'rm -f "$tags_file" "$releases_file"' EXIT
 
 verify_point_tag() {
-  local attempt direct_ref object_oid object_type
+  local attempt direct_ref object_oid object_type peel_count
   for attempt in 1 2 3 4 5; do
     if direct_ref="$(
       gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
         --jq '.object | [.sha, .type] | @tsv' 2>/dev/null
     )"; then
       IFS=$'\t' read -r object_oid object_type <<< "$direct_ref"
+      peel_count=0
       while [[ "$object_type" == "tag" ]]; do
+        if (( peel_count >= MAX_ANNOTATED_TAG_PEELS )); then
+          object_type=""
+          break
+        fi
         if ! direct_ref="$(
           gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_oid" \
             --jq '.object | [.sha, .type] | @tsv' 2>/dev/null
@@ -33,6 +39,7 @@ verify_point_tag() {
           break
         fi
         IFS=$'\t' read -r object_oid object_type <<< "$direct_ref"
+        ((peel_count += 1))
       done
       if [[ "$object_type" == "commit" && "$object_oid" == "$TARGET_SHA" ]]; then
         return
@@ -72,11 +79,17 @@ update)
   )
   peeled_oid="$direct_before_oid"
   peeled_type="$direct_type"
+  peel_count=0
   while [[ "$peeled_type" == "tag" ]]; do
+    if (( peel_count >= MAX_ANNOTATED_TAG_PEELS )); then
+      peeled_type=""
+      break
+    fi
     IFS=$'\t' read -r peeled_oid peeled_type < <(
       gh api "repos/$GITHUB_REPOSITORY/git/tags/$peeled_oid" \
         --jq '.object | [.sha, .type] | @tsv'
     )
+    ((peel_count += 1))
   done
   if [[ "$peeled_type" != "commit" || "$peeled_oid" != "$before_oid" ]]; then
     echo "$major_tag changed while its update was being prepared" >&2
