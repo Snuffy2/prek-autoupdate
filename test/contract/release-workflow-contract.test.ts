@@ -330,8 +330,8 @@ fi
 
 describe("release workflow", () => {
   it.each([
-    ["diff", "simulated git diff failure"],
-    ["ls-files", "simulated git ls-files failure"],
+    ["diff", "Unable to collect changed release paths"],
+    ["ls-files", "Unable to collect untracked release paths"],
   ] as const)(
     "fails closed when git %s path collection fails",
     (failure, message) => {
