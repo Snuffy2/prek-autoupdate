@@ -43,6 +43,11 @@ jobs:
           cache: npm
           cache-dependency-path: release/package-lock.json
 
+      - name: Set up prek
+        uses: j178/prek-action@v2
+        with:
+          install-only: true
+
       - run: npm ci --ignore-scripts
         working-directory: release
 
