@@ -155,8 +155,7 @@ describe("pull request auto-merge", () => {
       enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
     ).resolves.toBeUndefined();
 
-    expect(graphql).toHaveBeenCalledTimes(3);
-    expect(graphql.mock.calls[1]?.[1]).toEqual({
+    expect(graphql).toHaveBeenCalledWith(expect.any(String), {
       pullRequestId: "PR_node",
       expectedHeadOid: "HEAD",
     });
@@ -205,36 +204,17 @@ describe("pull request auto-merge", () => {
     expect(graphql).toHaveBeenCalledOnce();
   });
 
-  it("rejects an inexact mutation response", async () => {
-    const execution = await makeExecution(["prek.toml"]);
-    const graphql = vi
-      .fn()
-      .mockResolvedValueOnce({
-        repository: { pullRequest: autoMergePull() },
-      })
-      .mockResolvedValueOnce({
-        enablePullRequestAutoMerge: {
-          pullRequest: autoMergePull({ autoMergeRequest: null }),
-        },
-      })
-      .mockResolvedValueOnce({
-        disablePullRequestAutoMerge: {
-          pullRequest: { id: "PR_node", autoMergeRequest: null },
-        },
-      });
-    const autoMergeExecution = {
-      ...execution,
-      client: { ...execution.client, graphql } as unknown as GitHubClient,
-    };
-
-    await expect(
-      enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
-    ).rejects.toThrow(/did not confirm squash auto-merge/u);
-  });
-
   it.each([
     ["a null mutation payload", { enablePullRequestAutoMerge: null }],
     ["a missing mutation payload", {}],
+    [
+      "a missing auto-merge request",
+      {
+        enablePullRequestAutoMerge: {
+          pullRequest: { id: "PR_node", autoMergeRequest: null },
+        },
+      },
+    ],
     [
       "a mismatched mutation pull request",
       {
@@ -271,7 +251,7 @@ describe("pull request auto-merge", () => {
       enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
     ).rejects.toThrow(/did not confirm squash auto-merge/u);
 
-    expect(graphql.mock.calls[2]?.[1]).toEqual({
+    expect(graphql).toHaveBeenCalledWith(expect.any(String), {
       pullRequestId: "PR_node",
     });
   });

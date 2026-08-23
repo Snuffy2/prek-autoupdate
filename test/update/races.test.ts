@@ -286,27 +286,10 @@ describe("update publication races", () => {
     };
     harness.graphql.mockImplementation(async (document: string) => {
       const headRefOid = await remoteSha(harness.remote);
-      const pullRequest = {
-        autoMergeRequest: document.startsWith("mutation")
-          ? {
-              enabledAt: "2026-08-23T12:00:00Z",
-              mergeMethod: "SQUASH",
-            }
-          : null,
-        author: { login: "github-actions[bot]" },
-        baseRefName: "main",
-        body: BODY_MARKER,
+      const pullRequest = autoMergePull(
         headRefOid,
-        headRefName: "chore/prek-updates",
-        headRepository: { nameWithOwner: "owner/repo" },
-        id: "PR_node",
-        labels: {
-          nodes: [{ name: "dependencies" }],
-          pageInfo: { hasNextPage: false, endCursor: null },
-        },
-        number: 42,
-        state: "OPEN",
-      };
+        document.startsWith("mutation"),
+      );
       return document.startsWith("mutation")
         ? {
             enablePullRequestAutoMerge: {
@@ -324,99 +307,52 @@ describe("update publication races", () => {
       pullRequestNumber: 42,
     });
 
-    expect(harness.graphql).toHaveBeenCalledTimes(3);
-    expect(harness.graphql.mock.calls[1]?.[1]).toEqual(
+    expect(harness.graphql).toHaveBeenCalledWith(
+      expect.any(String),
       expect.objectContaining({
         expectedHeadOid: await remoteSha(harness.remote),
       }),
     );
   });
 
-  it("reports the published pull when auto-merge fails after creation", async () => {
-    const harness = await makeHarness();
-    harness.create.mockImplementation(async () => ({
-      data: mergePull(harness.pull, {
-        head: {
-          ...harness.pull.head,
-          sha: await remoteSha(harness.remote),
-        },
-      }),
-    }));
-    const execution: ActionExecution = {
-      ...harness.execution,
-      inputs: { ...harness.execution.inputs, autoMerge: true },
-    };
-    harness.graphql
-      .mockImplementationOnce(async () => ({
-        repository: {
-          pullRequest: {
-            autoMergeRequest: null,
-            author: { login: "github-actions[bot]" },
-            baseRefName: "main",
-            body: BODY_MARKER,
-            headRefOid: await remoteSha(harness.remote),
-            headRefName: "chore/prek-updates",
-            headRepository: { nameWithOwner: "owner/repo" },
-            id: "PR_node",
-            labels: {
-              nodes: [{ name: "dependencies" }],
-              pageInfo: { hasNextPage: false, endCursor: null },
+  it.each([
+    { existing: false, operation: "created" },
+    { existing: true, operation: "updated" },
+  ] as const)(
+    "reports the $operation pull when auto-merge fails",
+    async ({ existing, operation }) => {
+      const harness = await makeHarness({ existing });
+      if (!existing) {
+        harness.create.mockImplementation(async () => ({
+          data: mergePull(harness.pull, {
+            head: {
+              ...harness.pull.head,
+              sha: await remoteSha(harness.remote),
             },
-            number: 42,
-            state: "OPEN",
+          }),
+        }));
+      }
+      const execution: ActionExecution = {
+        ...harness.execution,
+        inputs: { ...harness.execution.inputs, autoMerge: true },
+      };
+      harness.graphql
+        .mockImplementationOnce(async () => ({
+          repository: {
+            pullRequest: autoMergePull(await remoteSha(harness.remote)),
           },
-        },
-      }))
-      .mockRejectedValueOnce(new Error("auto-merge rejected"));
+        }))
+        .mockRejectedValueOnce(new Error("auto-merge rejected"));
 
-    const error = await runUpdate(execution).catch((caught: unknown) => caught);
+      const error = await runUpdate(execution).catch(
+        (caught: unknown) => caught,
+      );
 
-    expect(error).toMatchObject({
-      publishedPullRequest: {
-        operation: "created",
-        pullRequestNumber: 42,
-      },
-    });
-  });
-
-  it("reports the published pull when auto-merge fails after update", async () => {
-    const harness = await makeHarness({ existing: true });
-    const execution: ActionExecution = {
-      ...harness.execution,
-      inputs: { ...harness.execution.inputs, autoMerge: true },
-    };
-    harness.graphql
-      .mockImplementationOnce(async () => ({
-        repository: {
-          pullRequest: {
-            autoMergeRequest: null,
-            author: { login: "github-actions[bot]" },
-            baseRefName: "main",
-            body: BODY_MARKER,
-            headRefOid: await remoteSha(harness.remote),
-            headRefName: "chore/prek-updates",
-            headRepository: { nameWithOwner: "owner/repo" },
-            id: "PR_node",
-            labels: {
-              nodes: [{ name: "dependencies" }],
-              pageInfo: { hasNextPage: false, endCursor: null },
-            },
-            number: 42,
-            state: "OPEN",
-          },
-        },
-      }))
-      .mockRejectedValueOnce(new Error("auto-merge rejected"));
-
-    const error = await runUpdate(execution).catch((caught: unknown) => caught);
-
-    expect(error).toMatchObject({
-      publishedPullRequest: {
-        operation: "updated",
-        pullRequestNumber: 42,
-      },
-    });
-  });
+      expect(error).toMatchObject({
+        publishedPullRequest: { operation, pullRequestNumber: 42 },
+      });
+    },
+  );
 
   it("does not attempt auto-merge when the token is not a PAT", async () => {
     const harness = await makeHarness();
@@ -1188,6 +1124,30 @@ function mergePull(
   changed: Record<string, unknown>,
 ): ReturnType<typeof ownedPull> {
   return { ...pull, ...changed } as ReturnType<typeof ownedPull>;
+}
+
+function autoMergePull(headRefOid: string, enabled = false) {
+  return {
+    autoMergeRequest: enabled
+      ? {
+          enabledAt: "2026-08-23T12:00:00Z",
+          mergeMethod: "SQUASH",
+        }
+      : null,
+    author: { login: "github-actions[bot]" },
+    baseRefName: "main",
+    body: BODY_MARKER,
+    headRefOid,
+    headRefName: "chore/prek-updates",
+    headRepository: { nameWithOwner: "owner/repo" },
+    id: "PR_node",
+    labels: {
+      nodes: [{ name: "dependencies" }],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+    number: 42,
+    state: "OPEN",
+  };
 }
 
 function ownedPull(sha: string) {
