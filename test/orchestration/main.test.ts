@@ -3,7 +3,11 @@ import * as github from "@actions/github";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { cleanupUpdateBranches } from "../../src/cleanup/index.js";
-import type { ActionContext, ActionInputs } from "../../src/contracts.js";
+import {
+  PublishedPullRequestError,
+  type ActionContext,
+  type ActionInputs,
+} from "../../src/contracts.js";
 import {
   parseInputs,
   resolveContext,
@@ -141,6 +145,30 @@ describe("runAction", () => {
     expect(cleanupUpdateBranches).toHaveBeenCalledOnce();
     expect(core.setFailed).toHaveBeenCalledWith(
       "update: update failed; cleanup: cleanup failed",
+    );
+  });
+
+  it("protects a published pull when a post-publication step fails", async () => {
+    vi.mocked(runUpdate).mockRejectedValue(
+      new PublishedPullRequestError(
+        "created",
+        41,
+        new Error("auto-merge failed"),
+      ),
+    );
+
+    await runAction();
+
+    expect(cleanupUpdateBranches).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        keepPullRequestNumber: 41,
+        keepLatestOpenPullRequest: false,
+      }),
+    );
+    expect(core.setOutput).toHaveBeenCalledWith("pull-request-number", "41");
+    expect(core.setFailed).toHaveBeenCalledWith(
+      "update: Pull request #41 was created, but post-publication setup failed: Error: auto-merge failed",
     );
   });
 

@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
-import type { ActionExecution, UpdateResult } from "../contracts.js";
+import {
+  PublishedPullRequestError,
+  type ActionExecution,
+  type UpdateResult,
+} from "../contracts.js";
 import {
   hardenedGitArguments,
   sanitizedChildEnvironment,
@@ -182,7 +186,12 @@ export async function runUpdate(
       } catch (error) {
         await rollbackCreatedPullRequest(execution, pullNumber, newSha, error);
       }
-      await enableAutoMergeIfRequested(execution, pullNumber, newSha);
+      await enableAutoMergeForPublishedPull(
+        execution,
+        "created",
+        pullNumber,
+        newSha,
+      );
       return { operation: "created", pullRequestNumber: pullNumber };
     }
 
@@ -210,8 +219,9 @@ export async function runUpdate(
           body,
         )
       ) {
-        await enableAutoMergeIfRequested(
+        await enableAutoMergeForPublishedPull(
           execution,
+          "updated",
           remote.ownedPullRequest.number,
           newSha,
         );
@@ -224,6 +234,9 @@ export async function runUpdate(
         "GitHub returned an unexpected pull request after update",
       );
     } catch (error) {
+      if (error instanceof PublishedPullRequestError) {
+        throw error;
+      }
       pullUpdateError = error;
     }
     let verified: PullRequest;
@@ -243,8 +256,9 @@ export async function runUpdate(
           body,
         )
       ) {
-        await enableAutoMergeIfRequested(
+        await enableAutoMergeForPublishedPull(
           execution,
+          "updated",
           remote.ownedPullRequest.number,
           newSha,
         );
@@ -254,6 +268,9 @@ export async function runUpdate(
         };
       }
     } catch (verificationError) {
+      if (verificationError instanceof PublishedPullRequestError) {
+        throw verificationError;
+      }
       throw new Error(
         "Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved",
         { cause: new AggregateError([pullUpdateError, verificationError]) },
@@ -382,6 +399,15 @@ interface AutoMergeMutationResult {
   } | null;
 }
 
+interface AutoMergeDisableMutationResult {
+  readonly disablePullRequestAutoMerge: {
+    readonly pullRequest: Pick<
+      AutoMergePullRequest,
+      "autoMergeRequest" | "id"
+    > | null;
+  } | null;
+}
+
 async function enableAutoMergeIfRequested(
   execution: ActionExecution,
   pullNumber: number,
@@ -397,6 +423,19 @@ async function enableAutoMergeIfRequested(
     return;
   }
   await enablePullRequestAutoMerge(execution, pullNumber, expectedHeadOid);
+}
+
+async function enableAutoMergeForPublishedPull(
+  execution: ActionExecution,
+  operation: "created" | "updated",
+  pullNumber: number,
+  expectedHeadOid: string,
+): Promise<void> {
+  try {
+    await enableAutoMergeIfRequested(execution, pullNumber, expectedHeadOid);
+  } catch (error: unknown) {
+    throw new PublishedPullRequestError(operation, pullNumber, error);
+  }
 }
 
 /** Enable squash auto-merge only for the exact pull-request revision published. */
@@ -478,11 +517,47 @@ export async function enablePullRequestAutoMerge(
     !isOwnedAutoMergePull(execution, result, pullNumber, expectedHeadOid) ||
     result.autoMergeRequest?.mergeMethod !== "SQUASH"
   ) {
-    throw new Error(
+    const validationError = new Error(
       "GitHub did not confirm squash auto-merge for the exact pull-request revision",
     );
+    if (result?.id === pull.id && result.autoMergeRequest !== null) {
+      try {
+        await disableUnverifiedAutoMerge(execution, pull.id);
+      } catch (disableError: unknown) {
+        throw new Error(
+          "Auto-merge revalidation failed and GitHub did not confirm that the request was disabled",
+          { cause: new AggregateError([validationError, disableError]) },
+        );
+      }
+    }
+    throw validationError;
   }
   core.info(`Enabled squash auto-merge for pull request #${pullNumber}.`);
+}
+
+async function disableUnverifiedAutoMerge(
+  execution: ActionExecution,
+  pullRequestId: string,
+): Promise<void> {
+  const disabled =
+    await execution.client.graphql<AutoMergeDisableMutationResult>(
+      `mutation DisableUnverifiedPrekAutoupdateAutoMerge($pullRequestId: ID!) {
+        disablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId }) {
+          pullRequest {
+            id
+            autoMergeRequest { enabledAt mergeMethod }
+          }
+        }
+      }`,
+      { pullRequestId },
+    );
+  const result = disabled.disablePullRequestAutoMerge?.pullRequest;
+  if (result?.id !== pullRequestId || result.autoMergeRequest !== null) {
+    throw new Error("GitHub did not confirm that auto-merge was disabled");
+  }
+  core.warning(
+    "Disabled an auto-merge request after pull-request ownership revalidation failed",
+  );
 }
 
 function isOwnedAutoMergePull(

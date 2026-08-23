@@ -38,6 +38,24 @@ export interface UpdateResult {
   readonly operation: PullRequestOperation;
 }
 
+/** Failure after a pull request was safely published and must survive cleanup. */
+export class PublishedPullRequestError extends Error {
+  readonly publishedPullRequest: UpdateResult;
+
+  constructor(
+    operation: "created" | "updated",
+    pullRequestNumber: number,
+    cause: unknown,
+  ) {
+    super(
+      `Pull request #${pullRequestNumber} was ${operation}, but post-publication setup failed: ${String(cause)}`,
+      { cause },
+    );
+    this.name = "PublishedPullRequestError";
+    this.publishedPullRequest = { operation, pullRequestNumber };
+  }
+}
+
 export interface CleanupOptions {
   readonly keepPullRequestNumber?: number;
   readonly keepLatestOpenPullRequest: boolean;

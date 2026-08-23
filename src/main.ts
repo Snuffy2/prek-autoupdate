@@ -7,6 +7,7 @@ import type {
   CleanupResult,
   UpdateResult,
 } from "./contracts.js";
+import { PublishedPullRequestError } from "./contracts.js";
 import {
   parseInputs,
   resolveContext,
@@ -44,6 +45,9 @@ export async function runAction(now: Date = new Date()): Promise<void> {
       );
     }
   } catch (error: unknown) {
+    if (error instanceof PublishedPullRequestError) {
+      updateResult = error.publishedPullRequest;
+    }
     failures.push({ phase: "update", error });
   } finally {
     try {

@@ -216,6 +216,74 @@ describe("pull request auto-merge", () => {
       enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
     ).rejects.toThrow(/did not confirm squash auto-merge/u);
   });
+
+  it("disables auto-merge when post-mutation ownership revalidation fails", async () => {
+    const execution = await makeExecution(["prek.toml"]);
+    const changedPull = autoMergePull({
+      baseRefName: "unexpected-base",
+      autoMergeRequest: {
+        enabledAt: "2026-08-23T12:00:00Z",
+        mergeMethod: "SQUASH",
+      },
+    });
+    const graphql = vi
+      .fn()
+      .mockResolvedValueOnce({
+        repository: { pullRequest: autoMergePull() },
+      })
+      .mockResolvedValueOnce({
+        enablePullRequestAutoMerge: { pullRequest: changedPull },
+      })
+      .mockResolvedValueOnce({
+        disablePullRequestAutoMerge: {
+          pullRequest: { ...changedPull, autoMergeRequest: null },
+        },
+      });
+    const autoMergeExecution = {
+      ...execution,
+      client: { ...execution.client, graphql } as unknown as GitHubClient,
+    };
+
+    await expect(
+      enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
+    ).rejects.toThrow(/did not confirm squash auto-merge/u);
+
+    expect(graphql).toHaveBeenCalledTimes(3);
+    expect(graphql.mock.calls[2]?.[0]).toContain("disablePullRequestAutoMerge");
+    expect(graphql.mock.calls[2]?.[1]).toEqual({
+      pullRequestId: "PR_node",
+    });
+  });
+
+  it("fails clearly when rollback of unverified auto-merge is not confirmed", async () => {
+    const execution = await makeExecution(["prek.toml"]);
+    const changedPull = autoMergePull({
+      baseRefName: "unexpected-base",
+      autoMergeRequest: {
+        enabledAt: "2026-08-23T12:00:00Z",
+        mergeMethod: "SQUASH",
+      },
+    });
+    const graphql = vi
+      .fn()
+      .mockResolvedValueOnce({
+        repository: { pullRequest: autoMergePull() },
+      })
+      .mockResolvedValueOnce({
+        enablePullRequestAutoMerge: { pullRequest: changedPull },
+      })
+      .mockResolvedValueOnce({
+        disablePullRequestAutoMerge: { pullRequest: changedPull },
+      });
+    const autoMergeExecution = {
+      ...execution,
+      client: { ...execution.client, graphql } as unknown as GitHubClient,
+    };
+
+    await expect(
+      enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
+    ).rejects.toThrow(/did not confirm that the request was disabled/u);
+  });
 });
 
 describe("non-mutating update preflight", () => {
@@ -556,6 +624,7 @@ function autoMergePull(
       readonly enabledAt: string;
       readonly mergeMethod: string;
     } | null;
+    readonly baseRefName: string;
     readonly headRefOid: string;
     readonly id: string;
     readonly number: number;

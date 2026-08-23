@@ -36204,6 +36204,16 @@ function closedPullStillOwned(pull, candidate, policy) {
         isWorkflowPull(pull, policy));
 }
 
+/** Failure after a pull request was safely published and must survive cleanup. */
+class PublishedPullRequestError extends Error {
+    publishedPullRequest;
+    constructor(operation, pullRequestNumber, cause) {
+        super(`Pull request #${pullRequestNumber} was ${operation}, but post-publication setup failed: ${String(cause)}`, { cause });
+        this.name = "PublishedPullRequestError";
+        this.publishedPullRequest = { operation, pullRequestNumber };
+    }
+}
+
 const SUPPORTED_EVENTS = new Set([
     "push",
     "schedule",
@@ -39993,7 +40003,7 @@ async function runUpdate(execution) {
             catch (error) {
                 await rollbackCreatedPullRequest(execution, pullNumber, newSha, error);
             }
-            await enableAutoMergeIfRequested(execution, pullNumber, newSha);
+            await enableAutoMergeForPublishedPull(execution, "created", pullNumber, newSha);
             return { operation: "created", pullRequestNumber: pullNumber };
         }
         try {
@@ -40013,7 +40023,7 @@ async function runUpdate(execution) {
             });
             const updated = pullFromData(response.data);
             if (isExactUpdatedPull(execution, updated, remote.ownedPullRequest.number, newSha, body)) {
-                await enableAutoMergeIfRequested(execution, remote.ownedPullRequest.number, newSha);
+                await enableAutoMergeForPublishedPull(execution, "updated", remote.ownedPullRequest.number, newSha);
                 return {
                     operation: "updated",
                     pullRequestNumber: remote.ownedPullRequest.number,
@@ -40022,6 +40032,9 @@ async function runUpdate(execution) {
             pullUpdateError = new Error("GitHub returned an unexpected pull request after update");
         }
         catch (error) {
+            if (error instanceof PublishedPullRequestError) {
+                throw error;
+            }
             pullUpdateError = error;
         }
         let verified;
@@ -40033,7 +40046,7 @@ async function runUpdate(execution) {
             });
             verified = pullFromData(response.data);
             if (isExactUpdatedPull(execution, verified, remote.ownedPullRequest.number, newSha, body)) {
-                await enableAutoMergeIfRequested(execution, remote.ownedPullRequest.number, newSha);
+                await enableAutoMergeForPublishedPull(execution, "updated", remote.ownedPullRequest.number, newSha);
                 return {
                     operation: "updated",
                     pullRequestNumber: remote.ownedPullRequest.number,
@@ -40041,6 +40054,9 @@ async function runUpdate(execution) {
             }
         }
         catch (verificationError) {
+            if (verificationError instanceof PublishedPullRequestError) {
+                throw verificationError;
+            }
             throw new Error("Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved", { cause: new AggregateError([pullUpdateError, verificationError]) });
         }
         const verificationError = new Error("Fresh pull request verification was not exact");
@@ -40129,6 +40145,14 @@ async function enableAutoMergeIfRequested(execution, pullNumber, expectedHeadOid
     }
     await enablePullRequestAutoMerge(execution, pullNumber, expectedHeadOid);
 }
+async function enableAutoMergeForPublishedPull(execution, operation, pullNumber, expectedHeadOid) {
+    try {
+        await enableAutoMergeIfRequested(execution, pullNumber, expectedHeadOid);
+    }
+    catch (error) {
+        throw new PublishedPullRequestError(operation, pullNumber, error);
+    }
+}
 /** Enable squash auto-merge only for the exact pull-request revision published. */
 async function enablePullRequestAutoMerge(execution, pullNumber, expectedHeadOid) {
     const observed = await execution.client.graphql(`query PrekAutoupdatePullRequest($owner: String!, $repository: String!, $number: Int!) {
@@ -40189,9 +40213,33 @@ async function enablePullRequestAutoMerge(execution, pullNumber, expectedHeadOid
         result.id !== pull.id ||
         !isOwnedAutoMergePull(execution, result, pullNumber, expectedHeadOid) ||
         result.autoMergeRequest?.mergeMethod !== "SQUASH") {
-        throw new Error("GitHub did not confirm squash auto-merge for the exact pull-request revision");
+        const validationError = new Error("GitHub did not confirm squash auto-merge for the exact pull-request revision");
+        if (result?.id === pull.id && result.autoMergeRequest !== null) {
+            try {
+                await disableUnverifiedAutoMerge(execution, pull.id);
+            }
+            catch (disableError) {
+                throw new Error("Auto-merge revalidation failed and GitHub did not confirm that the request was disabled", { cause: new AggregateError([validationError, disableError]) });
+            }
+        }
+        throw validationError;
     }
     info(`Enabled squash auto-merge for pull request #${pullNumber}.`);
+}
+async function disableUnverifiedAutoMerge(execution, pullRequestId) {
+    const disabled = await execution.client.graphql(`mutation DisableUnverifiedPrekAutoupdateAutoMerge($pullRequestId: ID!) {
+        disablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId }) {
+          pullRequest {
+            id
+            autoMergeRequest { enabledAt mergeMethod }
+          }
+        }
+      }`, { pullRequestId });
+    const result = disabled.disablePullRequestAutoMerge?.pullRequest;
+    if (result?.id !== pullRequestId || result.autoMergeRequest !== null) {
+        throw new Error("GitHub did not confirm that auto-merge was disabled");
+    }
+    warning("Disabled an auto-merge request after pull-request ownership revalidation failed");
 }
 function isOwnedAutoMergePull(execution, pull, pullNumber, expectedHeadOid) {
     return (pull.author?.login === execution.context.authenticatedLogin &&
@@ -40785,6 +40833,9 @@ async function runAction(now = new Date()) {
         }
     }
     catch (error) {
+        if (error instanceof PublishedPullRequestError) {
+            updateResult = error.publishedPullRequest;
+        }
         failures.push({ phase: "update", error });
     }
     finally {
