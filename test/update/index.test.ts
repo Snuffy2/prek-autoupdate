@@ -127,6 +127,17 @@ describe("pull request auto-merge", () => {
       })
       .mockResolvedValueOnce({
         enablePullRequestAutoMerge: {
+          pullRequest: {
+            id: "PR_node",
+            autoMergeRequest: {
+              enabledAt: "2026-08-23T12:00:00Z",
+              mergeMethod: "SQUASH",
+            },
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        repository: {
           pullRequest: autoMergePull({
             autoMergeRequest: {
               enabledAt: "2026-08-23T12:00:00Z",
@@ -144,12 +155,11 @@ describe("pull request auto-merge", () => {
       enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
     ).resolves.toBeUndefined();
 
-    expect(graphql).toHaveBeenCalledTimes(2);
+    expect(graphql).toHaveBeenCalledTimes(3);
     expect(graphql.mock.calls[1]?.[1]).toEqual({
       pullRequestId: "PR_node",
       expectedHeadOid: "HEAD",
     });
-    expect(graphql.mock.calls[1]?.[0]).toContain("mergeMethod: SQUASH");
   });
 
   it("does not replace an existing auto-merge request", async () => {
@@ -206,6 +216,11 @@ describe("pull request auto-merge", () => {
         enablePullRequestAutoMerge: {
           pullRequest: autoMergePull({ autoMergeRequest: null }),
         },
+      })
+      .mockResolvedValueOnce({
+        disablePullRequestAutoMerge: {
+          pullRequest: { id: "PR_node", autoMergeRequest: null },
+        },
       });
     const autoMergeExecution = {
       ...execution,
@@ -215,6 +230,130 @@ describe("pull request auto-merge", () => {
     await expect(
       enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
     ).rejects.toThrow(/did not confirm squash auto-merge/u);
+  });
+
+  it.each([
+    ["a null mutation payload", { enablePullRequestAutoMerge: null }],
+    ["a missing mutation payload", {}],
+    [
+      "a mismatched mutation pull request",
+      {
+        enablePullRequestAutoMerge: {
+          pullRequest: autoMergePull({
+            id: "different-node",
+            autoMergeRequest: {
+              enabledAt: "2026-08-23T12:00:00Z",
+              mergeMethod: "SQUASH",
+            },
+          }),
+        },
+      },
+    ],
+  ])("disables auto-merge after %s", async (_name, mutation) => {
+    const execution = await makeExecution(["prek.toml"]);
+    const graphql = vi
+      .fn()
+      .mockResolvedValueOnce({
+        repository: { pullRequest: autoMergePull() },
+      })
+      .mockResolvedValueOnce(mutation)
+      .mockResolvedValueOnce({
+        disablePullRequestAutoMerge: {
+          pullRequest: { id: "PR_node", autoMergeRequest: null },
+        },
+      });
+    const autoMergeExecution = {
+      ...execution,
+      client: { ...execution.client, graphql } as unknown as GitHubClient,
+    };
+
+    await expect(
+      enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
+    ).rejects.toThrow(/did not confirm squash auto-merge/u);
+
+    expect(graphql.mock.calls[2]?.[1]).toEqual({
+      pullRequestId: "PR_node",
+    });
+  });
+
+  it("paginates labels before and after enabling auto-merge", async () => {
+    const execution = await makeExecution(["prek.toml"]);
+    const firstPageLabels = Array.from({ length: 100 }, (_, index) => ({
+      name: `label-${index}`,
+    }));
+    const preEnableFirstPage = autoMergePull({
+      labels: {
+        nodes: firstPageLabels,
+        pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
+      },
+    });
+    const preEnableSecondPage = autoMergePull({
+      labels: {
+        nodes: [{ name: "dependencies" }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    });
+    const postEnableFirstPage = autoMergePull({
+      autoMergeRequest: {
+        enabledAt: "2026-08-23T12:00:00Z",
+        mergeMethod: "SQUASH",
+      },
+      labels: {
+        nodes: firstPageLabels,
+        pageInfo: { hasNextPage: true, endCursor: "cursor-2" },
+      },
+    });
+    const postEnableSecondPage = autoMergePull({
+      autoMergeRequest: {
+        enabledAt: "2026-08-23T12:00:00Z",
+        mergeMethod: "SQUASH",
+      },
+      labels: {
+        nodes: [{ name: "dependencies" }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    });
+    const graphql = vi
+      .fn()
+      .mockResolvedValueOnce({
+        repository: { pullRequest: preEnableFirstPage },
+      })
+      .mockResolvedValueOnce({
+        repository: { pullRequest: preEnableSecondPage },
+      })
+      .mockResolvedValueOnce({
+        enablePullRequestAutoMerge: {
+          pullRequest: {
+            id: "PR_node",
+            autoMergeRequest: {
+              enabledAt: "2026-08-23T12:00:00Z",
+              mergeMethod: "SQUASH",
+            },
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        repository: { pullRequest: postEnableFirstPage },
+      })
+      .mockResolvedValueOnce({
+        repository: { pullRequest: postEnableSecondPage },
+      });
+    const autoMergeExecution = {
+      ...execution,
+      client: { ...execution.client, graphql } as unknown as GitHubClient,
+    };
+
+    await expect(
+      enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
+    ).resolves.toBeUndefined();
+
+    expect(graphql).toHaveBeenCalledTimes(5);
+    expect(graphql.mock.calls[1]?.[1]).toEqual(
+      expect.objectContaining({ labelsCursor: "cursor-1" }),
+    );
+    expect(graphql.mock.calls[4]?.[1]).toEqual(
+      expect.objectContaining({ labelsCursor: "cursor-2" }),
+    );
   });
 
   it("disables auto-merge when post-mutation ownership revalidation fails", async () => {
@@ -232,7 +371,18 @@ describe("pull request auto-merge", () => {
         repository: { pullRequest: autoMergePull() },
       })
       .mockResolvedValueOnce({
-        enablePullRequestAutoMerge: { pullRequest: changedPull },
+        enablePullRequestAutoMerge: {
+          pullRequest: {
+            id: "PR_node",
+            autoMergeRequest: {
+              enabledAt: "2026-08-23T12:00:00Z",
+              mergeMethod: "SQUASH",
+            },
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        repository: { pullRequest: changedPull },
       })
       .mockResolvedValueOnce({
         disablePullRequestAutoMerge: {
@@ -248,9 +398,8 @@ describe("pull request auto-merge", () => {
       enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
     ).rejects.toThrow(/did not confirm squash auto-merge/u);
 
-    expect(graphql).toHaveBeenCalledTimes(3);
-    expect(graphql.mock.calls[2]?.[0]).toContain("disablePullRequestAutoMerge");
-    expect(graphql.mock.calls[2]?.[1]).toEqual({
+    expect(graphql).toHaveBeenCalledTimes(4);
+    expect(graphql.mock.calls[3]?.[1]).toEqual({
       pullRequestId: "PR_node",
     });
   });
@@ -270,7 +419,18 @@ describe("pull request auto-merge", () => {
         repository: { pullRequest: autoMergePull() },
       })
       .mockResolvedValueOnce({
-        enablePullRequestAutoMerge: { pullRequest: changedPull },
+        enablePullRequestAutoMerge: {
+          pullRequest: {
+            id: "PR_node",
+            autoMergeRequest: {
+              enabledAt: "2026-08-23T12:00:00Z",
+              mergeMethod: "SQUASH",
+            },
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        repository: { pullRequest: changedPull },
       })
       .mockResolvedValueOnce({
         disablePullRequestAutoMerge: { pullRequest: changedPull },
@@ -627,6 +787,13 @@ function autoMergePull(
     readonly baseRefName: string;
     readonly headRefOid: string;
     readonly id: string;
+    readonly labels: {
+      readonly nodes: readonly { readonly name: string }[];
+      readonly pageInfo: {
+        readonly hasNextPage: boolean;
+        readonly endCursor: string | null;
+      };
+    };
     readonly number: number;
   }> = {},
 ): {
@@ -641,7 +808,13 @@ function autoMergePull(
   readonly headRefName: string;
   readonly headRepository: { readonly nameWithOwner: string } | null;
   readonly id: string;
-  readonly labels: { readonly nodes: readonly { readonly name: string }[] };
+  readonly labels: {
+    readonly nodes: readonly { readonly name: string }[];
+    readonly pageInfo: {
+      readonly hasNextPage: boolean;
+      readonly endCursor: string | null;
+    };
+  };
   readonly number: number;
   readonly state: string;
 } {
@@ -654,7 +827,10 @@ function autoMergePull(
     headRefName: "chore/prek-updates",
     headRepository: { nameWithOwner: "owner/repo" },
     id: "PR_node",
-    labels: { nodes: [{ name: "dependencies" }] },
+    labels: {
+      nodes: [{ name: "dependencies" }],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
     number: 42,
     state: "OPEN",
     ...overrides,

@@ -81,8 +81,7 @@ describe("documented caller", () => {
     expect(selfWorkflow.concurrency["cancel-in-progress"]).toBe(false);
     expect(job?.if).toBe("github.event.repository.fork == false");
     expect(job?.permissions).toEqual({
-      "contents": "write",
-      "pull-requests": "write",
+      contents: "read",
     });
     expect(checkout?.with?.["persist-credentials"]).toBe(false);
     expect(steps).toContainEqual(expect.objectContaining({ uses: "./" }));

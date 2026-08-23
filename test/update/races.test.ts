@@ -300,12 +300,22 @@ describe("update publication races", () => {
         headRefName: "chore/prek-updates",
         headRepository: { nameWithOwner: "owner/repo" },
         id: "PR_node",
-        labels: { nodes: [{ name: "dependencies" }] },
+        labels: {
+          nodes: [{ name: "dependencies" }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
         number: 42,
         state: "OPEN",
       };
       return document.startsWith("mutation")
-        ? { enablePullRequestAutoMerge: { pullRequest } }
+        ? {
+            enablePullRequestAutoMerge: {
+              pullRequest: {
+                id: pullRequest.id,
+                autoMergeRequest: pullRequest.autoMergeRequest,
+              },
+            },
+          }
         : { repository: { pullRequest } };
     });
 
@@ -314,7 +324,7 @@ describe("update publication races", () => {
       pullRequestNumber: 42,
     });
 
-    expect(harness.graphql).toHaveBeenCalledTimes(2);
+    expect(harness.graphql).toHaveBeenCalledTimes(3);
     expect(harness.graphql.mock.calls[1]?.[1]).toEqual(
       expect.objectContaining({
         expectedHeadOid: await remoteSha(harness.remote),
@@ -348,7 +358,10 @@ describe("update publication races", () => {
             headRefName: "chore/prek-updates",
             headRepository: { nameWithOwner: "owner/repo" },
             id: "PR_node",
-            labels: { nodes: [{ name: "dependencies" }] },
+            labels: {
+              nodes: [{ name: "dependencies" }],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
             number: 42,
             state: "OPEN",
           },
@@ -384,7 +397,10 @@ describe("update publication races", () => {
             headRefName: "chore/prek-updates",
             headRepository: { nameWithOwner: "owner/repo" },
             id: "PR_node",
-            labels: { nodes: [{ name: "dependencies" }] },
+            labels: {
+              nodes: [{ name: "dependencies" }],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
             number: 42,
             state: "OPEN",
           },

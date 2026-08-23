@@ -160,6 +160,11 @@ using the built-in auto-merge option. Store it as an Actions secret and pass the
 secret through the action's `token` input:
 
 ```yaml
+- name: Checkout repository
+  uses: actions/checkout@v7
+  with:
+    persist-credentials: false
+
 - name: Update prek hooks
   uses: Snuffy2/prek-autoupdate@v2
   with:
@@ -249,6 +254,11 @@ Set `auto-merge: true` to have the action request a squash merge after it
 creates or updates and verifies its owned pull request:
 
 ```yaml
+- name: Checkout repository
+  uses: actions/checkout@v7
+  with:
+    persist-credentials: false
+
 - name: Update prek hooks
   uses: Snuffy2/prek-autoupdate@v2
   with:
