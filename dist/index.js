@@ -36204,6 +36204,16 @@ function closedPullStillOwned(pull, candidate, policy) {
         isWorkflowPull(pull, policy));
 }
 
+/** Failure after a pull request was safely published and must survive cleanup. */
+class PublishedPullRequestError extends Error {
+    publishedPullRequest;
+    constructor(operation, pullRequestNumber, cause) {
+        super(`Pull request #${pullRequestNumber} was ${operation}, but post-publication setup failed: ${String(cause)}`, { cause });
+        this.name = "PublishedPullRequestError";
+        this.publishedPullRequest = { operation, pullRequestNumber };
+    }
+}
+
 const SUPPORTED_EVENTS = new Set([
     "push",
     "schedule",
@@ -36225,6 +36235,7 @@ function parseInputs() {
     const cooldownDays = getInput("cooldown-days", { required: true });
     return {
         token,
+        autoMerge: booleanInput("auto-merge"),
         authorLogin: nonEmptyInput("author-login"),
         cooldownDays,
         updateDay,
@@ -36262,6 +36273,7 @@ async function resolveContext(client, inputs) {
         "HEAD",
     ]);
     const baseSha = await git$1(workspace, ["rev-parse", "HEAD"]);
+    const identity = await resolveAuthenticatedIdentity(client, inputs.token, inputs.authorLogin);
     return {
         eventName,
         owner,
@@ -36271,7 +36283,8 @@ async function resolveContext(client, inputs) {
         workspace,
         baseBranch,
         baseSha,
-        authenticatedLogin: await resolveAuthenticatedLogin(client, inputs.token, inputs.authorLogin),
+        authenticatedLogin: identity.login,
+        tokenAuthenticatedAsUser: identity.authenticatedAsUser,
     };
 }
 /** Validate checkout requirements needed only by the update phase. */
@@ -36302,6 +36315,16 @@ async function validateCheckout(context) {
         throw new Error("The caller checkout must use actions/checkout with persist-credentials: false");
     }
 }
+function booleanInput(name) {
+    const value = getInput(name, { required: true });
+    if (value === "true") {
+        return true;
+    }
+    if (value === "false") {
+        return false;
+    }
+    throw new Error(`${name} must be true or false`);
+}
 function nonEmptyInput(name) {
     const value = getInput(name, { required: true });
     if (value.trim() === "") {
@@ -36323,11 +36346,11 @@ function assertRuntime() {
         throw new Error(`prek-autoupdate supports Linux x64 and arm64, not ${process.arch}`);
     }
 }
-async function resolveAuthenticatedLogin(client, token, fallbackLogin) {
+async function resolveAuthenticatedIdentity(client, token, fallbackLogin) {
     setSecret(token);
     try {
         const response = await client.rest.users.getAuthenticated();
-        return response.data.login;
+        return { authenticatedAsUser: true, login: response.data.login };
     }
     catch (error) {
         if (typeof error === "object" &&
@@ -36335,7 +36358,7 @@ async function resolveAuthenticatedLogin(client, token, fallbackLogin) {
             "status" in error &&
             (error.status === 401 ||
                 error.status === 403)) {
-            return fallbackLogin;
+            return { authenticatedAsUser: false, login: fallbackLogin };
         }
         throw error;
     }
@@ -39980,6 +40003,7 @@ async function runUpdate(execution) {
             catch (error) {
                 await rollbackCreatedPullRequest(execution, pullNumber, newSha, error);
             }
+            await enableAutoMergeForPublishedPull(execution, "created", pullNumber, newSha);
             return { operation: "created", pullRequestNumber: pullNumber };
         }
         try {
@@ -39999,6 +40023,7 @@ async function runUpdate(execution) {
             });
             const updated = pullFromData(response.data);
             if (isExactUpdatedPull(execution, updated, remote.ownedPullRequest.number, newSha, body)) {
+                await enableAutoMergeForPublishedPull(execution, "updated", remote.ownedPullRequest.number, newSha);
                 return {
                     operation: "updated",
                     pullRequestNumber: remote.ownedPullRequest.number,
@@ -40007,6 +40032,9 @@ async function runUpdate(execution) {
             pullUpdateError = new Error("GitHub returned an unexpected pull request after update");
         }
         catch (error) {
+            if (error instanceof PublishedPullRequestError) {
+                throw error;
+            }
             pullUpdateError = error;
         }
         let verified;
@@ -40018,6 +40046,7 @@ async function runUpdate(execution) {
             });
             verified = pullFromData(response.data);
             if (isExactUpdatedPull(execution, verified, remote.ownedPullRequest.number, newSha, body)) {
+                await enableAutoMergeForPublishedPull(execution, "updated", remote.ownedPullRequest.number, newSha);
                 return {
                     operation: "updated",
                     pullRequestNumber: remote.ownedPullRequest.number,
@@ -40025,6 +40054,9 @@ async function runUpdate(execution) {
             }
         }
         catch (verificationError) {
+            if (verificationError instanceof PublishedPullRequestError) {
+                throw verificationError;
+            }
             throw new Error("Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved", { cause: new AggregateError([pullUpdateError, verificationError]) });
         }
         const verificationError = new Error("Fresh pull request verification was not exact");
@@ -40102,6 +40134,201 @@ async function runUpdate(execution) {
         }
         reportCleanupFailures(updateFailed, updateError, cleanupErrors);
     }
+}
+const AUTO_MERGE_PULL_REQUEST_QUERY = `query PrekAutoupdatePullRequest($owner: String!, $repository: String!, $number: Int!, $labelsCursor: String) {
+  repository(owner: $owner, name: $repository) {
+    pullRequest(number: $number) {
+      id
+      number
+      author { login }
+      baseRefName
+      body
+      headRefName
+      headRefOid
+      headRepository { nameWithOwner }
+      labels(first: 100, after: $labelsCursor) {
+        nodes { name }
+        pageInfo { hasNextPage endCursor }
+      }
+      state
+      autoMergeRequest { enabledAt mergeMethod }
+    }
+  }
+}`;
+async function enableAutoMergeIfRequested(execution, pullNumber, expectedHeadOid) {
+    if (!execution.inputs.autoMerge) {
+        return;
+    }
+    if (!execution.context.tokenAuthenticatedAsUser) {
+        warning("Skipping auto-merge because the configured token did not authenticate with GET /user; provide a PAT through the token input");
+        return;
+    }
+    await enablePullRequestAutoMerge(execution, pullNumber, expectedHeadOid);
+}
+async function enableAutoMergeForPublishedPull(execution, operation, pullNumber, expectedHeadOid) {
+    try {
+        await enableAutoMergeIfRequested(execution, pullNumber, expectedHeadOid);
+    }
+    catch (error) {
+        throw new PublishedPullRequestError(operation, pullNumber, error);
+    }
+}
+/** Enable squash auto-merge only for the exact pull-request revision published. */
+async function enablePullRequestAutoMerge(execution, pullNumber, expectedHeadOid) {
+    const pull = await fetchAutoMergePullRequest(execution, pullNumber);
+    if (pull === null ||
+        pull === undefined ||
+        !isOwnedAutoMergePull(execution, pull, pullNumber, expectedHeadOid)) {
+        throw new Error("Pull request changed before squash auto-merge could be enabled");
+    }
+    if (pull.autoMergeRequest?.mergeMethod === "SQUASH") {
+        info(`Squash auto-merge is already enabled for pull request #${pullNumber}.`);
+        return;
+    }
+    const enabled = await execution.client.graphql(`mutation EnablePrekAutoupdateAutoMerge($pullRequestId: ID!, $expectedHeadOid: GitObjectID!) {
+      enablePullRequestAutoMerge(input: {
+        pullRequestId: $pullRequestId
+        mergeMethod: SQUASH
+        expectedHeadOid: $expectedHeadOid
+      }) {
+        pullRequest {
+          id
+          autoMergeRequest { enabledAt mergeMethod }
+        }
+      }
+    }`, { pullRequestId: pull.id, expectedHeadOid });
+    const result = enabled?.enablePullRequestAutoMerge?.pullRequest;
+    let confirmed = false;
+    if (result?.id === pull.id &&
+        result.autoMergeRequest?.mergeMethod === "SQUASH") {
+        try {
+            const completeResult = await fetchAutoMergePullRequest(execution, pullNumber);
+            confirmed =
+                completeResult !== null &&
+                    isOwnedAutoMergePull(execution, completeResult, pullNumber, expectedHeadOid);
+        }
+        catch {
+            confirmed = false;
+        }
+    }
+    if (!confirmed) {
+        const validationError = new Error("GitHub did not confirm squash auto-merge for the exact pull-request revision");
+        try {
+            await disableUnverifiedAutoMerge(execution, pull.id);
+        }
+        catch (disableError) {
+            throw new Error("Auto-merge revalidation failed and GitHub did not confirm that the request was disabled", { cause: new AggregateError([validationError, disableError]) });
+        }
+        throw validationError;
+    }
+    info(`Enabled squash auto-merge for pull request #${pullNumber}.`);
+}
+async function fetchAutoMergePullRequestPage(execution, pullNumber, labelsCursor) {
+    const observed = await execution.client.graphql(AUTO_MERGE_PULL_REQUEST_QUERY, {
+        owner: execution.context.owner,
+        repository: execution.context.repository,
+        number: pullNumber,
+        labelsCursor,
+    });
+    const pull = observed.repository?.pullRequest ?? null;
+    if (pull !== null) {
+        assertCompleteAutoMergePullRequestPage(pull);
+    }
+    return pull;
+}
+async function fetchAutoMergePullRequest(execution, pullNumber) {
+    const first = await fetchAutoMergePullRequestPage(execution, pullNumber, null);
+    if (first === null) {
+        return null;
+    }
+    return completeAutoMergePullRequest(execution, pullNumber, first);
+}
+async function completeAutoMergePullRequest(execution, pullNumber, first) {
+    const labels = [...first.labels.nodes];
+    let current = first;
+    const seenCursors = new Set();
+    while (current.labels.pageInfo.hasNextPage) {
+        const cursor = current.labels.pageInfo.endCursor;
+        if (cursor === null || seenCursors.has(cursor)) {
+            throw new Error("GitHub returned an invalid pull-request label pagination cursor");
+        }
+        seenCursors.add(cursor);
+        const next = await fetchAutoMergePullRequestPage(execution, pullNumber, cursor);
+        if (next === null || !sameAutoMergePullMetadata(first, next)) {
+            throw new Error("Pull request metadata changed while reading ownership labels");
+        }
+        labels.push(...next.labels.nodes);
+        current = next;
+    }
+    return {
+        ...current,
+        labels: { ...current.labels, nodes: labels },
+    };
+}
+function assertCompleteAutoMergePullRequestPage(pull) {
+    const labels = pull.labels;
+    if (typeof labels !== "object" || labels === null) {
+        throw new Error("GitHub returned a pull request without labels");
+    }
+    const labelPage = labels;
+    if (!Array.isArray(labelPage.nodes) ||
+        !labelPage.nodes.every((label) => typeof label === "object" &&
+            label !== null &&
+            typeof label.name === "string")) {
+        throw new Error("GitHub returned malformed pull-request labels");
+    }
+    if (typeof labelPage.pageInfo !== "object" || labelPage.pageInfo === null) {
+        throw new Error("GitHub returned a pull request without label pagination information");
+    }
+    const pageInfo = labelPage.pageInfo;
+    if (typeof pageInfo.hasNextPage !== "boolean" ||
+        (pageInfo.endCursor !== null && typeof pageInfo.endCursor !== "string")) {
+        throw new Error("GitHub returned malformed label pagination information");
+    }
+}
+function sameAutoMergePullMetadata(left, right) {
+    return (left.id === right.id &&
+        left.number === right.number &&
+        left.author?.login === right.author?.login &&
+        left.baseRefName === right.baseRefName &&
+        left.body === right.body &&
+        left.headRefName === right.headRefName &&
+        left.headRefOid === right.headRefOid &&
+        left.headRepository?.nameWithOwner ===
+            right.headRepository?.nameWithOwner &&
+        left.state === right.state &&
+        left.autoMergeRequest?.enabledAt === right.autoMergeRequest?.enabledAt &&
+        left.autoMergeRequest?.mergeMethod === right.autoMergeRequest?.mergeMethod);
+}
+async function disableUnverifiedAutoMerge(execution, pullRequestId) {
+    const disabled = await execution.client.graphql(`mutation DisableUnverifiedPrekAutoupdateAutoMerge($pullRequestId: ID!) {
+        disablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId }) {
+          pullRequest {
+            id
+            autoMergeRequest { enabledAt mergeMethod }
+          }
+        }
+      }`, { pullRequestId });
+    const result = disabled.disablePullRequestAutoMerge?.pullRequest;
+    if (result?.id !== pullRequestId || result.autoMergeRequest !== null) {
+        throw new Error("GitHub did not confirm that auto-merge was disabled");
+    }
+    warning("Disabled an auto-merge request after pull-request ownership revalidation failed");
+}
+function isOwnedAutoMergePull(execution, pull, pullNumber, expectedHeadOid) {
+    const labels = pull.labels?.nodes;
+    return (pull.author?.login === execution.context.authenticatedLogin &&
+        pull.baseRefName === execution.context.baseBranch &&
+        typeof pull.body === "string" &&
+        pull.body.includes(BODY_MARKER) &&
+        pull.headRefName === execution.inputs.updateBranch &&
+        pull.headRefOid === expectedHeadOid &&
+        pull.headRepository?.nameWithOwner?.toLowerCase() ===
+            execution.context.repositoryFullName.toLowerCase() &&
+        Array.isArray(labels) &&
+        labels.some((label) => label.name === execution.inputs.label) &&
+        pull.number === pullNumber &&
+        pull.state === "OPEN");
 }
 async function createTemporaryRoot(create = mkdtemp, resolve = realpath, remove = rm$1) {
     const rawRoot = await create(path$1.join(tmpdir(), "prek-autoupdate-"));
@@ -40683,6 +40910,9 @@ async function runAction(now = new Date()) {
         }
     }
     catch (error) {
+        if (error instanceof PublishedPullRequestError) {
+            updateResult = error.publishedPullRequest;
+        }
         failures.push({ phase: "update", error });
     }
     finally {

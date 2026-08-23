@@ -10,7 +10,7 @@ import type { ActionContext, GitHubClient } from "../../src/contracts.js";
 import {
   parseInputs,
   normalizeServerUrl,
-  resolveAuthenticatedLogin,
+  resolveAuthenticatedIdentity,
   shouldUpdate,
   validateCheckout,
 } from "../../src/input.js";
@@ -22,6 +22,7 @@ vi.mock("@actions/core", () => ({
 
 const DEFAULT_INPUTS: Readonly<Record<string, string>> = {
   "token": "token",
+  "auto-merge": "false",
   "author-login": "github-actions[bot]",
   "cooldown-days": "7",
   "update-day": "1",
@@ -44,6 +45,7 @@ function checkoutContext(
 ): ActionContext {
   return {
     authenticatedLogin: "prek-bot",
+    tokenAuthenticatedAsUser: true,
     baseBranch: "main",
     baseSha: "0".repeat(40),
     eventName: "schedule",
@@ -73,6 +75,7 @@ describe("parseInputs", () => {
     process.env.INPUT_TOKEN = "token";
     expect(parseInputs()).toEqual({
       token: "token",
+      autoMerge: false,
       authorLogin: "github-actions[bot]",
       cooldownDays: "7",
       updateDay: 1,
@@ -108,6 +111,25 @@ describe("parseInputs", () => {
     expect(parseInputs().addPaths).toEqual(["prek.toml", "docs/file.md"]);
   });
 
+  it("enables auto-merge only from an explicit true input", () => {
+    vi.mocked(core.getInput).mockImplementation((name) =>
+      name === "auto-merge" ? "true" : (DEFAULT_INPUTS[name] ?? ""),
+    );
+
+    expect(parseInputs().autoMerge).toBe(true);
+  });
+
+  it.each(["", "yes", "TRUE", "1"])(
+    "rejects invalid auto-merge value %j",
+    (autoMerge) => {
+      vi.mocked(core.getInput).mockImplementation((name) =>
+        name === "auto-merge" ? autoMerge : (DEFAULT_INPUTS[name] ?? ""),
+      );
+
+      expect(() => parseInputs()).toThrow("auto-merge must be true or false");
+    },
+  );
+
   it.each([
     ["0", 0],
     ["6", 6],
@@ -134,7 +156,7 @@ describe("parseInputs", () => {
   );
 });
 
-describe("resolveAuthenticatedLogin", () => {
+describe("resolveAuthenticatedIdentity", () => {
   function clientWithAuthenticatedUser(
     implementation: () => Promise<unknown>,
   ): GitHubClient {
@@ -153,8 +175,11 @@ describe("resolveAuthenticatedLogin", () => {
     }));
 
     await expect(
-      resolveAuthenticatedLogin(client, "token", "fallback[bot]"),
-    ).resolves.toBe("exact-user-login");
+      resolveAuthenticatedIdentity(client, "token", "fallback[bot]"),
+    ).resolves.toEqual({
+      authenticatedAsUser: true,
+      login: "exact-user-login",
+    });
   });
 
   it.each([401, 403])(
@@ -165,8 +190,11 @@ describe("resolveAuthenticatedLogin", () => {
       });
 
       await expect(
-        resolveAuthenticatedLogin(client, "token", "custom-app[bot]"),
-      ).resolves.toBe("custom-app[bot]");
+        resolveAuthenticatedIdentity(client, "token", "custom-app[bot]"),
+      ).resolves.toEqual({
+        authenticatedAsUser: false,
+        login: "custom-app[bot]",
+      });
     },
   );
 
@@ -179,7 +207,7 @@ describe("resolveAuthenticatedLogin", () => {
     });
 
     await expect(
-      resolveAuthenticatedLogin(client, "token", "fallback[bot]"),
+      resolveAuthenticatedIdentity(client, "token", "fallback[bot]"),
     ).rejects.toBe(failure);
   });
 });

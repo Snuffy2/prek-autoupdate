@@ -19,6 +19,7 @@ describe("action metadata", () => {
     expect(new Set(Object.keys(metadata.inputs))).toEqual(
       new Set([
         "token",
+        "auto-merge",
         "author-login",
         "cooldown-days",
         "update-day",
@@ -31,6 +32,7 @@ describe("action metadata", () => {
       ]),
     );
     expect(metadata.inputs.token?.default).toBe("${{ github.token }}");
+    expect(metadata.inputs["auto-merge"]?.default).toBe("false");
     expect(metadata.inputs["author-login"]?.default).toBe(
       "github-actions[bot]",
     );

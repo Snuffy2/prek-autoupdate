@@ -49,9 +49,11 @@ const execution = {
     baseBranch: "main",
     baseSha: "base",
     authenticatedLogin: "github-actions[bot]",
+    tokenAuthenticatedAsUser: false,
   },
   inputs: {
     token: "token",
+    autoMerge: false,
     cooldownDays: "7",
     updateDay: 1,
     updateBranch: branch,

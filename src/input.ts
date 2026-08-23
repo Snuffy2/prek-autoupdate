@@ -40,6 +40,7 @@ export function parseInputs(): ActionInputs {
 
   return {
     token,
+    autoMerge: booleanInput("auto-merge"),
     authorLogin: nonEmptyInput("author-login"),
     cooldownDays,
     updateDay,
@@ -88,6 +89,11 @@ export async function resolveContext(
     "HEAD",
   ]);
   const baseSha = await git(workspace, ["rev-parse", "HEAD"]);
+  const identity = await resolveAuthenticatedIdentity(
+    client,
+    inputs.token,
+    inputs.authorLogin,
+  );
 
   return {
     eventName,
@@ -98,11 +104,8 @@ export async function resolveContext(
     workspace,
     baseBranch,
     baseSha,
-    authenticatedLogin: await resolveAuthenticatedLogin(
-      client,
-      inputs.token,
-      inputs.authorLogin,
-    ),
+    authenticatedLogin: identity.login,
+    tokenAuthenticatedAsUser: identity.authenticatedAsUser,
   };
 }
 
@@ -147,6 +150,17 @@ export async function validateCheckout(context: ActionContext): Promise<void> {
   }
 }
 
+function booleanInput(name: string): boolean {
+  const value = core.getInput(name, { required: true });
+  if (value === "true") {
+    return true;
+  }
+  if (value === "false") {
+    return false;
+  }
+  throw new Error(`${name} must be true or false`);
+}
+
 function nonEmptyInput(name: string): string {
   const value = core.getInput(name, { required: true });
   if (value.trim() === "") {
@@ -177,15 +191,20 @@ function assertRuntime(): void {
   }
 }
 
-export async function resolveAuthenticatedLogin(
+export interface AuthenticatedIdentity {
+  readonly authenticatedAsUser: boolean;
+  readonly login: string;
+}
+
+export async function resolveAuthenticatedIdentity(
   client: GitHubClient,
   token: string,
   fallbackLogin: string,
-): Promise<string> {
+): Promise<AuthenticatedIdentity> {
   core.setSecret(token);
   try {
     const response = await client.rest.users.getAuthenticated();
-    return response.data.login;
+    return { authenticatedAsUser: true, login: response.data.login };
   } catch (error: unknown) {
     if (
       typeof error === "object" &&
@@ -194,7 +213,7 @@ export async function resolveAuthenticatedLogin(
       ((error as { readonly status?: unknown }).status === 401 ||
         (error as { readonly status?: unknown }).status === 403)
     ) {
-      return fallbackLogin;
+      return { authenticatedAsUser: false, login: fallbackLogin };
     }
     throw error;
   }

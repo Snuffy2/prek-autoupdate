@@ -17,8 +17,7 @@ jobs:
     if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -29,5 +28,6 @@ jobs:
         uses: ./
         with:
           token: ${{ secrets.PREK_AUTOUPDATE_TOKEN }}
+          auto-merge: true
           author-login: prek-autoupdate-bot
           update-day: "0"
