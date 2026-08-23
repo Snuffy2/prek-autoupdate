@@ -100,7 +100,7 @@ not match your repository.
 | ---------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `token`          | `${{ github.token }}`      | The job's GitHub token, used to push the update branch and manage pull requests.                                                                 |
 | `auto-merge`     | `false`                    | With a PAT, requests squash auto-merge for the exact pull-request revision published by the action. See [Automatic merging](#automatic-merging). |
-| `author-login`   | `github-actions[bot]`      | The PR author identity used for ownership checks if GitHub cannot report the token's authenticated login.                                        |
+| `author-login`   | `github-actions[bot]`      | Fallback PR-author login used only when GitHub cannot identify the token's user. See [When to set `author-login`](#when-to-set-author-login).    |
 | `cooldown-days`  | `"7"`                      | Passed to `prek auto-update --cooldown-days`.                                                                                                    |
 | `update-day`     | `"1"`                      | UTC day for scheduled updates: `0` is Sunday and `6` is Saturday.                                                                                |
 | `update-branch`  | `chore/prek-updates`       | The branch for the update pull request.                                                                                                          |
@@ -156,9 +156,28 @@ run automatically. Built-in auto-merge is the exception: `auto-merge: true`
 requires a PAT. With a GitHub App installation token, the action still creates
 or updates the PR but skips the auto-merge request.
 
-Keep the same `author-login` value for scheduled, manual, and push-triggered
-cleanup runs. For a PAT, the action normally discovers the token owner's GitHub
-login automatically, so `author-login` is not required.
+### When to set `author-login`
+
+`author-login` is only a fallback used to prove that an update PR belongs to
+this action. It does not select the account used by the token, change the PR
+author, or grant permissions.
+
+- **Default `GITHUB_TOKEN`:** omit `author-login`. Its default value,
+  `github-actions[bot]`, is already correct. This remains true if the workflow
+  passes `${{ github.token }}` explicitly through `token`.
+- **Classic or fine-grained PAT:** omit `author-login`. The action discovers the
+  PAT owner's login from GitHub and uses that value, even if `author-login` was
+  also supplied.
+- **GitHub App installation token:** set `author-login` to the exact bot login
+  that authors the PR, normally `<app-slug>[bot]`. Installation tokens do not
+  identify a user through GitHub's user endpoint, so the action must use this
+  configured fallback.
+
+If a token cannot identify a user and its PR author is not
+`github-actions[bot]`, `author-login` is required and must exactly match the PR
+author. Use the same value in scheduled, manual, and push-triggered cleanup
+runs; a different value causes the ownership checks to fail closed rather than
+modify a PR owned by another identity.
 
 ### Personal access token permissions
 
