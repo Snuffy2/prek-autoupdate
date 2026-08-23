@@ -270,6 +270,58 @@ describe("update publication races", () => {
     expect(await pushes(harness.log)).toHaveLength(1);
   });
 
+  it("enables auto-merge after proving the exact created pull revision", async () => {
+    const harness = await makeHarness();
+    harness.create.mockImplementation(async () => ({
+      data: mergePull(harness.pull, {
+        head: {
+          ...harness.pull.head,
+          sha: await remoteSha(harness.remote),
+        },
+      }),
+    }));
+    const execution: ActionExecution = {
+      ...harness.execution,
+      inputs: { ...harness.execution.inputs, autoMerge: true },
+    };
+    harness.graphql.mockImplementation(async (document: string) => {
+      const headRefOid = await remoteSha(harness.remote);
+      const pullRequest = {
+        autoMergeRequest: document.startsWith("mutation")
+          ? {
+              enabledAt: "2026-08-23T12:00:00Z",
+              mergeMethod: "SQUASH",
+            }
+          : null,
+        author: { login: "github-actions[bot]" },
+        baseRefName: "main",
+        body: BODY_MARKER,
+        headRefOid,
+        headRefName: "chore/prek-updates",
+        headRepository: { nameWithOwner: "owner/repo" },
+        id: "PR_node",
+        labels: { nodes: [{ name: "dependencies" }] },
+        number: 42,
+        state: "OPEN",
+      };
+      return document.startsWith("mutation")
+        ? { enablePullRequestAutoMerge: { pullRequest } }
+        : { repository: { pullRequest } };
+    });
+
+    await expect(runUpdate(execution)).resolves.toEqual({
+      operation: "created",
+      pullRequestNumber: 42,
+    });
+
+    expect(harness.graphql).toHaveBeenCalledTimes(2);
+    expect(harness.graphql.mock.calls[1]?.[1]).toEqual(
+      expect.objectContaining({
+        expectedHeadOid: await remoteSha(harness.remote),
+      }),
+    );
+  });
+
   it("preserves the pushed branch when create has an ambiguous outcome", async () => {
     const harness = await makeHarness();
     harness.create.mockRejectedValue(
@@ -878,7 +930,9 @@ async function makeHarness(options: HarnessOptions = {}) {
   const paginate = vi.fn(async () => (options.existing ? [pull] : []));
   const addLabels = vi.fn();
   const getLabel = vi.fn(async () => ({ data: { name: "dependencies" } }));
+  const graphql = vi.fn();
   const client = {
+    graphql,
     paginate,
     rest: {
       git: { getRef },
@@ -901,6 +955,7 @@ async function makeHarness(options: HarnessOptions = {}) {
     },
     inputs: {
       addPaths: ["prek.toml"],
+      autoMerge: false,
       authorLogin: "github-actions[bot]",
       branchPrefix: "chore/prek-",
       commitMessage: "update",
@@ -918,6 +973,7 @@ async function makeHarness(options: HarnessOptions = {}) {
     create,
     execution,
     get,
+    graphql,
     log,
     oldSha,
     paginate,

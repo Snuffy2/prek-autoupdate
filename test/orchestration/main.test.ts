@@ -44,6 +44,7 @@ vi.mock("../../src/version.js", () => ({
 
 const inputs: ActionInputs = {
   token: "token",
+  autoMerge: false,
   authorLogin: "github-actions[bot]",
   cooldownDays: "7",
   updateDay: 1,

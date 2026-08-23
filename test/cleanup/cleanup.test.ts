@@ -52,6 +52,7 @@ const execution = {
   },
   inputs: {
     token: "token",
+    autoMerge: false,
     cooldownDays: "7",
     updateDay: 1,
     updateBranch: branch,

@@ -16,6 +16,7 @@ import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
 import {
   BODY_MARKER,
   createTemporaryRoot,
+  enablePullRequestAutoMerge,
   runUpdate,
   sanitizeOutput,
   validateAddPath,
@@ -111,6 +112,109 @@ describe("captured output", () => {
 
   it("keeps the exact ownership marker stable", () => {
     expect(BODY_MARKER).toBe("Automated update of `prek` hooks.");
+  });
+});
+
+describe("pull request auto-merge", () => {
+  it("enables squash auto-merge for the exact observed head revision", async () => {
+    const execution = await makeExecution(["prek.toml"]);
+    const graphql = vi
+      .fn()
+      .mockResolvedValueOnce({
+        repository: {
+          pullRequest: autoMergePull(),
+        },
+      })
+      .mockResolvedValueOnce({
+        enablePullRequestAutoMerge: {
+          pullRequest: autoMergePull({
+            autoMergeRequest: {
+              enabledAt: "2026-08-23T12:00:00Z",
+              mergeMethod: "SQUASH",
+            },
+          }),
+        },
+      });
+    const autoMergeExecution = {
+      ...execution,
+      client: { ...execution.client, graphql } as unknown as GitHubClient,
+    };
+
+    await expect(
+      enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
+    ).resolves.toBeUndefined();
+
+    expect(graphql).toHaveBeenCalledTimes(2);
+    expect(graphql.mock.calls[1]?.[1]).toEqual({
+      pullRequestId: "PR_node",
+      expectedHeadOid: "HEAD",
+    });
+    expect(graphql.mock.calls[1]?.[0]).toContain("mergeMethod: SQUASH");
+  });
+
+  it("does not replace an existing auto-merge request", async () => {
+    const execution = await makeExecution(["prek.toml"]);
+    const graphql = vi.fn().mockResolvedValue({
+      repository: {
+        pullRequest: autoMergePull({
+          autoMergeRequest: {
+            enabledAt: "2026-08-23T12:00:00Z",
+            mergeMethod: "SQUASH",
+          },
+        }),
+      },
+    });
+    const autoMergeExecution = {
+      ...execution,
+      client: { ...execution.client, graphql } as unknown as GitHubClient,
+    };
+
+    await enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD");
+
+    expect(graphql).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["a missing pull request", null],
+    ["a different pull request number", autoMergePull({ number: 43 })],
+    ["a changed head revision", autoMergePull({ headRefOid: "CHANGED" })],
+    ["an unowned pull request", autoMergePull({ author: { login: "other" } })],
+  ])("rejects %s before mutation", async (_name, pullRequest) => {
+    const execution = await makeExecution(["prek.toml"]);
+    const graphql = vi.fn().mockResolvedValue({
+      repository: { pullRequest },
+    });
+    const autoMergeExecution = {
+      ...execution,
+      client: { ...execution.client, graphql } as unknown as GitHubClient,
+    };
+
+    await expect(
+      enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
+    ).rejects.toThrow(/changed before squash auto-merge/u);
+    expect(graphql).toHaveBeenCalledOnce();
+  });
+
+  it("rejects an inexact mutation response", async () => {
+    const execution = await makeExecution(["prek.toml"]);
+    const graphql = vi
+      .fn()
+      .mockResolvedValueOnce({
+        repository: { pullRequest: autoMergePull() },
+      })
+      .mockResolvedValueOnce({
+        enablePullRequestAutoMerge: {
+          pullRequest: autoMergePull({ autoMergeRequest: null }),
+        },
+      });
+    const autoMergeExecution = {
+      ...execution,
+      client: { ...execution.client, graphql } as unknown as GitHubClient,
+    };
+
+    await expect(
+      enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
+    ).rejects.toThrow(/did not confirm squash auto-merge/u);
   });
 });
 
@@ -412,6 +516,7 @@ async function makeExecution(
     },
     inputs: {
       addPaths: [],
+      autoMerge: false,
       authorLogin: "github-actions[bot]",
       branchPrefix: "chore/prek-",
       commitMessage: "update",
@@ -440,5 +545,48 @@ function ownedPull(login: string): Record<string, unknown> {
     title: "Update",
     updated_at: "2026-07-28T00:00:00Z",
     user: { login },
+  };
+}
+
+function autoMergePull(
+  overrides: Partial<{
+    readonly author: { readonly login: string } | null;
+    readonly autoMergeRequest: {
+      readonly enabledAt: string;
+      readonly mergeMethod: string;
+    } | null;
+    readonly headRefOid: string;
+    readonly id: string;
+    readonly number: number;
+  }> = {},
+): {
+  readonly autoMergeRequest: {
+    readonly enabledAt: string;
+    readonly mergeMethod: string;
+  } | null;
+  readonly author: { readonly login: string } | null;
+  readonly baseRefName: string;
+  readonly body: string;
+  readonly headRefOid: string;
+  readonly headRefName: string;
+  readonly headRepository: { readonly nameWithOwner: string } | null;
+  readonly id: string;
+  readonly labels: { readonly nodes: readonly { readonly name: string }[] };
+  readonly number: number;
+  readonly state: string;
+} {
+  return {
+    author: { login: "github-actions[bot]" },
+    autoMergeRequest: null,
+    baseRefName: "main",
+    body: BODY_MARKER,
+    headRefOid: "HEAD",
+    headRefName: "chore/prek-updates",
+    headRepository: { nameWithOwner: "owner/repo" },
+    id: "PR_node",
+    labels: { nodes: [{ name: "dependencies" }] },
+    number: 42,
+    state: "OPEN",
+    ...overrides,
   };
 }

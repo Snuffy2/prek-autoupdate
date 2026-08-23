@@ -96,18 +96,19 @@ immediately before each is run.
 You can usually use the defaults. Only add a `with:` value when the default does
 not match your repository.
 
-| Input            | Default                    | What it controls                                                                                                                                |
-| ---------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `token`          | `${{ github.token }}`      | The job's GitHub token, used to push the update branch and manage pull requests.                                                                |
-| `author-login`   | `github-actions[bot]`      | The PR author identity used for ownership checks if GitHub cannot report the token's authenticated login.                                       |
-| `cooldown-days`  | `"7"`                      | Passed to `prek auto-update --cooldown-days`.                                                                                                   |
-| `update-day`     | `"1"`                      | UTC day for scheduled updates: `0` is Sunday and `6` is Saturday.                                                                               |
-| `update-branch`  | `chore/prek-updates`       | The branch for the update pull request.                                                                                                         |
-| `branch-prefix`  | `chore/prek-updates`       | The branch prefix that cleanup treats as action-owned.                                                                                          |
-| `label`          | `dependencies`             | An existing repository label applied to the update PR and used to prove ownership during cleanup.                                               |
-| `commit-message` | `chore: update prek hooks` | The update commit message.                                                                                                                      |
-| `pr-title`       | `Bump prek Hooks`          | The update pull-request title.                                                                                                                  |
-| `add-paths`      | auto-detect                | Newline-separated repository-relative paths to commit. When blank, the action requires exactly one of `prek.toml` or `.pre-commit-config.yaml`. |
+| Input            | Default                    | What it controls                                                                                                                                  |
+| ---------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `token`          | `${{ github.token }}`      | The job's GitHub token, used to push the update branch and manage pull requests.                                                                  |
+| `auto-merge`     | `false`                    | When `true`, requests squash auto-merge for the exact pull-request revision published by the action. See [Automatic merging](#automatic-merging). |
+| `author-login`   | `github-actions[bot]`      | The PR author identity used for ownership checks if GitHub cannot report the token's authenticated login.                                         |
+| `cooldown-days`  | `"7"`                      | Passed to `prek auto-update --cooldown-days`.                                                                                                     |
+| `update-day`     | `"1"`                      | UTC day for scheduled updates: `0` is Sunday and `6` is Saturday.                                                                                 |
+| `update-branch`  | `chore/prek-updates`       | The branch for the update pull request.                                                                                                           |
+| `branch-prefix`  | `chore/prek-updates`       | The branch prefix that cleanup treats as action-owned.                                                                                            |
+| `label`          | `dependencies`             | An existing repository label applied to the update PR and used to prove ownership during cleanup.                                                 |
+| `commit-message` | `chore: update prek hooks` | The update commit message.                                                                                                                        |
+| `pr-title`       | `Bump prek Hooks`          | The update pull-request title.                                                                                                                    |
+| `add-paths`      | auto-detect                | Newline-separated repository-relative paths to commit. When blank, the action requires exactly one of `prek.toml` or `.pre-commit-config.yaml`.   |
 
 ## Output
 
@@ -150,6 +151,54 @@ with:
 Keep the same `author-login` value for scheduled, manual, and push-triggered
 cleanup runs. For a PAT, the action normally discovers the token owner's GitHub
 login automatically, so `author-login` is not required.
+
+## Automatic merging
+
+Set `auto-merge: true` to have the action request a squash merge after it
+creates or updates and verifies its owned pull request:
+
+```yaml
+- name: Update prek hooks
+  uses: Snuffy2/prek-autoupdate@v2
+  with:
+    token: ${{ secrets.PREK_AUTOUPDATE_TOKEN }}
+    auto-merge: true
+```
+
+This option is disabled by default. When enabled, the action binds the request
+to the exact head commit that it published. GitHub, rather than the action,
+waits for every required review and status check and then performs a squash
+merge. A separate pull-request-triggered auto-merge workflow is not required.
+
+Complete all of these prerequisites before enabling the option:
+
+1. In **Settings > General > Pull Requests**, enable **Allow auto-merge** and
+   **Allow squash merging** for the repository.
+2. Create a PAT for a dedicated automation identity with repository **Contents:
+   read and write** and **Pull requests: read and write** access. Store it as a
+   repository secret such as `PREK_AUTOUPDATE_TOKEN` and pass it through the
+   action's `token` input. The default `GITHUB_TOKEN` creates approval-required
+   pull-request workflow runs, so it is not suitable for unattended CI and
+   auto-merge. A GitHub App installation token with the same permissions is an
+   equivalent alternative.
+3. Create an active branch ruleset targeting the default branch. Enable
+   **Require a pull request before merging** and **Require status checks to pass
+   before merging**, then select every CI check that must pass. Do not give the
+   PAT owner or GitHub App a ruleset bypass if CI must remain mandatory.
+
+A branch ruleset makes the selected CI checks merge requirements. Auto-merge
+then waits instead of merging the generated PR before CI has passed. Strict
+status checks can additionally require the PR branch to be current with the base
+branch, while loose checks allow it to merge after the selected checks pass on
+its existing head. See GitHub's documentation for
+[creating rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository)
+and the available
+[ruleset status-check rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#require-status-checks-to-pass-before-merging).
+
+If auto-merge is disabled at the repository level, squash merges are not
+allowed, the token lacks permission, or no merge requirement is holding the PR,
+GitHub can reject the request and the action run fails without closing the
+otherwise valid update pull request.
 
 ## Releases
 

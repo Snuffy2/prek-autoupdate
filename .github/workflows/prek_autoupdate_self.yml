@@ -29,5 +29,6 @@ jobs:
         uses: ./
         with:
           token: ${{ secrets.PREK_AUTOUPDATE_TOKEN }}
+          auto-merge: true
           author-login: prek-autoupdate-bot
           update-day: "0"

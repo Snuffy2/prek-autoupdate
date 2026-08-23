@@ -36225,6 +36225,7 @@ function parseInputs() {
     const cooldownDays = getInput("cooldown-days", { required: true });
     return {
         token,
+        autoMerge: booleanInput("auto-merge"),
         authorLogin: nonEmptyInput("author-login"),
         cooldownDays,
         updateDay,
@@ -36301,6 +36302,16 @@ async function validateCheckout(context) {
     if (persistedCredential !== "") {
         throw new Error("The caller checkout must use actions/checkout with persist-credentials: false");
     }
+}
+function booleanInput(name) {
+    const value = getInput(name, { required: true });
+    if (value === "true") {
+        return true;
+    }
+    if (value === "false") {
+        return false;
+    }
+    throw new Error(`${name} must be true or false`);
 }
 function nonEmptyInput(name) {
     const value = getInput(name, { required: true });
@@ -39980,6 +39991,7 @@ async function runUpdate(execution) {
             catch (error) {
                 await rollbackCreatedPullRequest(execution, pullNumber, newSha, error);
             }
+            await enableAutoMergeIfRequested(execution, pullNumber, newSha);
             return { operation: "created", pullRequestNumber: pullNumber };
         }
         try {
@@ -39999,6 +40011,7 @@ async function runUpdate(execution) {
             });
             const updated = pullFromData(response.data);
             if (isExactUpdatedPull(execution, updated, remote.ownedPullRequest.number, newSha, body)) {
+                await enableAutoMergeIfRequested(execution, remote.ownedPullRequest.number, newSha);
                 return {
                     operation: "updated",
                     pullRequestNumber: remote.ownedPullRequest.number,
@@ -40018,6 +40031,7 @@ async function runUpdate(execution) {
             });
             verified = pullFromData(response.data);
             if (isExactUpdatedPull(execution, verified, remote.ownedPullRequest.number, newSha, body)) {
+                await enableAutoMergeIfRequested(execution, remote.ownedPullRequest.number, newSha);
                 return {
                     operation: "updated",
                     pullRequestNumber: remote.ownedPullRequest.number,
@@ -40102,6 +40116,88 @@ async function runUpdate(execution) {
         }
         reportCleanupFailures(updateFailed, updateError, cleanupErrors);
     }
+}
+async function enableAutoMergeIfRequested(execution, pullNumber, expectedHeadOid) {
+    if (!execution.inputs.autoMerge) {
+        return;
+    }
+    await enablePullRequestAutoMerge(execution, pullNumber, expectedHeadOid);
+}
+/** Enable squash auto-merge only for the exact pull-request revision published. */
+async function enablePullRequestAutoMerge(execution, pullNumber, expectedHeadOid) {
+    const observed = await execution.client.graphql(`query PrekAutoupdatePullRequest($owner: String!, $repository: String!, $number: Int!) {
+      repository(owner: $owner, name: $repository) {
+        pullRequest(number: $number) {
+          id
+          number
+          author { login }
+          baseRefName
+          body
+          headRefName
+          headRefOid
+          headRepository { nameWithOwner }
+          labels(first: 100) { nodes { name } }
+          state
+          autoMergeRequest { enabledAt mergeMethod }
+        }
+      }
+    }`, {
+        owner: execution.context.owner,
+        repository: execution.context.repository,
+        number: pullNumber,
+    });
+    const pull = observed.repository?.pullRequest;
+    if (pull === null ||
+        pull === undefined ||
+        !isOwnedAutoMergePull(execution, pull, pullNumber, expectedHeadOid)) {
+        throw new Error("Pull request changed before squash auto-merge could be enabled");
+    }
+    if (pull.autoMergeRequest?.mergeMethod === "SQUASH") {
+        info(`Squash auto-merge is already enabled for pull request #${pullNumber}.`);
+        return;
+    }
+    const enabled = await execution.client.graphql(`mutation EnablePrekAutoupdateAutoMerge($pullRequestId: ID!, $expectedHeadOid: GitObjectID!) {
+      enablePullRequestAutoMerge(input: {
+        pullRequestId: $pullRequestId
+        mergeMethod: SQUASH
+        expectedHeadOid: $expectedHeadOid
+      }) {
+        pullRequest {
+          id
+          number
+          author { login }
+          baseRefName
+          body
+          headRefName
+          headRefOid
+          headRepository { nameWithOwner }
+          labels(first: 100) { nodes { name } }
+          state
+          autoMergeRequest { enabledAt mergeMethod }
+        }
+      }
+    }`, { pullRequestId: pull.id, expectedHeadOid });
+    const result = enabled.enablePullRequestAutoMerge?.pullRequest;
+    if (result === null ||
+        result === undefined ||
+        result.id !== pull.id ||
+        !isOwnedAutoMergePull(execution, result, pullNumber, expectedHeadOid) ||
+        result.autoMergeRequest?.mergeMethod !== "SQUASH") {
+        throw new Error("GitHub did not confirm squash auto-merge for the exact pull-request revision");
+    }
+    info(`Enabled squash auto-merge for pull request #${pullNumber}.`);
+}
+function isOwnedAutoMergePull(execution, pull, pullNumber, expectedHeadOid) {
+    return (pull.author?.login === execution.context.authenticatedLogin &&
+        pull.baseRefName === execution.context.baseBranch &&
+        pull.body.includes(BODY_MARKER) &&
+        pull.headRefName === execution.inputs.updateBranch &&
+        pull.headRefOid === expectedHeadOid &&
+        pull.headRepository?.nameWithOwner.toLowerCase() ===
+            execution.context.repositoryFullName.toLowerCase() &&
+        pull.labels.nodes.some((label) => label.name === execution.inputs.label) &&
+        pull.number === pullNumber &&
+        pull.state === "OPEN");
 }
 async function createTemporaryRoot(create = mkdtemp, resolve = realpath, remove = rm$1) {
     const rawRoot = await create(path$1.join(tmpdir(), "prek-autoupdate-"));

@@ -40,6 +40,7 @@ export function parseInputs(): ActionInputs {
 
   return {
     token,
+    autoMerge: booleanInput("auto-merge"),
     authorLogin: nonEmptyInput("author-login"),
     cooldownDays,
     updateDay,
@@ -145,6 +146,17 @@ export async function validateCheckout(context: ActionContext): Promise<void> {
       "The caller checkout must use actions/checkout with persist-credentials: false",
     );
   }
+}
+
+function booleanInput(name: string): boolean {
+  const value = core.getInput(name, { required: true });
+  if (value === "true") {
+    return true;
+  }
+  if (value === "false") {
+    return false;
+  }
+  throw new Error(`${name} must be true or false`);
 }
 
 function nonEmptyInput(name: string): string {

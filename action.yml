@@ -8,6 +8,11 @@ inputs:
       GitHub token used to push the update branch and manage pull requests.
     required: false
     default: ${{ github.token }}
+  auto-merge:
+    description:
+      Enable squash auto-merge for the exact generated pull-request revision.
+    required: false
+    default: "false"
   author-login:
     description:
       Pull-request author login used when the token cannot query GET /user.

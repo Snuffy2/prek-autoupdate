@@ -22,6 +22,7 @@ vi.mock("@actions/core", () => ({
 
 const DEFAULT_INPUTS: Readonly<Record<string, string>> = {
   "token": "token",
+  "auto-merge": "false",
   "author-login": "github-actions[bot]",
   "cooldown-days": "7",
   "update-day": "1",
@@ -73,6 +74,7 @@ describe("parseInputs", () => {
     process.env.INPUT_TOKEN = "token";
     expect(parseInputs()).toEqual({
       token: "token",
+      autoMerge: false,
       authorLogin: "github-actions[bot]",
       cooldownDays: "7",
       updateDay: 1,
@@ -107,6 +109,25 @@ describe("parseInputs", () => {
 
     expect(parseInputs().addPaths).toEqual(["prek.toml", "docs/file.md"]);
   });
+
+  it("enables auto-merge only from an explicit true input", () => {
+    vi.mocked(core.getInput).mockImplementation((name) =>
+      name === "auto-merge" ? "true" : (DEFAULT_INPUTS[name] ?? ""),
+    );
+
+    expect(parseInputs().autoMerge).toBe(true);
+  });
+
+  it.each(["", "yes", "TRUE", "1"])(
+    "rejects invalid auto-merge value %j",
+    (autoMerge) => {
+      vi.mocked(core.getInput).mockImplementation((name) =>
+        name === "auto-merge" ? autoMerge : (DEFAULT_INPUTS[name] ?? ""),
+      );
+
+      expect(() => parseInputs()).toThrow("auto-merge must be true or false");
+    },
+  );
 
   it.each([
     ["0", 0],
