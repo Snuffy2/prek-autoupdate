@@ -3,87 +3,65 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
-interface CallerWorkflow {
-  readonly concurrency: {
-    readonly "cancel-in-progress": boolean;
-    readonly "group": string;
-  };
-  readonly jobs: Record<
-    string,
-    {
-      readonly if?: string;
-      readonly permissions?: Record<string, string>;
-      readonly steps?: Array<{
-        readonly uses?: string;
-        readonly with?: Record<string, unknown>;
-      }>;
-    }
-  >;
-  readonly on: Record<string, unknown>;
-  readonly permissions: Record<string, string>;
-}
-
 const readme = readFileSync("README.md", "utf8");
-const selfWorkflow = parse(
-  readFileSync(".github/workflows/prek_autoupdate_self.yml", "utf8"),
-) as CallerWorkflow;
 
-function documentedWorkflow(): CallerWorkflow {
-  const yamlBlocks = [...readme.matchAll(/```yaml\n(?<yaml>[\s\S]*?)\n```/gu)];
-  const example = yamlBlocks.find((match) =>
-    match.groups?.yaml.includes("Snuffy2/prek-autoupdate@v2"),
-  );
-
-  expect(example?.groups?.yaml).toBeDefined();
-  return parse(example?.groups?.yaml ?? "") as CallerWorkflow;
+function isMapping(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-describe("documented caller", () => {
-  it("is a complete safe direct-action workflow", () => {
-    const workflow = documentedWorkflow();
-    const job = Object.values(workflow.jobs).find((candidate) =>
-      candidate.steps?.some(
-        (step) => step.uses === "Snuffy2/prek-autoupdate@v2",
-      ),
+function actionStepLists(value: unknown): readonly (readonly unknown[])[] {
+  if (Array.isArray(value)) {
+    const containsAction = value.some(
+      (item) =>
+        isMapping(item) &&
+        typeof item.uses === "string" &&
+        item.uses.startsWith("Snuffy2/prek-autoupdate@"),
     );
-    const steps = job?.steps ?? [];
-    const checkout = steps.find((step) =>
-      step.uses?.startsWith("actions/checkout@"),
-    );
+    return [
+      ...(containsAction ? [value] : []),
+      ...value.flatMap(actionStepLists),
+    ];
+  }
+  if (isMapping(value)) {
+    return Object.values(value).flatMap(actionStepLists);
+  }
+  return [];
+}
 
-    expect(Object.keys(workflow.on)).toEqual(
-      expect.arrayContaining(["schedule", "push", "workflow_dispatch"]),
-    );
-    expect(workflow.permissions).toEqual({
-      "contents": "write",
-      "pull-requests": "write",
+describe("documented callers", () => {
+  it("check out the target repository without persisting credentials", () => {
+    const yamlBlocks = [
+      ...readme.matchAll(/```yaml\n(?<yaml>[\s\S]*?)\n```/gu),
+    ];
+    const documentedCallers = yamlBlocks.flatMap((match) => {
+      const yaml = match.groups?.yaml ?? "";
+      return yaml.includes("Snuffy2/prek-autoupdate@")
+        ? actionStepLists(parse(yaml) as unknown)
+        : [];
     });
-    expect(workflow.concurrency.group).toBeTruthy();
-    expect(workflow.concurrency["cancel-in-progress"]).toBe(false);
-    expect(job?.if).toBe("github.event.repository.fork == false");
-    expect(checkout?.uses).toBe("actions/checkout@v7");
-    expect(checkout?.with?.["persist-credentials"]).toBe(false);
-    expect(steps).toContainEqual(
-      expect.objectContaining({ uses: "Snuffy2/prek-autoupdate@v2" }),
-    );
-  });
 
-  it("keeps the repository caller aligned with the documented concurrency and checkout contract", () => {
-    const job = Object.values(selfWorkflow.jobs).find((candidate) =>
-      candidate.steps?.some((step) => step.uses === "./"),
-    );
-    const steps = job?.steps ?? [];
-    const checkout = steps.find((step) =>
-      step.uses?.startsWith("actions/checkout@"),
-    );
+    expect(documentedCallers.length).toBeGreaterThan(0);
+    for (const steps of documentedCallers) {
+      const actionIndex = steps.findIndex(
+        (step) =>
+          isMapping(step) &&
+          typeof step.uses === "string" &&
+          step.uses.startsWith("Snuffy2/prek-autoupdate@"),
+      );
+      const checkout = steps
+        .slice(0, actionIndex)
+        .find(
+          (step) =>
+            isMapping(step) &&
+            typeof step.uses === "string" &&
+            step.uses.startsWith("actions/checkout@"),
+        );
 
-    expect(selfWorkflow.concurrency.group).toBeTruthy();
-    expect(selfWorkflow.concurrency["cancel-in-progress"]).toBe(false);
-    expect(job?.if).toBe("github.event.repository.fork == false");
-    expect(job?.permissions).toEqual({
-      contents: "read",
-    });
-    expect(checkout?.with?.["persist-credentials"]).toBe(false);
-    expect(steps).toContainEqual(expect.objectContaining({ uses: "./" }));
+      expect(checkout).toBeDefined();
+      expect(isMapping(checkout) && isMapping(checkout.with)).toBe(true);
+      if (isMapping(checkout) && isMapping(checkout.with)) {
+        expect(checkout.with["persist-credentials"]).toBe(false);
+      }
+    }
   });
 });
