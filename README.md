@@ -98,7 +98,7 @@ not match your repository.
 
 | Input            | Default                    | What it controls                                                                                                                                 |
 | ---------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `token`          | `${{ github.token }}`      | The job's GitHub token, used to push the update branch and manage pull requests.                                                                 |
+| `token`          | `${{ github.token }}`      | Credential used to push the update branch and manage pull requests. See [Authentication and permissions](#authentication-and-permissions).       |
 | `auto-merge`     | `false`                    | With a PAT, requests squash auto-merge for the exact pull-request revision published by the action. See [Automatic merging](#automatic-merging). |
 | `author-login`   | `github-actions[bot]`      | Fallback PR-author login used only when GitHub cannot identify the token's user. See [When to set `author-login`](#when-to-set-author-login).    |
 | `cooldown-days`  | `"7"`                      | Passed to `prek auto-update --cooldown-days`.                                                                                                    |
@@ -122,9 +122,21 @@ update PR remains open. Check for a non-empty value before using it:
   run: echo "PR #${{ steps.prek-autoupdate.outputs.pull-request-number }}"
 ```
 
-## Permissions
+## Authentication and permissions
 
-The normal setup uses the job's `GITHUB_TOKEN`. It needs only these permissions:
+Choose one of the two primary setups: the built-in `GITHUB_TOKEN`, or a PAT.
+Workflow permissions and PAT permissions are separate settings:
+
+- The workflow's YAML `permissions:` block configures only that job's
+  `GITHUB_TOKEN`.
+- A PAT passed through `token` keeps the scopes or repository permissions
+  configured when the PAT was created. The YAML `permissions:` block does not
+  add permissions to the PAT.
+
+### Default `GITHUB_TOKEN`
+
+If `token` is omitted, the action uses the job's `GITHUB_TOKEN`. Grant that
+generated token these workflow permissions in the workflow YAML:
 
 ```yaml
 permissions:
@@ -132,35 +144,84 @@ permissions:
   pull-requests: write
 ```
 
-Keep the default token identity consistent for the update PR and later cleanup
-runs, because cleanup uses that identity as part of its ownership proof.
+`contents: write` lets the action push and delete its update branch.
+`pull-requests: write` lets it create, update, and close its pull request. The
+workflow does not need `actions: write`.
 
-If a generated update PR must trigger downstream CI, provide a GitHub App
-installation token or a personal access token (PAT) through `token` instead. For
-a fine-grained PAT or GitHub App, give that token repository **Contents: read
-and write** and **Pull requests: read and write** permissions. A classic PAT
-uses OAuth scopes instead; see
-[Personal access token permissions](#personal-access-token-permissions) below.
-No token type needs `actions: write` permission. Store the credential as a
-repository secret, then pass it to the action. With a GitHub App installation
-token, also set its bot login before the action creates a PR:
+This is the simplest setup, but pull requests created with `GITHUB_TOKEN` do not
+trigger most downstream workflow runs. The action also does not use
+`GITHUB_TOKEN` for its built-in auto-merge option. Omit `author-login`; its
+default value, `github-actions[bot]`, is correct.
+
+### PAT supplied through `token`
+
+Use a PAT when the generated pull request must trigger downstream CI or when
+using the built-in auto-merge option. Store it as an Actions secret and pass the
+secret through the action's `token` input:
 
 ```yaml
-with:
-  token: ${{ secrets.PREK_AUTOUPDATE_TOKEN }}
-  author-login: <app-slug>[bot]
+- name: Update prek hooks
+  uses: Snuffy2/prek-autoupdate@v2
+  with:
+    token: ${{ secrets.PREK_AUTOUPDATE_TOKEN }}
 ```
 
-Both token types can create and update the action-owned PR and allow its CI to
-run automatically. Built-in auto-merge is the exception: `auto-merge: true`
-requires a PAT. With a GitHub App installation token, the action still creates
-or updates the PR but skips the auto-merge request.
+Because the PAT performs the writes, the job's own `GITHUB_TOKEN` needs only
+`contents: read` for `actions/checkout`:
+
+```yaml
+permissions:
+  contents: read
+```
+
+Configure the PAT itself using one of the following sections.
+
+#### Classic PAT scopes
+
+A classic PAT is the recommended compatibility-first credential for built-in
+auto-merge. Create it under **Settings > Developer settings > Personal access
+tokens > Tokens (classic)** for a dedicated automation account that already has
+write access to the target repository. A scope cannot grant repository access
+that the account itself does not have.
+
+Select the narrowest applicable classic PAT scope:
+
+- For public repositories only, select `public_repo`.
+- For a private or internal repository, select `repo`. GitHub defines `repo` as
+  a broad scope covering public and private repositories, so a dedicated
+  automation account limits its exposure.
+
+Do not select the classic PAT scopes `workflow`, `admin:org`, or any package
+scope; this action does not need them. Set an expiration, rotate the PAT before
+it expires, and store it in an Actions secret such as
+`PREK_AUTOUPDATE_TOKEN`—never directly in workflow YAML. See GitHub's
+[classic PAT scope reference](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps).
+
+If the repository belongs to an organization that uses SAML single sign-on,
+authorize the classic PAT for that organization after creating it. An
+organization can also prohibit classic PAT access entirely. See GitHub's
+[PAT management guidance](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens).
+
+Omit `author-login`; the action discovers the PAT owner's login.
+
+#### Fine-grained PAT permissions
+
+A fine-grained PAT is a narrower alternative when the organization and target
+repository support it. Select the target repository and grant these repository
+permissions:
+
+- **Contents: read and write**
+- **Pull requests: read and write**
+
+GitHub adds **Metadata: read** automatically. No other repository or account
+permissions are needed. Omit `author-login`; the action discovers the PAT
+owner's login.
 
 ### When to set `author-login`
 
 `author-login` is only a fallback used to prove that an update PR belongs to
-this action. It does not select the account used by the token, change the PR
-author, or grant permissions.
+this action. It does not select the credential, change the PR author, or grant
+either workflow or credential permissions.
 
 - **Default `GITHUB_TOKEN`:** omit `author-login`. Its default value,
   `github-actions[bot]`, is already correct. This remains true if the workflow
@@ -168,10 +229,6 @@ author, or grant permissions.
 - **Classic or fine-grained PAT:** omit `author-login`. The action discovers the
   PAT owner's login from GitHub and uses that value, even if `author-login` was
   also supplied.
-- **GitHub App installation token:** set `author-login` to the exact bot login
-  that authors the PR, normally `<app-slug>[bot]`. Installation tokens do not
-  identify a user through GitHub's user endpoint, so the action must use this
-  configured fallback.
 
 If a token cannot identify a user and its PR author is not
 `github-actions[bot]`, `author-login` is required and must exactly match the PR
@@ -179,40 +236,12 @@ author. Use the same value in scheduled, manual, and push-triggered cleanup
 runs; a different value causes the ownership checks to fail closed rather than
 modify a PR owned by another identity.
 
-### Personal access token permissions
-
-The most direct setup is a **classic PAT** owned by a dedicated automation
-account that already has write access to the target repository. The token's
-scope cannot grant repository access that its owner does not have.
-
-When creating the classic PAT under **Settings > Developer settings > Personal
-access tokens > Tokens (classic)**, select the narrowest applicable repository
-scope:
-
-- For public repositories only, select `public_repo`.
-- If the action must access a private or internal repository, select `repo`.
-  GitHub defines `repo` as a broad scope covering public and private
-  repositories, so use a dedicated automation account when practical.
-
-No additional classic scopes are required. In particular, do not select
-`workflow`, `admin:org`, or package scopes for this action. Set an expiration,
-rotate the token before it expires, and store it in an Actions secret such as
-`PREK_AUTOUPDATE_TOKEN`; never put the token directly in workflow YAML. See
-GitHub's
-[classic PAT scope reference](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps)
-for the access included in `repo` and `public_repo`.
-
-If the repository belongs to an organization that uses SAML single sign-on,
-authorize the classic PAT for that organization after creating it. An
-organization can also prohibit classic PAT access entirely. See GitHub's
-[PAT management guidance](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
-for expiration, SSO authorization, and organization restrictions.
-
-A fine-grained PAT is a narrower alternative when the organization and target
-repository support it. Select the target repository and grant repository
-**Contents: read and write** and **Pull requests: read and write**; GitHub adds
-**Metadata: read** automatically. The classic PAT instructions above are the
-recommended compatibility-first setup for this action's auto-merge option.
+As an advanced compatibility case, an organization that already issues GitHub
+App installation tokens may pass one through `token`. Configure the App itself
+with repository **Contents: read and write** and **Pull requests: read and
+write**, and set `author-login` to its exact `<app-slug>[bot]` login. The App
+does not need the **Actions** repository permission, and its installation token
+cannot use this action's built-in auto-merge option.
 
 ## Automatic merging
 
@@ -227,8 +256,8 @@ creates or updates and verifies its owned pull request:
     auto-merge: true
 ```
 
-This option is disabled by default and requires a PAT supplied through `token`;
-a GitHub App installation token is not an equivalent credential for this option.
+This option is disabled by default and requires a PAT supplied through `token`.
+The action skips the auto-merge request for every other credential type.
 
 With a confirmed PAT, the action binds the request to the exact head commit that
 it published. GitHub, rather than the action, waits for every required review
@@ -239,12 +268,11 @@ Complete all of these prerequisites before enabling the option:
 
 1. In **Settings > General > Pull Requests**, enable **Allow auto-merge** and
    **Allow squash merging** for the repository.
-2. Create a PAT for a dedicated automation identity using the permissions in
-   [Personal access token permissions](#personal-access-token-permissions).
-   Store it as a repository secret such as `PREK_AUTOUPDATE_TOKEN` and pass it
-   through the action's `token` input. The default `GITHUB_TOKEN` creates
-   approval-required pull-request workflow runs and is not used by the action
-   for auto-merge.
+2. Create a PAT for a dedicated automation identity. Configure either the
+   [classic PAT scopes](#classic-pat-scopes) or
+   [fine-grained PAT permissions](#fine-grained-pat-permissions), store the PAT
+   as a repository secret such as `PREK_AUTOUPDATE_TOKEN`, and pass it through
+   `token`. The action does not attempt built-in auto-merge without a PAT.
 3. Create an active branch ruleset targeting the default branch. Enable
    **Require a pull request before merging** and **Require status checks to pass
    before merging**, then select every CI check that must pass. Do not give the
