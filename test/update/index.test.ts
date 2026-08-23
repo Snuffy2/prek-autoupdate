@@ -127,10 +127,7 @@ describe("pull request auto-merge", () => {
             enablePullRequestAutoMerge: {
               pullRequest: {
                 id: "PR_node",
-                autoMergeRequest: {
-                  enabledAt: "2026-08-23T12:00:00Z",
-                  mergeMethod: "SQUASH",
-                },
+                autoMergeRequest: enabledAutoMergeRequest(),
               },
             },
           };
@@ -163,10 +160,7 @@ describe("pull request auto-merge", () => {
     const execution = await makeExecution(["prek.toml"]);
     const graphql = queryOnlyGraphql(
       autoMergePull({
-        autoMergeRequest: {
-          enabledAt: "2026-08-23T12:00:00Z",
-          mergeMethod: "SQUASH",
-        },
+        autoMergeRequest: enabledAutoMergeRequest(),
       }),
     );
     const autoMergeExecution = {
@@ -212,10 +206,7 @@ describe("pull request auto-merge", () => {
         enablePullRequestAutoMerge: {
           pullRequest: autoMergePull({
             id: "different-node",
-            autoMergeRequest: {
-              enabledAt: "2026-08-23T12:00:00Z",
-              mergeMethod: "SQUASH",
-            },
+            autoMergeRequest: enabledAutoMergeRequest(),
           }),
         },
       },
@@ -265,20 +256,14 @@ describe("pull request auto-merge", () => {
       },
     });
     const postEnableFirstPage = autoMergePull({
-      autoMergeRequest: {
-        enabledAt: "2026-08-23T12:00:00Z",
-        mergeMethod: "SQUASH",
-      },
+      autoMergeRequest: enabledAutoMergeRequest(),
       labels: {
         nodes: firstPageLabels,
         pageInfo: { hasNextPage: true, endCursor: "cursor-2" },
       },
     });
     const postEnableSecondPage = autoMergePull({
-      autoMergeRequest: {
-        enabledAt: "2026-08-23T12:00:00Z",
-        mergeMethod: "SQUASH",
-      },
+      autoMergeRequest: enabledAutoMergeRequest(),
       labels: {
         nodes: [{ name: "dependencies" }],
         pageInfo: { hasNextPage: false, endCursor: null },
@@ -340,10 +325,7 @@ describe("pull request auto-merge", () => {
     const execution = await makeExecution(["prek.toml"]);
     const changedPull = autoMergePull({
       baseRefName: "unexpected-base",
-      autoMergeRequest: {
-        enabledAt: "2026-08-23T12:00:00Z",
-        mergeMethod: "SQUASH",
-      },
+      autoMergeRequest: enabledAutoMergeRequest(),
     });
     const graphql = vi
       .fn()
@@ -354,10 +336,7 @@ describe("pull request auto-merge", () => {
         enablePullRequestAutoMerge: {
           pullRequest: {
             id: "PR_node",
-            autoMergeRequest: {
-              enabledAt: "2026-08-23T12:00:00Z",
-              mergeMethod: "SQUASH",
-            },
+            autoMergeRequest: enabledAutoMergeRequest(),
           },
         },
       })
@@ -387,10 +366,7 @@ describe("pull request auto-merge", () => {
     const execution = await makeExecution(["prek.toml"]);
     const changedPull = autoMergePull({
       baseRefName: "unexpected-base",
-      autoMergeRequest: {
-        enabledAt: "2026-08-23T12:00:00Z",
-        mergeMethod: "SQUASH",
-      },
+      autoMergeRequest: enabledAutoMergeRequest(),
     });
     const graphql = vi
       .fn()
@@ -401,10 +377,7 @@ describe("pull request auto-merge", () => {
         enablePullRequestAutoMerge: {
           pullRequest: {
             id: "PR_node",
-            autoMergeRequest: {
-              enabledAt: "2026-08-23T12:00:00Z",
-              mergeMethod: "SQUASH",
-            },
+            autoMergeRequest: enabledAutoMergeRequest(),
           },
         },
       })
