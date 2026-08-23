@@ -10,7 +10,7 @@ import type { ActionContext, GitHubClient } from "../../src/contracts.js";
 import {
   parseInputs,
   normalizeServerUrl,
-  resolveAuthenticatedLogin,
+  resolveAuthenticatedIdentity,
   shouldUpdate,
   validateCheckout,
 } from "../../src/input.js";
@@ -45,6 +45,7 @@ function checkoutContext(
 ): ActionContext {
   return {
     authenticatedLogin: "prek-bot",
+    tokenAuthenticatedAsUser: true,
     baseBranch: "main",
     baseSha: "0".repeat(40),
     eventName: "schedule",
@@ -155,7 +156,7 @@ describe("parseInputs", () => {
   );
 });
 
-describe("resolveAuthenticatedLogin", () => {
+describe("resolveAuthenticatedIdentity", () => {
   function clientWithAuthenticatedUser(
     implementation: () => Promise<unknown>,
   ): GitHubClient {
@@ -174,8 +175,11 @@ describe("resolveAuthenticatedLogin", () => {
     }));
 
     await expect(
-      resolveAuthenticatedLogin(client, "token", "fallback[bot]"),
-    ).resolves.toBe("exact-user-login");
+      resolveAuthenticatedIdentity(client, "token", "fallback[bot]"),
+    ).resolves.toEqual({
+      authenticatedAsUser: true,
+      login: "exact-user-login",
+    });
   });
 
   it.each([401, 403])(
@@ -186,8 +190,11 @@ describe("resolveAuthenticatedLogin", () => {
       });
 
       await expect(
-        resolveAuthenticatedLogin(client, "token", "custom-app[bot]"),
-      ).resolves.toBe("custom-app[bot]");
+        resolveAuthenticatedIdentity(client, "token", "custom-app[bot]"),
+      ).resolves.toEqual({
+        authenticatedAsUser: false,
+        login: "custom-app[bot]",
+      });
     },
   );
 
@@ -200,7 +207,7 @@ describe("resolveAuthenticatedLogin", () => {
     });
 
     await expect(
-      resolveAuthenticatedLogin(client, "token", "fallback[bot]"),
+      resolveAuthenticatedIdentity(client, "token", "fallback[bot]"),
     ).rejects.toBe(failure);
   });
 });

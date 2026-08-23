@@ -49,6 +49,7 @@ const execution = {
     baseBranch: "main",
     baseSha: "base",
     authenticatedLogin: "github-actions[bot]",
+    tokenAuthenticatedAsUser: false,
   },
   inputs: {
     token: "token",

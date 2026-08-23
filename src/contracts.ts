@@ -28,6 +28,7 @@ export interface ActionContext {
   readonly baseBranch: string;
   readonly baseSha: string;
   readonly authenticatedLogin: string;
+  readonly tokenAuthenticatedAsUser: boolean;
 }
 
 export type PullRequestOperation = "closed" | "created" | "none" | "updated";

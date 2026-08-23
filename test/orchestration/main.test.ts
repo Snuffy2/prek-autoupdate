@@ -65,6 +65,7 @@ const context: ActionContext = {
   baseBranch: "main",
   baseSha: "base",
   authenticatedLogin: "github-actions[bot]",
+  tokenAuthenticatedAsUser: false,
 };
 
 describe("runAction", () => {

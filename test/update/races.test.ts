@@ -322,6 +322,36 @@ describe("update publication races", () => {
     );
   });
 
+  it("does not attempt auto-merge when the token is not a PAT", async () => {
+    const harness = await makeHarness();
+    harness.create.mockImplementation(async () => ({
+      data: mergePull(harness.pull, {
+        head: {
+          ...harness.pull.head,
+          sha: await remoteSha(harness.remote),
+        },
+      }),
+    }));
+    const execution: ActionExecution = {
+      ...harness.execution,
+      context: {
+        ...harness.execution.context,
+        tokenAuthenticatedAsUser: false,
+      },
+      inputs: { ...harness.execution.inputs, autoMerge: true },
+    };
+
+    await expect(runUpdate(execution)).resolves.toEqual({
+      operation: "created",
+      pullRequestNumber: 42,
+    });
+
+    expect(harness.graphql).not.toHaveBeenCalled();
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringMatching(/Skipping auto-merge.*provide a PAT/u),
+    );
+  });
+
   it("preserves the pushed branch when create has an ambiguous outcome", async () => {
     const harness = await makeHarness();
     harness.create.mockRejectedValue(
@@ -944,6 +974,7 @@ async function makeHarness(options: HarnessOptions = {}) {
     client,
     context: {
       authenticatedLogin: "github-actions[bot]",
+      tokenAuthenticatedAsUser: true,
       baseBranch: "main",
       baseSha,
       eventName: "schedule",

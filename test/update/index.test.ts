@@ -513,6 +513,7 @@ async function makeExecution(
       repositoryFullName: "owner/repo",
       serverUrl: "https://github.com",
       workspace,
+      tokenAuthenticatedAsUser: true,
     },
     inputs: {
       addPaths: [],

@@ -36263,6 +36263,7 @@ async function resolveContext(client, inputs) {
         "HEAD",
     ]);
     const baseSha = await git$1(workspace, ["rev-parse", "HEAD"]);
+    const identity = await resolveAuthenticatedIdentity(client, inputs.token, inputs.authorLogin);
     return {
         eventName,
         owner,
@@ -36272,7 +36273,8 @@ async function resolveContext(client, inputs) {
         workspace,
         baseBranch,
         baseSha,
-        authenticatedLogin: await resolveAuthenticatedLogin(client, inputs.token, inputs.authorLogin),
+        authenticatedLogin: identity.login,
+        tokenAuthenticatedAsUser: identity.authenticatedAsUser,
     };
 }
 /** Validate checkout requirements needed only by the update phase. */
@@ -36334,11 +36336,11 @@ function assertRuntime() {
         throw new Error(`prek-autoupdate supports Linux x64 and arm64, not ${process.arch}`);
     }
 }
-async function resolveAuthenticatedLogin(client, token, fallbackLogin) {
+async function resolveAuthenticatedIdentity(client, token, fallbackLogin) {
     setSecret(token);
     try {
         const response = await client.rest.users.getAuthenticated();
-        return response.data.login;
+        return { authenticatedAsUser: true, login: response.data.login };
     }
     catch (error) {
         if (typeof error === "object" &&
@@ -36346,7 +36348,7 @@ async function resolveAuthenticatedLogin(client, token, fallbackLogin) {
             "status" in error &&
             (error.status === 401 ||
                 error.status === 403)) {
-            return fallbackLogin;
+            return { authenticatedAsUser: false, login: fallbackLogin };
         }
         throw error;
     }
@@ -40119,6 +40121,10 @@ async function runUpdate(execution) {
 }
 async function enableAutoMergeIfRequested(execution, pullNumber, expectedHeadOid) {
     if (!execution.inputs.autoMerge) {
+        return;
+    }
+    if (!execution.context.tokenAuthenticatedAsUser) {
+        warning("Skipping auto-merge because the configured token did not authenticate with GET /user; provide a PAT through the token input");
         return;
     }
     await enablePullRequestAutoMerge(execution, pullNumber, expectedHeadOid);

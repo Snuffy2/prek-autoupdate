@@ -10,7 +10,7 @@ inputs:
     default: ${{ github.token }}
   auto-merge:
     description:
-      Enable squash auto-merge for the exact generated pull-request revision.
+      Enable PAT-authenticated squash auto-merge for the exact generated PR.
     required: false
     default: "false"
   author-login:

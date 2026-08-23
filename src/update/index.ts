@@ -390,6 +390,12 @@ async function enableAutoMergeIfRequested(
   if (!execution.inputs.autoMerge) {
     return;
   }
+  if (!execution.context.tokenAuthenticatedAsUser) {
+    core.warning(
+      "Skipping auto-merge because the configured token did not authenticate with GET /user; provide a PAT through the token input",
+    );
+    return;
+  }
   await enablePullRequestAutoMerge(execution, pullNumber, expectedHeadOid);
 }
 
