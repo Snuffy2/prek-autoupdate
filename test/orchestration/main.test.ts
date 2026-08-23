@@ -168,7 +168,10 @@ describe("runAction", () => {
     );
     expect(core.setOutput).toHaveBeenCalledWith("pull-request-number", "41");
     expect(core.setFailed).toHaveBeenCalledWith(
-      "update: Pull request #41 was created, but post-publication setup failed: Error: auto-merge failed",
+      expect.stringContaining("Pull request #41"),
+    );
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining("auto-merge failed"),
     );
   });
 

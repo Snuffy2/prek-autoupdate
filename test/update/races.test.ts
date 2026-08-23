@@ -284,23 +284,23 @@ describe("update publication races", () => {
       ...harness.execution,
       inputs: { ...harness.execution.inputs, autoMerge: true },
     };
-    harness.graphql.mockImplementation(async (document: string) => {
-      const headRefOid = await remoteSha(harness.remote);
-      const pullRequest = autoMergePull(
-        headRefOid,
-        document.startsWith("mutation"),
-      );
-      return document.startsWith("mutation")
-        ? {
-            enablePullRequestAutoMerge: {
-              pullRequest: {
-                id: pullRequest.id,
-                autoMergeRequest: pullRequest.autoMergeRequest,
+    harness.graphql.mockImplementation(
+      async (_document: string, variables: Record<string, unknown>) => {
+        const headRefOid = await remoteSha(harness.remote);
+        const enabling = "expectedHeadOid" in variables;
+        const pullRequest = autoMergePull(headRefOid, enabling);
+        return enabling
+          ? {
+              enablePullRequestAutoMerge: {
+                pullRequest: {
+                  id: pullRequest.id,
+                  autoMergeRequest: pullRequest.autoMergeRequest,
+                },
               },
-            },
-          }
-        : { repository: { pullRequest } };
-    });
+            }
+          : { repository: { pullRequest } };
+      },
+    );
 
     await expect(runUpdate(execution)).resolves.toEqual({
       operation: "created",

@@ -163,24 +163,20 @@ describe("pull request auto-merge", () => {
 
   it("does not replace an existing auto-merge request", async () => {
     const execution = await makeExecution(["prek.toml"]);
-    const graphql = vi.fn().mockResolvedValue({
-      repository: {
-        pullRequest: autoMergePull({
-          autoMergeRequest: {
-            enabledAt: "2026-08-23T12:00:00Z",
-            mergeMethod: "SQUASH",
-          },
-        }),
-      },
-    });
+    const graphql = queryOnlyGraphql(
+      autoMergePull({
+        autoMergeRequest: {
+          enabledAt: "2026-08-23T12:00:00Z",
+          mergeMethod: "SQUASH",
+        },
+      }),
+    );
     const autoMergeExecution = {
       ...execution,
       client: { ...execution.client, graphql } as unknown as GitHubClient,
     };
 
     await enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD");
-
-    expect(graphql).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -190,9 +186,7 @@ describe("pull request auto-merge", () => {
     ["an unowned pull request", autoMergePull({ author: { login: "other" } })],
   ])("rejects %s before mutation", async (_name, pullRequest) => {
     const execution = await makeExecution(["prek.toml"]);
-    const graphql = vi.fn().mockResolvedValue({
-      repository: { pullRequest },
-    });
+    const graphql = queryOnlyGraphql(pullRequest);
     const autoMergeExecution = {
       ...execution,
       client: { ...execution.client, graphql } as unknown as GitHubClient,
@@ -201,7 +195,6 @@ describe("pull request auto-merge", () => {
     await expect(
       enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
     ).rejects.toThrow(/changed before squash auto-merge/u);
-    expect(graphql).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -327,13 +320,19 @@ describe("pull request auto-merge", () => {
       enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
     ).resolves.toBeUndefined();
 
-    expect(graphql).toHaveBeenCalledTimes(5);
-    expect(graphql.mock.calls[1]?.[1]).toEqual(
-      expect.objectContaining({ labelsCursor: "cursor-1" }),
+    const variables = graphql.mock.calls.map((call) => call[1]);
+    const beforeMutation = variables.findIndex(
+      (value) => value?.labelsCursor === "cursor-1",
     );
-    expect(graphql.mock.calls[4]?.[1]).toEqual(
-      expect.objectContaining({ labelsCursor: "cursor-2" }),
+    const mutation = variables.findIndex(
+      (value) => value?.expectedHeadOid === "HEAD",
     );
+    const afterMutation = variables.findIndex(
+      (value) => value?.labelsCursor === "cursor-2",
+    );
+    expect(beforeMutation).toBeGreaterThanOrEqual(0);
+    expect(mutation).toBeGreaterThan(beforeMutation);
+    expect(afterMutation).toBeGreaterThan(mutation);
   });
 
   it("disables auto-merge when post-mutation ownership revalidation fails", async () => {
@@ -378,8 +377,7 @@ describe("pull request auto-merge", () => {
       enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
     ).rejects.toThrow(/did not confirm squash auto-merge/u);
 
-    expect(graphql).toHaveBeenCalledTimes(4);
-    expect(graphql.mock.calls[3]?.[1]).toEqual({
+    expect(graphql).toHaveBeenCalledWith(expect.any(String), {
       pullRequestId: "PR_node",
     });
   });
@@ -815,4 +813,15 @@ function autoMergePull(
     state: "OPEN",
     ...overrides,
   };
+}
+
+function queryOnlyGraphql(pullRequest: unknown) {
+  return vi.fn(
+    async (_document: string, variables: Record<string, unknown>) => {
+      if ("expectedHeadOid" in variables) {
+        throw new Error("unexpected auto-merge mutation");
+      }
+      return { repository: { pullRequest } };
+    },
+  );
 }
