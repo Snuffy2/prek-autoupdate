@@ -136,11 +136,14 @@ Keep the default token identity consistent for the update PR and later cleanup
 runs, because cleanup uses that identity as part of its ownership proof.
 
 If a generated update PR must trigger downstream CI, provide a GitHub App
-installation token or a personal access token (PAT) through `token` instead.
-Give that token repository **Contents: read and write** and **Pull requests:
-read and write** permissions; it needs no `actions: write` permission. Store it
-as a repository secret, then pass it to the action. With a GitHub App
-installation token, also set its bot login before the action creates a PR:
+installation token or a personal access token (PAT) through `token` instead. For
+a fine-grained PAT or GitHub App, give that token repository **Contents: read
+and write** and **Pull requests: read and write** permissions. A classic PAT
+uses OAuth scopes instead; see
+[Personal access token permissions](#personal-access-token-permissions) below.
+No token type needs `actions: write` permission. Store the credential as a
+repository secret, then pass it to the action. With a GitHub App installation
+token, also set its bot login before the action creates a PR:
 
 ```yaml
 with:
@@ -156,6 +159,41 @@ or updates the PR but skips the auto-merge request.
 Keep the same `author-login` value for scheduled, manual, and push-triggered
 cleanup runs. For a PAT, the action normally discovers the token owner's GitHub
 login automatically, so `author-login` is not required.
+
+### Personal access token permissions
+
+The most direct setup is a **classic PAT** owned by a dedicated automation
+account that already has write access to the target repository. The token's
+scope cannot grant repository access that its owner does not have.
+
+When creating the classic PAT under **Settings > Developer settings > Personal
+access tokens > Tokens (classic)**, select the narrowest applicable repository
+scope:
+
+- For public repositories only, select `public_repo`.
+- If the action must access a private or internal repository, select `repo`.
+  GitHub defines `repo` as a broad scope covering public and private
+  repositories, so use a dedicated automation account when practical.
+
+No additional classic scopes are required. In particular, do not select
+`workflow`, `admin:org`, or package scopes for this action. Set an expiration,
+rotate the token before it expires, and store it in an Actions secret such as
+`PREK_AUTOUPDATE_TOKEN`; never put the token directly in workflow YAML. See
+GitHub's
+[classic PAT scope reference](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps)
+for the access included in `repo` and `public_repo`.
+
+If the repository belongs to an organization that uses SAML single sign-on,
+authorize the classic PAT for that organization after creating it. An
+organization can also prohibit classic PAT access entirely. See GitHub's
+[PAT management guidance](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
+for expiration, SSO authorization, and organization restrictions.
+
+A fine-grained PAT is a narrower alternative when the organization and target
+repository support it. Select the target repository and grant repository
+**Contents: read and write** and **Pull requests: read and write**; GitHub adds
+**Metadata: read** automatically. The classic PAT instructions above are the
+recommended compatibility-first setup for this action's auto-merge option.
 
 ## Automatic merging
 
@@ -182,12 +220,12 @@ Complete all of these prerequisites before enabling the option:
 
 1. In **Settings > General > Pull Requests**, enable **Allow auto-merge** and
    **Allow squash merging** for the repository.
-2. Create a PAT for a dedicated automation identity with repository **Contents:
-   read and write** and **Pull requests: read and write** access. Store it as a
-   repository secret such as `PREK_AUTOUPDATE_TOKEN` and pass it through the
-   action's `token` input. The default `GITHUB_TOKEN` creates approval-required
-   pull-request workflow runs and does not authenticate as a user, so the action
-   will not use it for auto-merge.
+2. Create a PAT for a dedicated automation identity using the permissions in
+   [Personal access token permissions](#personal-access-token-permissions).
+   Store it as a repository secret such as `PREK_AUTOUPDATE_TOKEN` and pass it
+   through the action's `token` input. The default `GITHUB_TOKEN` creates
+   approval-required pull-request workflow runs and is not used by the action
+   for auto-merge.
 3. Create an active branch ruleset targeting the default branch. Enable
    **Require a pull request before merging** and **Require status checks to pass
    before merging**, then select every CI check that must pass. Do not give the
