@@ -118,34 +118,32 @@ describe("captured output", () => {
 describe("pull request auto-merge", () => {
   it("enables squash auto-merge for the exact observed head revision", async () => {
     const execution = await makeExecution(["prek.toml"]);
-    const graphql = vi
-      .fn()
-      .mockResolvedValueOnce({
-        repository: {
-          pullRequest: autoMergePull(),
-        },
-      })
-      .mockResolvedValueOnce({
-        enablePullRequestAutoMerge: {
-          pullRequest: {
-            id: "PR_node",
-            autoMergeRequest: {
-              enabledAt: "2026-08-23T12:00:00Z",
-              mergeMethod: "SQUASH",
+    let enabled = false;
+    const graphql = vi.fn(
+      async (_document: string, variables: Record<string, unknown>) => {
+        if ("expectedHeadOid" in variables) {
+          enabled = true;
+          return {
+            enablePullRequestAutoMerge: {
+              pullRequest: {
+                id: "PR_node",
+                autoMergeRequest: {
+                  enabledAt: "2026-08-23T12:00:00Z",
+                  mergeMethod: "SQUASH",
+                },
+              },
             },
+          };
+        }
+        return {
+          repository: {
+            pullRequest: autoMergePull({
+              autoMergeRequest: enabled ? enabledAutoMergeRequest() : null,
+            }),
           },
-        },
-      })
-      .mockResolvedValueOnce({
-        repository: {
-          pullRequest: autoMergePull({
-            autoMergeRequest: {
-              enabledAt: "2026-08-23T12:00:00Z",
-              mergeMethod: "SQUASH",
-            },
-          }),
-        },
-      });
+        };
+      },
+    );
     const autoMergeExecution = {
       ...execution,
       client: { ...execution.client, graphql } as unknown as GitHubClient,
@@ -286,31 +284,39 @@ describe("pull request auto-merge", () => {
         pageInfo: { hasNextPage: false, endCursor: null },
       },
     });
-    const graphql = vi
-      .fn()
-      .mockResolvedValueOnce({
-        repository: { pullRequest: preEnableFirstPage },
-      })
-      .mockResolvedValueOnce({
-        repository: { pullRequest: preEnableSecondPage },
-      })
-      .mockResolvedValueOnce({
-        enablePullRequestAutoMerge: {
-          pullRequest: {
-            id: "PR_node",
-            autoMergeRequest: {
-              enabledAt: "2026-08-23T12:00:00Z",
-              mergeMethod: "SQUASH",
+    let enabled = false;
+    const graphql = vi.fn(
+      async (_document: string, variables: Record<string, unknown>) => {
+        if ("expectedHeadOid" in variables) {
+          enabled = true;
+          return {
+            enablePullRequestAutoMerge: {
+              pullRequest: {
+                id: "PR_node",
+                autoMergeRequest: enabledAutoMergeRequest(),
+              },
             },
+          };
+        }
+        const cursor = variables.labelsCursor;
+        if (cursor === null) {
+          return {
+            repository: {
+              pullRequest: enabled ? postEnableFirstPage : preEnableFirstPage,
+            },
+          };
+        }
+        const expectedCursor = enabled ? "cursor-2" : "cursor-1";
+        if (cursor !== expectedCursor) {
+          throw new Error(`unexpected label cursor ${String(cursor)}`);
+        }
+        return {
+          repository: {
+            pullRequest: enabled ? postEnableSecondPage : preEnableSecondPage,
           },
-        },
-      })
-      .mockResolvedValueOnce({
-        repository: { pullRequest: postEnableFirstPage },
-      })
-      .mockResolvedValueOnce({
-        repository: { pullRequest: postEnableSecondPage },
-      });
+        };
+      },
+    );
     const autoMergeExecution = {
       ...execution,
       client: { ...execution.client, graphql } as unknown as GitHubClient,
@@ -320,19 +326,14 @@ describe("pull request auto-merge", () => {
       enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
     ).resolves.toBeUndefined();
 
-    const variables = graphql.mock.calls.map((call) => call[1]);
-    const beforeMutation = variables.findIndex(
-      (value) => value?.labelsCursor === "cursor-1",
+    expect(graphql).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ labelsCursor: "cursor-1" }),
     );
-    const mutation = variables.findIndex(
-      (value) => value?.expectedHeadOid === "HEAD",
+    expect(graphql).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ labelsCursor: "cursor-2" }),
     );
-    const afterMutation = variables.findIndex(
-      (value) => value?.labelsCursor === "cursor-2",
-    );
-    expect(beforeMutation).toBeGreaterThanOrEqual(0);
-    expect(mutation).toBeGreaterThan(beforeMutation);
-    expect(afterMutation).toBeGreaterThan(mutation);
   });
 
   it("disables auto-merge when post-mutation ownership revalidation fails", async () => {
@@ -812,6 +813,13 @@ function autoMergePull(
     number: 42,
     state: "OPEN",
     ...overrides,
+  };
+}
+
+function enabledAutoMergeRequest() {
+  return {
+    enabledAt: "2026-08-23T12:00:00Z",
+    mergeMethod: "SQUASH",
   };
 }
 
