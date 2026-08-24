@@ -48,6 +48,7 @@ interface FinalizerOptions {
   statusOutput?: string;
   tagCommitSha?: string;
   tagSha?: string;
+  tagMissing?: boolean;
 }
 
 function runFinalizer(options: FinalizerOptions = {}): {
@@ -87,8 +88,10 @@ diff)
   ;;
 ls-remote)
   printf '%s\trefs/heads/main\n' "$BRANCH_SHA"
-  printf '%s\trefs/tags/v2.0.3\n' "$TAG_SHA"
-  printf '%s\trefs/tags/v2.0.3^{}\n' "$TAG_COMMIT_SHA"
+  if [[ "$TAG_MISSING" != "true" ]]; then
+    printf '%s\trefs/tags/v2.0.3\n' "$TAG_SHA"
+    printf '%s\trefs/tags/v2.0.3^{}\n' "$TAG_COMMIT_SHA"
+  fi
   exit 0
   ;;
 add|config|commit)
@@ -137,6 +140,7 @@ exit 2
             SOURCE_SHA,
             STATUS_OUTPUT: options.statusOutput ?? "",
             TAG_COMMIT_SHA: options.tagCommitSha ?? SOURCE_SHA,
+            TAG_MISSING: String(options.tagMissing ?? false),
             TAG_SHA: options.tagSha ?? SOURCE_SHA,
           },
           stdio: ["ignore", "pipe", "pipe"],
@@ -186,6 +190,15 @@ describe("release finalization", () => {
     );
   });
 
+  it("atomically creates a release tag for a dispatched release", () => {
+    const result = runFinalizer({ tagMissing: true });
+
+    expect(result.output).toBe(`sha=${RELEASE_SHA}\n`);
+    expect(result.calls).toContain("--force-with-lease=refs/tags/v2.0.3:");
+    expect(result.calls).toContain("HEAD:refs/tags/v2.0.3");
+    expect(result.calls).not.toContain("+HEAD:refs/tags/v2.0.3");
+  });
+
   it("fails if the default branch advances during preparation", () => {
     expect(() => runFinalizer({ branchSha: "3".repeat(40) })).toThrow(
       "Default branch or release tag advanced during preparation",
@@ -218,6 +231,14 @@ describe("release finalization", () => {
 
     expect(result.output).toBe(`sha=${SOURCE_SHA}\n`);
     expect(result.calls).not.toContain("push --atomic");
+  });
+
+  it("creates a missing tag even when release files are already current", () => {
+    const result = runFinalizer({ noChanges: true, tagMissing: true });
+
+    expect(result.output).toBe(`sha=${SOURCE_SHA}\n`);
+    expect(result.calls).toContain("push --atomic");
+    expect(result.calls).toContain("HEAD:refs/tags/v2.0.3");
   });
 
   it("does not mask an unexpected cached diff failure", () => {

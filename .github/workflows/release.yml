@@ -1,9 +1,14 @@
 name: Release
 
+run-name: Release ${{ inputs.tag }}
+
 on:
-  release:
-    types:
-      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (for example, v2.0.5)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,16 +19,15 @@ concurrency:
 
 jobs:
   prepare:
-    if: github.event.release.prerelease == false
     outputs:
       major-tag: ${{ steps.release.outputs.major-tag }}
       source-sha: ${{ steps.release.outputs.source-sha }}
     runs-on: ubuntu-latest
     steps:
-      - name: Check out published release source
+      - name: Check out release source
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.sha }}
           path: release
           fetch-depth: 0
           persist-credentials: false
@@ -54,8 +58,27 @@ jobs:
       - name: Prepare and validate release files
         id: release
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: bash ../tooling/.github/scripts/prepare-release.sh
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$RELEASE_REF" != "$DEFAULT_BRANCH" ]]; then
+            echo "Release workflow must be dispatched from $DEFAULT_BRANCH, not $RELEASE_REF." >&2
+            exit 1
+          fi
+
+          release_view_error="$RUNNER_TEMP/release-view-error.txt"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>"$release_view_error"; then
+            echo "Resuming existing GitHub release: $RELEASE_TAG"
+          elif ! grep -Eq "HTTP 404|release not found" "$release_view_error"; then
+            cat "$release_view_error" >&2
+            exit 1
+          fi
+
+          bash ../tooling/.github/scripts/prepare-release.sh
         working-directory: release
 
       - name: Upload prepared release files
@@ -71,7 +94,7 @@ jobs:
 
   finalize:
     needs: prepare
-    # Commit the prepared release files and retarget the new point tag once.
+    # Commit the prepared release files and create or retarget the point tag once.
     permissions:
       actions: read
       contents: write
@@ -101,19 +124,49 @@ jobs:
           name: release-${{ github.run_id }}-${{ github.run_attempt }}
           path: prepared
 
-      - name: Commit release files and finalize published tag
+      - name: Commit release files and finalize release tag
         id: release
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ github.token }}
           PREPARED_DIRECTORY: ${{ github.workspace }}/prepared
           RELEASE_DIRECTORY: ${{ github.workspace }}/release
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
           SOURCE_SHA: ${{ needs.prepare.outputs.source-sha }}
         run: node tooling/.github/scripts/finalize-release.mjs
 
+  publish:
+    needs: finalize
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          release_view_error="$RUNNER_TEMP/release-view-error.txt"
+          if release_is_draft="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>"$release_view_error")"; then
+            if [[ "$release_is_draft" != "true" ]]; then
+              echo "GitHub release is already published: $RELEASE_TAG"
+              exit 0
+            fi
+            gh release edit "$RELEASE_TAG" --draft=false
+          elif grep -Eq "HTTP 404|release not found" "$release_view_error"; then
+            gh release create "$RELEASE_TAG" \
+              --generate-notes \
+              --title "$RELEASE_TAG" \
+              --verify-tag
+          else
+            cat "$release_view_error" >&2
+            exit 1
+          fi
+
   update-major:
-    needs: [prepare, finalize]
+    needs: [prepare, finalize, publish]
     # Move or create the verified major tag; no other repository writes are needed.
     permissions:
       contents: write
@@ -134,6 +187,6 @@ jobs:
       - name: Update moving major tag
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
           TARGET_SHA: ${{ needs.finalize.outputs.release-sha }}
         run: bash .github/scripts/update-major-tag.sh

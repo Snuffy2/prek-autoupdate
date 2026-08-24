@@ -13,6 +13,7 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
 interface WorkflowStep {
+  readonly env?: Record<string, string>;
   readonly id?: string;
   readonly uses?: string;
   readonly with?: Record<string, unknown>;
@@ -24,10 +25,16 @@ interface WorkflowJob {
 }
 
 interface Workflow {
+  readonly on: {
+    readonly workflow_dispatch: {
+      readonly inputs: Record<string, Record<string, unknown>>;
+    };
+  };
   readonly permissions: Record<string, string>;
   readonly jobs: {
     readonly "prepare": WorkflowJob;
     readonly "finalize": WorkflowJob;
+    readonly "publish": WorkflowJob;
     readonly "update-major": WorkflowJob;
   };
 }
@@ -351,6 +358,23 @@ fi
 }
 
 describe("release workflow", () => {
+  it("requires a release tag when manually dispatched", () => {
+    const releaseWorkflow = workflow();
+
+    expect(Object.keys(releaseWorkflow.on)).toEqual(["workflow_dispatch"]);
+    expect(releaseWorkflow.on.workflow_dispatch.inputs.tag).toMatchObject({
+      required: true,
+      type: "string",
+    });
+    const releaseTagValues = Object.values(releaseWorkflow.jobs).flatMap(
+      (job) =>
+        job.steps.flatMap((step) =>
+          step.env?.RELEASE_TAG === undefined ? [] : [step.env.RELEASE_TAG],
+        ),
+    );
+    expect(releaseTagValues).toEqual(Array(4).fill("${{ inputs.tag }}"));
+  });
+
   it.each([
     ["diff", "Unable to collect changed release paths"],
     ["ls-files", "Unable to collect untracked release paths"],
