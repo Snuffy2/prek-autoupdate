@@ -39,6 +39,9 @@ jobs:
       major-tag: ${{ steps.release.outputs.major-tag }}
       release-tag: ${{ steps.tag.outputs.release-tag }}
       source-sha: ${{ steps.release.outputs.source-sha }}
+    permissions:
+      actions: read
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - name: Check out release source
@@ -72,6 +75,18 @@ jobs:
       - run: npm ci --ignore-scripts
         working-directory: release
 
+      - name: Restore automatic release tag
+        if:
+          inputs.tag == '' && inputs.prerelease == false && github.run_attempt
+          != 1
+        uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          name: release-resolution-${{ github.run_id }}
+          path: release/resolution
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
       - name: Resolve release tag
         id: tag
         env:
@@ -79,8 +94,21 @@ jobs:
           EXPLICIT_TAG: ${{ inputs.tag }}
           GH_TOKEN: ${{ github.token }}
           IS_PRERELEASE: ${{ inputs.prerelease }}
+          PERSISTED_TAG_PATH:
+            ${{ github.workspace }}/release/resolution/release-tag
+          REQUIRE_PERSISTED_TAG: ${{ github.run_attempt != 1 }}
         run: node ../tooling/.github/scripts/resolve-release-tag.mjs
         working-directory: release
+
+      - name: Persist automatic release tag
+        if:
+          inputs.tag == '' && inputs.prerelease == false && github.run_attempt
+          == 1
+        uses: actions/upload-artifact@v7
+        with:
+          if-no-files-found: error
+          name: release-resolution-${{ github.run_id }}
+          path: release/resolution/release-tag
 
       - name: Prepare and validate release files
         id: release

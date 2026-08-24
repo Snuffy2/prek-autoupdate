@@ -13,6 +13,7 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
 interface WorkflowStep {
+  readonly if?: string;
   readonly env?: Record<string, string>;
   readonly id?: string;
   readonly uses?: string;
@@ -398,6 +399,40 @@ describe("release workflow", () => {
     ).toBe(true);
   });
 
+  it("persists automatic tags by stable run ID for reruns", () => {
+    const prepare = workflow().jobs.prepare;
+    const restoreIndex = prepare.steps.findIndex(
+      (step) =>
+        step.uses?.includes("download-artifact") &&
+        typeof step.with?.name === "string" &&
+        step.with.name.includes("release-resolution"),
+    );
+    const persistIndex = prepare.steps.findIndex(
+      (step) =>
+        step.uses?.includes("upload-artifact") &&
+        typeof step.with?.name === "string" &&
+        step.with.name.includes("release-resolution"),
+    );
+    const resolveIndex = prepare.steps.findIndex((step) => step.id === "tag");
+    const restore = prepare.steps[restoreIndex];
+    const persist = prepare.steps[persistIndex];
+    const resolve = prepare.steps[resolveIndex];
+
+    expect(prepare.permissions?.actions).toBe("read");
+    expect(restoreIndex).toBeGreaterThanOrEqual(0);
+    expect(persistIndex).toBeGreaterThanOrEqual(0);
+    expect(resolveIndex).toBeGreaterThanOrEqual(0);
+    expect(restore?.if).toContain("github.run_attempt != 1");
+    expect(persist?.if).toContain("github.run_attempt == 1");
+    expect(restore?.with?.name).toContain("github.run_id");
+    expect(restore?.with?.["run-id"]).toBe("${{ github.run_id }}");
+    expect(restore?.with?.name).not.toContain("run_attempt");
+    expect(persist?.with?.name).toBe(restore?.with?.name);
+    expect(restoreIndex).toBeLessThan(resolveIndex);
+    expect(resolve?.env?.PERSISTED_TAG_PATH).toBeTruthy();
+    expect(resolve?.env?.REQUIRE_PERSISTED_TAG).toContain("github.run_attempt");
+  });
+
   it.each(["finalize", "publish", "update-major"] as const)(
     "passes the resolved tag to the %s job",
     (jobName) => {
@@ -490,7 +525,7 @@ describe("release workflow", () => {
     expect({
       ...releaseWorkflow.permissions,
       ...releaseWorkflow.jobs.prepare.permissions,
-    }).toEqual({ contents: "read" });
+    }).toEqual({ actions: "read", contents: "read" });
     expect(releaseWorkflow.jobs.finalize.permissions).toEqual({
       actions: "read",
       contents: "write",

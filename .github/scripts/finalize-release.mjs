@@ -95,6 +95,19 @@ function validateExistingTag(releaseTag, sourceSha, tagCommitOid, tagOid) {
   } catch {
     throw new Error("Existing release tag has different release files");
   }
+  if (tagCommitOid !== sourceSha) {
+    const changedPaths = git(["diff", "--name-only", sourceSha, tagCommitOid])
+      .split("\n")
+      .filter(Boolean);
+    const unexpected = changedPaths.filter(
+      (path) => !RELEASE_FILES.includes(path),
+    );
+    if (unexpected.length > 0) {
+      throw new Error(
+        `Existing release tag changes unexpected path: ${unexpected[0]}`,
+      );
+    }
+  }
 }
 
 function main() {

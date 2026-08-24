@@ -1,5 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname } from "node:path";
 
 const STABLE_SEMVER_PATTERN =
   /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
@@ -25,15 +31,42 @@ function writeReleaseTag(releaseTag) {
   appendFileSync(required("GITHUB_OUTPUT"), `release-tag=${releaseTag}\n`);
 }
 
+function readPersistedTag(path) {
+  let persistedTag;
+  try {
+    persistedTag = readFileSync(path, "utf8").trim();
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw new Error("Unable to read persisted automatic release tag", {
+      cause: error,
+    });
+  }
+  if (!STABLE_SEMVER_PATTERN.test(persistedTag)) {
+    throw new Error("Persisted automatic release tag is invalid");
+  }
+  return persistedTag;
+}
+
+function persistReleaseTag(path, releaseTag) {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${releaseTag}\n`);
+}
+
 function main() {
   const explicitTag = process.env.EXPLICIT_TAG?.trim() ?? "";
   const isPrerelease = process.env.IS_PRERELEASE?.trim() ?? "";
   const bumpType = process.env.BUMP_TYPE?.trim() ?? "none";
+  const persistedTagPath = process.env.PERSISTED_TAG_PATH?.trim() ?? "";
+  const requirePersistedTag =
+    process.env.REQUIRE_PERSISTED_TAG?.trim() ?? "false";
   if (isPrerelease !== "true" && isPrerelease !== "false") {
     throw new Error("IS_PRERELEASE must be true or false");
   }
   if (!BUMP_TYPES.has(bumpType)) {
     throw new Error("BUMP_TYPE must be none, patch, minor, or major");
+  }
+  if (requirePersistedTag !== "true" && requirePersistedTag !== "false") {
+    throw new Error("REQUIRE_PERSISTED_TAG must be true or false");
   }
 
   if (explicitTag || isPrerelease === "true") {
@@ -45,6 +78,17 @@ function main() {
   }
   if (bumpType === "none") {
     throw new Error("Provide an explicit release tag or select a version bump");
+  }
+
+  if (persistedTagPath) {
+    const persistedTag = readPersistedTag(persistedTagPath);
+    if (persistedTag) {
+      writeReleaseTag(persistedTag);
+      return;
+    }
+  }
+  if (requirePersistedTag === "true") {
+    throw new Error("Persisted automatic release tag is missing");
   }
 
   const repository = required("GITHUB_REPOSITORY");
@@ -93,7 +137,9 @@ function main() {
     minor = 0n;
     patch = 0n;
   }
-  writeReleaseTag(`v${major}.${minor}.${patch}`);
+  const releaseTag = `v${major}.${minor}.${patch}`;
+  if (persistedTagPath) persistReleaseTag(persistedTagPath, releaseTag);
+  writeReleaseTag(releaseTag);
 }
 
 try {

@@ -46,8 +46,10 @@ interface FinalizerOptions {
   noChanges?: boolean;
   releaseTag?: string;
   mutatePrepared?: (directory: string) => void;
+  onFailure?: (calls: string) => void;
   statusOutput?: string;
   tagCommitSha?: string;
+  tagChangedPaths?: string[];
   tagFilesMatch?: boolean;
   tagSha?: string;
   tagMissing?: boolean;
@@ -83,7 +85,11 @@ status)
   ;;
 diff)
   if [[ "$2" == "--name-only" ]]; then
-    printf '%s\n' "$CHANGED_PATHS"
+    if [[ "\${3:-}" == "$SOURCE_SHA" && "\${4:-}" == "$TAG_COMMIT_SHA" ]]; then
+      printf '%s\n' "$TAG_CHANGED_PATHS"
+    else
+      printf '%s\n' "$CHANGED_PATHS"
+    fi
     exit 0
   fi
   if [[ "$2" == "--cached" && "$3" == "--quiet" ]]; then
@@ -164,6 +170,9 @@ exit 2
             SOURCE_SHA,
             STATUS_OUTPUT: options.statusOutput ?? "",
             TAG_COMMIT_SHA: options.tagCommitSha ?? SOURCE_SHA,
+            TAG_CHANGED_PATHS: (options.tagChangedPaths ?? RELEASE_FILES).join(
+              "\n",
+            ),
             TAG_FILES_MATCH: String(options.tagFilesMatch ?? true),
             TAG_MISSING: String(options.tagMissing ?? true),
             TAG_PARENT_SHA: options.tagParentSha ?? SOURCE_SHA,
@@ -177,6 +186,9 @@ exit 2
       );
     } catch (error) {
       const stderr = (error as { stderr?: Buffer | string }).stderr;
+      options.onFailure?.(
+        readFileSync(callsPath, { encoding: "utf8", flag: "a+" }),
+      );
       throw new Error(
         stderr?.toString().trim() || "release finalization failed",
         {
@@ -281,6 +293,22 @@ describe("release finalization", () => {
         tagSha: "3".repeat(40),
       }),
     ).toThrow(/existing release tag/iu);
+  });
+
+  it("rejects a generated release tag that changes an unexpected path", () => {
+    let calls = "";
+    expect(() =>
+      runFinalizer({
+        onFailure: (failureCalls) => {
+          calls = failureCalls;
+        },
+        tagChangedPaths: [...RELEASE_FILES, "README.md"],
+        tagCommitSha: RELEASE_SHA,
+        tagMissing: false,
+        tagSha: "3".repeat(40),
+      }),
+    ).toThrow(/existing release tag changes unexpected path/iu);
+    expect(calls).not.toContain("push ");
   });
 
   it("rejects a dirty release checkout", () => {

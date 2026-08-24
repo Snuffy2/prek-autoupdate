@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -15,6 +16,8 @@ interface ResolutionOptions {
   readonly bump?: string;
   readonly explicitTag?: string;
   readonly prerelease?: boolean;
+  readonly persistedTag?: string;
+  readonly requirePersistedTag?: boolean;
   readonly releases?: Array<{
     readonly draft: boolean;
     readonly prerelease: boolean;
@@ -25,11 +28,13 @@ interface ResolutionOptions {
 
 function resolveReleaseTag(options: ResolutionOptions): {
   readonly ghCalled: boolean;
+  readonly persistedTag?: string;
   readonly releaseTag: string;
 } {
   const directory = mkdtempSync(join(tmpdir(), "prek-release-tag-"));
   const callsPath = join(directory, "calls");
   const outputPath = join(directory, "output");
+  const persistedTagPath = join(directory, "persisted", "release-tag");
   const ghPath = join(directory, "gh");
   writeFileSync(
     ghPath,
@@ -40,6 +45,10 @@ printf '%s\n' "$RELEASES_JSON"
 `,
   );
   chmodSync(ghPath, 0o755);
+  mkdirSync(join(directory, "persisted"), { recursive: true });
+  if (options.persistedTag !== undefined) {
+    writeFileSync(persistedTagPath, `${options.persistedTag}\n`);
+  }
   try {
     try {
       execFileSync(
@@ -57,6 +66,8 @@ printf '%s\n' "$RELEASES_JSON"
             GITHUB_REPOSITORY: "owner/repository",
             IS_PRERELEASE: String(options.prerelease ?? false),
             PATH: `${directory}:${process.env.PATH}`,
+            PERSISTED_TAG_PATH: persistedTagPath,
+            REQUIRE_PERSISTED_TAG: String(options.requirePersistedTag ?? false),
             RELEASES_JSON: JSON.stringify([options.releases ?? []]),
           },
           stdio: ["ignore", "pipe", "pipe"],
@@ -71,6 +82,12 @@ printf '%s\n' "$RELEASES_JSON"
     return {
       ghCalled:
         readFileSync(callsPath, { encoding: "utf8", flag: "a+" }) !== "",
+      ...(readFileSync(persistedTagPath, {
+        encoding: "utf8",
+        flag: "a+",
+      }).trim()
+        ? { persistedTag: readFileSync(persistedTagPath, "utf8").trim() }
+        : {}),
       releaseTag: readFileSync(outputPath, "utf8")
         .trim()
         .replace(/^release-tag=/u, ""),
@@ -85,6 +102,87 @@ describe("release tag resolution", () => {
     expect(resolveReleaseTag({ bump: "major", explicitTag: "v4.5.6" })).toEqual(
       { ghCalled: false, releaseTag: "v4.5.6" },
     );
+  });
+
+  it("persists and recovers the automatic tag without bumping again", () => {
+    const firstAttempt = resolveReleaseTag({
+      bump: "patch",
+      releases: [
+        {
+          draft: false,
+          prerelease: false,
+          published_at: "2026-01-01T00:00:00Z",
+          tag_name: "v2.4.9",
+        },
+      ],
+    });
+    expect(firstAttempt).toEqual({
+      ghCalled: true,
+      persistedTag: "v2.4.10",
+      releaseTag: "v2.4.10",
+    });
+
+    expect(
+      resolveReleaseTag({
+        bump: "patch",
+        persistedTag: firstAttempt.persistedTag,
+        requirePersistedTag: true,
+      }),
+    ).toEqual({
+      ghCalled: false,
+      persistedTag: "v2.4.10",
+      releaseTag: "v2.4.10",
+    });
+  });
+
+  it("fails safely when an automatic rerun has no persisted tag", () => {
+    expect(() =>
+      resolveReleaseTag({
+        bump: "patch",
+        releases: [
+          {
+            draft: false,
+            prerelease: false,
+            published_at: "2026-01-01T00:00:00Z",
+            tag_name: "v2.4.9",
+          },
+        ],
+        requirePersistedTag: true,
+      }),
+    ).toThrow(/persisted automatic release tag is missing/iu);
+  });
+
+  it("fails safely when an automatic rerun has a corrupt persisted tag", () => {
+    expect(() =>
+      resolveReleaseTag({
+        bump: "patch",
+        persistedTag: "not-a-release-tag",
+        releases: [
+          {
+            draft: false,
+            prerelease: false,
+            published_at: "2026-01-01T00:00:00Z",
+            tag_name: "v2.4.9",
+          },
+        ],
+        requirePersistedTag: true,
+      }),
+    ).toThrow(/persisted automatic release tag is invalid/iu);
+  });
+
+  it("keeps explicit tags ahead of persisted automatic state", () => {
+    expect(
+      resolveReleaseTag({
+        bump: "major",
+        explicitTag: "v4.5.6",
+        persistedTag: "v2.4.10",
+        requirePersistedTag: true,
+      }),
+    ).toEqual({
+      ghCalled: false,
+      persistedTag: "v2.4.10",
+      releaseTag: "v4.5.6",
+    });
   });
 
   it("requires an explicit tag when publishing a prerelease", () => {
@@ -137,7 +235,7 @@ describe("release tag resolution", () => {
         ],
       });
 
-      expect(result).toEqual({ ghCalled: true, releaseTag: expected });
+      expect(result).toMatchObject({ ghCalled: true, releaseTag: expected });
     },
   );
 
