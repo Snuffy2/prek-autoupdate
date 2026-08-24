@@ -13,6 +13,7 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
 interface WorkflowStep {
+  readonly if?: string;
   readonly env?: Record<string, string>;
   readonly id?: string;
   readonly uses?: string;
@@ -21,6 +22,7 @@ interface WorkflowStep {
 
 interface WorkflowJob {
   readonly if?: string;
+  readonly outputs?: Record<string, string>;
   readonly permissions?: Record<string, string>;
   readonly steps: WorkflowStep[];
 }
@@ -359,13 +361,20 @@ fi
 }
 
 describe("release workflow", () => {
-  it("requires a release tag when manually dispatched", () => {
+  it("offers an optional explicit tag and stable bump choices", () => {
     const releaseWorkflow = workflow();
 
     expect(Object.keys(releaseWorkflow.on)).toEqual(["workflow_dispatch"]);
     expect(releaseWorkflow.on.workflow_dispatch.inputs.tag).toMatchObject({
-      required: true,
+      default: "",
+      required: false,
       type: "string",
+    });
+    expect(releaseWorkflow.on.workflow_dispatch.inputs.bump).toMatchObject({
+      default: "none",
+      options: ["none", "patch", "minor", "major"],
+      required: true,
+      type: "choice",
     });
     expect(
       releaseWorkflow.on.workflow_dispatch.inputs.prerelease,
@@ -376,12 +385,62 @@ describe("release workflow", () => {
     });
   });
 
-  it.each(["prepare", "finalize", "publish", "update-major"] as const)(
-    "passes the dispatched tag to the %s job",
+  it("passes the resolved tag through release preparation", () => {
+    const prepare = workflow().jobs.prepare;
+
+    expect(prepare.outputs?.["release-tag"]).toBe(
+      "${{ steps.tag.outputs.release-tag }}",
+    );
+    expect(
+      prepare.steps.some(
+        (step) =>
+          step.env?.RELEASE_TAG === "${{ steps.tag.outputs.release-tag }}",
+      ),
+    ).toBe(true);
+  });
+
+  it("persists automatic tags by stable run ID for reruns", () => {
+    const prepare = workflow().jobs.prepare;
+    const restoreIndex = prepare.steps.findIndex(
+      (step) =>
+        step.uses?.includes("download-artifact") &&
+        typeof step.with?.name === "string" &&
+        step.with.name.includes("release-resolution"),
+    );
+    const persistIndex = prepare.steps.findIndex(
+      (step) =>
+        step.uses?.includes("upload-artifact") &&
+        typeof step.with?.name === "string" &&
+        step.with.name.includes("release-resolution"),
+    );
+    const resolveIndex = prepare.steps.findIndex((step) => step.id === "tag");
+    const restore = prepare.steps[restoreIndex];
+    const persist = prepare.steps[persistIndex];
+    const resolve = prepare.steps[resolveIndex];
+
+    expect(prepare.permissions?.actions).toBe("read");
+    expect(restoreIndex).toBeGreaterThanOrEqual(0);
+    expect(persistIndex).toBeGreaterThanOrEqual(0);
+    expect(resolveIndex).toBeGreaterThanOrEqual(0);
+    expect(restore?.if).toContain("github.run_attempt != 1");
+    expect(persist?.if).toContain("github.run_attempt == 1");
+    expect(restore?.with?.name).toContain("github.run_id");
+    expect(restore?.with?.["run-id"]).toBe("${{ github.run_id }}");
+    expect(restore?.with?.name).not.toContain("run_attempt");
+    expect(persist?.with?.name).toBe(restore?.with?.name);
+    expect(restoreIndex).toBeLessThan(resolveIndex);
+    expect(resolve?.env?.PERSISTED_TAG_PATH).toBeTruthy();
+    expect(resolve?.env?.REQUIRE_PERSISTED_TAG).toContain("github.run_attempt");
+  });
+
+  it.each(["finalize", "publish", "update-major"] as const)(
+    "passes the resolved tag to the %s job",
     (jobName) => {
       expect(
         workflow().jobs[jobName].steps.some(
-          (step) => step.env?.RELEASE_TAG === "${{ inputs.tag }}",
+          (step) =>
+            step.env?.RELEASE_TAG ===
+            "${{ needs.prepare.outputs.release-tag }}",
         ),
       ).toBe(true);
     },
@@ -466,7 +525,7 @@ describe("release workflow", () => {
     expect({
       ...releaseWorkflow.permissions,
       ...releaseWorkflow.jobs.prepare.permissions,
-    }).toEqual({ contents: "read" });
+    }).toEqual({ actions: "read", contents: "read" });
     expect(releaseWorkflow.jobs.finalize.permissions).toEqual({
       actions: "read",
       contents: "write",
@@ -474,6 +533,10 @@ describe("release workflow", () => {
     expect(releaseWorkflow.jobs["update-major"].permissions).toEqual({
       contents: "write",
     });
+    const finalizeStep = releaseWorkflow.jobs.finalize.steps.find(
+      (step) => step.id === "release",
+    );
+    expect(finalizeStep?.env?.GH_TOKEN).toBe("${{ github.token }}");
     expect(checkouts.length).toBeGreaterThan(0);
     for (const checkout of checkouts) {
       expect(checkout.with?.["persist-credentials"]).toBe(false);
