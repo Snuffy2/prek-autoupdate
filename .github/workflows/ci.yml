@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   node:
-    name: Node 24
+    name: Node CI
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.user.login == 'prek-autoupdate-bot' ||
