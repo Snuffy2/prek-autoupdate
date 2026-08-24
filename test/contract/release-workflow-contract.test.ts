@@ -423,6 +423,7 @@ describe("release workflow", () => {
     const persist = prepare.steps[persistIndex];
     const resolve = prepare.steps[resolveIndex];
     const persistedTagPath = resolve?.env?.PERSISTED_TAG_PATH;
+    const releaseCheckoutPath = releaseCheckout?.with?.path;
 
     expect(prepare.permissions?.actions).toBe("read");
     expect(restoreIndex).toBeGreaterThanOrEqual(0);
@@ -437,9 +438,11 @@ describe("release workflow", () => {
     expect(restoreIndex).toBeLessThan(resolveIndex);
     expect(persistedTagPath).toBe(persist?.with?.path);
     expect(persistedTagPath).toContain(`${String(restore?.with?.path)}/`);
-    expect(persistedTagPath).not.toContain(
-      `/${String(releaseCheckout?.with?.path)}/`,
-    );
+    expect(releaseCheckoutPath).toBeTypeOf("string");
+    if (typeof releaseCheckoutPath !== "string") {
+      throw new TypeError("Release checkout path must be a string");
+    }
+    expect(persistedTagPath).not.toContain(`/${releaseCheckoutPath}/`);
     expect(resolve?.env?.REQUIRE_PERSISTED_TAG).toContain("github.run_attempt");
   });
 
