@@ -474,6 +474,10 @@ describe("release workflow", () => {
     expect(releaseWorkflow.jobs["update-major"].permissions).toEqual({
       contents: "write",
     });
+    const finalizeStep = releaseWorkflow.jobs.finalize.steps.find(
+      (step) => step.id === "release",
+    );
+    expect(finalizeStep?.env?.GH_TOKEN).toBe("${{ github.token }}");
     expect(checkouts.length).toBeGreaterThan(0);
     for (const checkout of checkouts) {
       expect(checkout.with?.["persist-credentials"]).toBe(false);

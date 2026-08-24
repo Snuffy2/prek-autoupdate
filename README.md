@@ -313,9 +313,9 @@ prerelease without moving the stable `v<major>` tag.
 
 Run the Release workflow from the default branch and supply the release tag. The
 workflow validates that source, prepares the package metadata and bundled
-Action, then atomically commits those files, creates the new point tag at the
-final release commit, and publishes the GitHub Release. The exact
-`v<major>.<minor>.<patch>` tag is created at the final release commit and is not
-retargeted by later releases. Wait for the release workflow to finish before
-recording an exact release ref; use the final commit SHA when a permanently
-immutable pin is required.
+Action, creates a release commit without updating the protected default branch,
+and pushes only an annotated point tag for that commit using `GITHUB_TOKEN`. It
+then publishes the GitHub Release. The exact `v<major>.<minor>.<patch>` tag is
+created at the final release commit and is not retargeted by later releases.
+Wait for the release workflow to finish before recording an exact release ref;
+use the final commit SHA when a permanently immutable pin is required.

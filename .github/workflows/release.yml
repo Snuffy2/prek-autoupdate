@@ -86,7 +86,7 @@ jobs:
 
   finalize:
     needs: prepare
-    # Commit the prepared release files and create or retarget the point tag once.
+    # Create the release commit locally and publish only its annotated point tag.
     permissions:
       actions: read
       contents: write

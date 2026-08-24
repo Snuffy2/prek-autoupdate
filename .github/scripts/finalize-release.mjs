@@ -69,6 +69,30 @@ function remoteRefs(defaultBranch, releaseTag) {
   return { branchOid, tagCommitOid, tagOid };
 }
 
+function validateExistingTag(releaseTag, sourceSha, tagCommitOid, tagOid) {
+  if (tagCommitOid === tagOid) {
+    throw new Error("Existing release tag is not annotated");
+  }
+  git(["fetch", "--no-tags", "origin", `refs/tags/${releaseTag}`]);
+  const ancestry = git(["rev-list", "--parents", "-n", "1", tagCommitOid])
+    .split(" ")
+    .filter(Boolean);
+  const expectedSubject = `Updating to version ${releaseTag} [skip ci]`;
+  if (
+    ancestry.length !== 2 ||
+    ancestry[0] !== tagCommitOid ||
+    ancestry[1] !== sourceSha ||
+    git(["log", "-1", "--format=%s", tagCommitOid]) !== expectedSubject
+  ) {
+    throw new Error("Existing release tag is not the expected release commit");
+  }
+  try {
+    git(["diff", "--quiet", tagCommitOid, "--", ...RELEASE_FILES]);
+  } catch {
+    throw new Error("Existing release tag has different release files");
+  }
+}
+
 function main() {
   const defaultBranch = required("DEFAULT_BRANCH");
   const outputPath = required("GITHUB_OUTPUT");
@@ -117,13 +141,13 @@ function main() {
   }
 
   const refs = remoteRefs(defaultBranch, releaseTag);
-  if (
-    refs.branchOid !== sourceSha ||
-    (refs.tagCommitOid !== undefined && refs.tagCommitOid !== sourceSha)
-  ) {
-    throw new Error(
-      "Default branch or release tag advanced during preparation",
-    );
+  if (refs.branchOid !== sourceSha) {
+    throw new Error("Default branch advanced during preparation");
+  }
+  if (refs.tagCommitOid !== undefined && refs.tagOid !== undefined) {
+    validateExistingTag(releaseTag, sourceSha, refs.tagCommitOid, refs.tagOid);
+    appendFileSync(outputPath, `sha=${refs.tagCommitOid}\n`);
+    return;
   }
 
   git(["add", "--", ...RELEASE_FILES]);
@@ -148,30 +172,17 @@ function main() {
     }
   }
 
-  if (refs.tagCommitOid === releaseSha) {
-    appendFileSync(outputPath, `sha=${releaseSha}\n`);
-    return;
-  }
-
   const authorization = Buffer.from(`x-access-token:${token}`).toString(
     "base64",
   );
-  const tagLease = refs.tagOid
-    ? `--force-with-lease=refs/tags/${releaseTag}:${refs.tagOid}`
-    : `--force-with-lease=refs/tags/${releaseTag}:`;
-  const tagUpdate = refs.tagOid
-    ? `+HEAD:refs/tags/${releaseTag}`
-    : `HEAD:refs/tags/${releaseTag}`;
+  git(["tag", "-a", releaseTag, "-m", `Release ${releaseTag}`, releaseSha]);
   try {
     git(
       [
         "push",
-        "--atomic",
-        `--force-with-lease=refs/heads/${defaultBranch}:${refs.branchOid}`,
-        tagLease,
+        `--force-with-lease=refs/tags/${releaseTag}:`,
         "origin",
-        `HEAD:refs/heads/${defaultBranch}`,
-        tagUpdate,
+        `refs/tags/${releaseTag}:refs/tags/${releaseTag}`,
       ],
       {
         env: {
@@ -183,7 +194,7 @@ function main() {
       },
     );
   } catch {
-    throw new Error("Atomic release branch and tag update failed");
+    throw new Error("Release tag update failed");
   }
   appendFileSync(outputPath, `sha=${releaseSha}\n`);
 }
