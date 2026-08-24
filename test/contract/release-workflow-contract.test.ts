@@ -366,14 +366,18 @@ describe("release workflow", () => {
       required: true,
       type: "string",
     });
-    const releaseTagValues = Object.values(releaseWorkflow.jobs).flatMap(
-      (job) =>
-        job.steps.flatMap((step) =>
-          step.env?.RELEASE_TAG === undefined ? [] : [step.env.RELEASE_TAG],
-        ),
-    );
-    expect(releaseTagValues).toEqual(Array(4).fill("${{ inputs.tag }}"));
   });
+
+  it.each(["prepare", "finalize", "publish", "update-major"] as const)(
+    "passes the dispatched tag to the %s job",
+    (jobName) => {
+      expect(
+        workflow().jobs[jobName].steps.some(
+          (step) => step.env?.RELEASE_TAG === "${{ inputs.tag }}",
+        ),
+      ).toBe(true);
+    },
+  );
 
   it.each([
     ["diff", "Unable to collect changed release paths"],
