@@ -1,3 +1,4 @@
+import * as core from "@actions/core";
 import { execFile } from "node:child_process";
 import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,6 +11,10 @@ const prekMocks = vi.hoisted(() => ({
   cleanup: vi.fn(async () => undefined),
   install: vi.fn(),
 }));
+vi.mock("@actions/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof core>();
+  return { ...actual, warning: vi.fn() };
+});
 vi.mock("../../src/prek/index.js", () => ({ installPrek: prekMocks.install }));
 
 import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
@@ -236,6 +241,7 @@ describe("pull request auto-merge", () => {
     expect(graphql).toHaveBeenCalledWith(expect.any(String), {
       pullRequestId: "PR_node",
     });
+    expect(core.warning).toHaveBeenCalledOnce();
   });
 
   it("paginates labels before and after enabling auto-merge", async () => {
@@ -360,6 +366,7 @@ describe("pull request auto-merge", () => {
     expect(graphql).toHaveBeenCalledWith(expect.any(String), {
       pullRequestId: "PR_node",
     });
+    expect(core.warning).toHaveBeenCalledOnce();
   });
 
   it("fails clearly when rollback of unverified auto-merge is not confirmed", async () => {
