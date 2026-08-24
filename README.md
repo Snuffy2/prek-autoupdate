@@ -311,11 +311,16 @@ tag to that release commit. For example, dispatching `v3.1.0` creates or moves
 **Publish as a prerelease** option enabled. Prereleases publish a GitHub
 prerelease without moving the stable `v<major>` tag.
 
-Run the Release workflow from the default branch and supply the release tag. The
-workflow validates that source, prepares the package metadata and bundled
-Action, creates a release commit without updating the protected default branch,
-and pushes only an annotated point tag for that commit using `GITHUB_TOKEN`. It
-then publishes the GitHub Release. The exact `v<major>.<minor>.<patch>` tag is
-created at the final release commit and is not retargeted by later releases.
-Wait for the release workflow to finish before recording an exact release ref;
-use the final commit SHA when a permanently immutable pin is required.
+Run the Release workflow from the default branch. Select `patch`, `minor`, or
+`major` to bump the highest published stable semantic release. Automatic bumps
+ignore drafts and prereleases. To override the bump, supply an explicit release
+tag; an explicit tag takes precedence over the dropdown selection. Prereleases
+require an explicit tag, and selecting **Publish as a prerelease** also ignores
+the bump selection. The workflow validates that source, prepares the package
+metadata and bundled Action, creates a release commit without updating the
+protected default branch, and pushes only an annotated point tag for that commit
+using `GITHUB_TOKEN`. It then publishes the GitHub Release. The exact
+`v<major>.<minor>.<patch>` tag is created at the final release commit and is not
+retargeted by later releases. Wait for the release workflow to finish before
+recording an exact release ref; use the final commit SHA when a permanently
+immutable pin is required.

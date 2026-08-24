@@ -21,6 +21,7 @@ interface WorkflowStep {
 
 interface WorkflowJob {
   readonly if?: string;
+  readonly outputs?: Record<string, string>;
   readonly permissions?: Record<string, string>;
   readonly steps: WorkflowStep[];
 }
@@ -359,13 +360,20 @@ fi
 }
 
 describe("release workflow", () => {
-  it("requires a release tag when manually dispatched", () => {
+  it("offers an optional explicit tag and stable bump choices", () => {
     const releaseWorkflow = workflow();
 
     expect(Object.keys(releaseWorkflow.on)).toEqual(["workflow_dispatch"]);
     expect(releaseWorkflow.on.workflow_dispatch.inputs.tag).toMatchObject({
-      required: true,
+      default: "",
+      required: false,
       type: "string",
+    });
+    expect(releaseWorkflow.on.workflow_dispatch.inputs.bump).toMatchObject({
+      default: "none",
+      options: ["none", "patch", "minor", "major"],
+      required: true,
+      type: "choice",
     });
     expect(
       releaseWorkflow.on.workflow_dispatch.inputs.prerelease,
@@ -376,12 +384,28 @@ describe("release workflow", () => {
     });
   });
 
-  it.each(["prepare", "finalize", "publish", "update-major"] as const)(
-    "passes the dispatched tag to the %s job",
+  it("passes the resolved tag through release preparation", () => {
+    const prepare = workflow().jobs.prepare;
+
+    expect(prepare.outputs?.["release-tag"]).toBe(
+      "${{ steps.tag.outputs.release-tag }}",
+    );
+    expect(
+      prepare.steps.some(
+        (step) =>
+          step.env?.RELEASE_TAG === "${{ steps.tag.outputs.release-tag }}",
+      ),
+    ).toBe(true);
+  });
+
+  it.each(["finalize", "publish", "update-major"] as const)(
+    "passes the resolved tag to the %s job",
     (jobName) => {
       expect(
         workflow().jobs[jobName].steps.some(
-          (step) => step.env?.RELEASE_TAG === "${{ inputs.tag }}",
+          (step) =>
+            step.env?.RELEASE_TAG ===
+            "${{ needs.prepare.outputs.release-tag }}",
         ),
       ).toBe(true);
     },

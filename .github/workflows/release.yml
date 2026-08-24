@@ -1,13 +1,24 @@
 name: Release
 
-run-name: Release ${{ inputs.tag }}
+run-name: Release ${{ inputs.tag || inputs.bump }}
 
 on:
   workflow_dispatch:
     inputs:
+      bump:
+        description: Stable version bump when tag is blank
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - patch
+          - minor
+          - major
       tag:
         description: Release tag (for example, v2.0.5 or v2.1.0-beta.1)
-        required: true
+        required: false
+        default: ""
         type: string
       prerelease:
         description: Publish as a prerelease
@@ -26,6 +37,7 @@ jobs:
   prepare:
     outputs:
       major-tag: ${{ steps.release.outputs.major-tag }}
+      release-tag: ${{ steps.tag.outputs.release-tag }}
       source-sha: ${{ steps.release.outputs.source-sha }}
     runs-on: ubuntu-latest
     steps:
@@ -60,6 +72,16 @@ jobs:
       - run: npm ci --ignore-scripts
         working-directory: release
 
+      - name: Resolve release tag
+        id: tag
+        env:
+          BUMP_TYPE: ${{ inputs.bump }}
+          EXPLICIT_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          IS_PRERELEASE: ${{ inputs.prerelease }}
+        run: node ../tooling/.github/scripts/resolve-release-tag.mjs
+        working-directory: release
+
       - name: Prepare and validate release files
         id: release
         env:
@@ -67,7 +89,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           IS_PRERELEASE: ${{ inputs.prerelease }}
           RELEASE_REF: ${{ github.ref_name }}
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ steps.tag.outputs.release-tag }}
         run: |
           bash ../tooling/.github/scripts/validate-release-request.sh
           bash ../tooling/.github/scripts/prepare-release.sh
@@ -123,12 +145,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PREPARED_DIRECTORY: ${{ github.workspace }}/prepared
           RELEASE_DIRECTORY: ${{ github.workspace }}/release
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
           SOURCE_SHA: ${{ needs.prepare.outputs.source-sha }}
         run: node tooling/.github/scripts/finalize-release.mjs
 
   publish:
-    needs: finalize
+    needs: [prepare, finalize]
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -144,7 +166,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           IS_PRERELEASE: ${{ inputs.prerelease }}
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
         run: bash .github/scripts/publish-release.sh
 
   update-major:
@@ -170,6 +192,6 @@ jobs:
       - name: Update moving major tag
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
           TARGET_SHA: ${{ needs.finalize.outputs.release-sha }}
         run: bash .github/scripts/update-major-tag.sh
