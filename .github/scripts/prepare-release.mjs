@@ -1,14 +1,45 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 
-const SEMVER_PATTERN = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+const PRERELEASE_IDENTIFIER =
+  "(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)";
+const SEMVER_PATTERN = new RegExp(
+  `^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(${PRERELEASE_IDENTIFIER}(?:\\.${PRERELEASE_IDENTIFIER})*))?$`,
+);
 
 function compare(left, right) {
-  for (let index = 0; index < 3; index += 1) {
+  for (let index = 1; index <= 3; index += 1) {
     const leftPart = BigInt(left[index]);
     const rightPart = BigInt(right[index]);
     if (leftPart < rightPart) return -1;
     if (leftPart > rightPart) return 1;
+  }
+  const leftPrerelease = left[4];
+  const rightPrerelease = right[4];
+  if (leftPrerelease === undefined)
+    return rightPrerelease === undefined ? 0 : 1;
+  if (rightPrerelease === undefined) return -1;
+
+  const leftParts = leftPrerelease.split(".");
+  const rightParts = rightPrerelease.split(".");
+  for (
+    let index = 0;
+    index < Math.max(leftParts.length, rightParts.length);
+    index += 1
+  ) {
+    const leftPart = leftParts[index];
+    const rightPart = rightParts[index];
+    if (leftPart === undefined) return -1;
+    if (rightPart === undefined) return 1;
+    if (leftPart === rightPart) continue;
+    const leftNumeric = /^[0-9]+$/.test(leftPart);
+    const rightNumeric = /^[0-9]+$/.test(rightPart);
+    if (leftNumeric && rightNumeric) {
+      return BigInt(leftPart) < BigInt(rightPart) ? -1 : 1;
+    }
+    if (leftNumeric) return -1;
+    if (rightNumeric) return 1;
+    return leftPart < rightPart ? -1 : 1;
   }
   return 0;
 }
@@ -25,7 +56,9 @@ function main() {
   const releaseTag = process.env.RELEASE_TAG ?? "";
   const match = SEMVER_PATTERN.exec(releaseTag);
   if (!match) {
-    throw new Error("Release tag must have vMAJOR.MINOR.PATCH form");
+    throw new Error(
+      "Release tag must have vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE form",
+    );
   }
 
   const version = releaseTag.slice(1);
@@ -35,9 +68,9 @@ function main() {
   const packageLock = readJson(lockPath);
   const currentMatch = SEMVER_PATTERN.exec(`v${String(packageJson.version)}`);
   if (!currentMatch) {
-    throw new Error("package.json must contain a stable semantic version");
+    throw new Error("package.json must contain a semantic version");
   }
-  if (compare(match.slice(1), currentMatch.slice(1)) < 0) {
+  if (compare(match, currentMatch) < 0) {
     throw new Error(
       `Release ${releaseTag} would downgrade package.json from ${String(packageJson.version)}`,
     );

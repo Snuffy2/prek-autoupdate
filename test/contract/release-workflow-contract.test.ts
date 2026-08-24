@@ -20,6 +20,7 @@ interface WorkflowStep {
 }
 
 interface WorkflowJob {
+  readonly if?: string;
   readonly permissions?: Record<string, string>;
   readonly steps: WorkflowStep[];
 }
@@ -366,6 +367,13 @@ describe("release workflow", () => {
       required: true,
       type: "string",
     });
+    expect(
+      releaseWorkflow.on.workflow_dispatch.inputs.prerelease,
+    ).toMatchObject({
+      default: false,
+      required: true,
+      type: "boolean",
+    });
   });
 
   it.each(["prepare", "finalize", "publish", "update-major"] as const)(
@@ -378,6 +386,21 @@ describe("release workflow", () => {
       ).toBe(true);
     },
   );
+
+  it("keeps prereleases away from the stable moving tag", () => {
+    const releaseWorkflow = workflow();
+
+    for (const jobName of ["prepare", "publish"] as const) {
+      expect(
+        releaseWorkflow.jobs[jobName].steps.some(
+          (step) => step.env?.IS_PRERELEASE === "${{ inputs.prerelease }}",
+        ),
+      ).toBe(true);
+    }
+    expect(releaseWorkflow.jobs["update-major"].if).toBe(
+      "inputs.prerelease == false",
+    );
+  });
 
   it.each([
     ["diff", "Unable to collect changed release paths"],
@@ -400,6 +423,23 @@ describe("release workflow", () => {
     expect(prepared.packageLock.packages[""].version).toBe("2.0.3");
     expect(() => prepareRelease("v2.0.1", "2.0.2")).toThrow(/downgrade/u);
     expect(() => prepareRelease("v2", "2.0.2")).toThrow(
+      /vMAJOR\.MINOR\.PATCH/u,
+    );
+  });
+
+  it("updates package metadata to a valid prerelease version", () => {
+    const prepared = prepareRelease("v2.1.0-beta.2", "2.1.0-beta.1");
+
+    expect(prepared.output).toMatch(
+      /^major-tag=v2\nsource-sha=[0-9a-f]{40}\n$/,
+    );
+    expect(prepared.packageJson.version).toBe("2.1.0-beta.2");
+    expect(prepared.packageLock.version).toBe("2.1.0-beta.2");
+    expect(prepared.packageLock.packages[""].version).toBe("2.1.0-beta.2");
+    expect(() => prepareRelease("v2.1.0-beta.1", "2.1.0-beta.2")).toThrow(
+      /downgrade/u,
+    );
+    expect(() => prepareRelease("v2.1.0-beta.01", "2.0.4")).toThrow(
       /vMAJOR\.MINOR\.PATCH/u,
     );
   });

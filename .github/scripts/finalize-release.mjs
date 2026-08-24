@@ -2,7 +2,11 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, copyFileSync, lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const SEMVER_PATTERN = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+const PRERELEASE_IDENTIFIER =
+  "(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)";
+const SEMVER_PATTERN = new RegExp(
+  `^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(${PRERELEASE_IDENTIFIER}(?:\\.${PRERELEASE_IDENTIFIER})*))?$`,
+);
 const RELEASE_FILES = ["dist/index.js", "package-lock.json", "package.json"];
 
 function git(args, options = {}) {
@@ -74,7 +78,9 @@ function main() {
   const sourceSha = required("SOURCE_SHA");
   const token = required("GH_TOKEN");
   if (!SEMVER_PATTERN.test(releaseTag)) {
-    throw new Error("Release tag must have vMAJOR.MINOR.PATCH form");
+    throw new Error(
+      "Release tag must have vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE form",
+    );
   }
   if (!/^[0-9a-f]{40}$/.test(sourceSha)) {
     throw new Error("Release source SHA is invalid");

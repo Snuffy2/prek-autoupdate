@@ -304,15 +304,17 @@ otherwise valid update pull request.
 
 ## Releases
 
-Use the moving major tag for stable updates. Each manually dispatched
+Use the moving major tag for stable updates. Each manually dispatched stable
 `v<major>.<minor>.<patch>` release creates or moves its corresponding `v<major>`
 tag to that release commit. For example, dispatching `v3.1.0` creates or moves
-`v3`.
+`v3`. Prerelease tags such as `v3.2.0-beta.1` must be dispatched with the
+**Publish as a prerelease** option enabled. Prereleases publish a GitHub
+prerelease without moving the stable `v<major>` tag.
 
-Run the Release workflow from the default branch and supply the stable release
-tag. The workflow validates that source, prepares the package metadata and
-bundled Action, then atomically commits those files, creates the new point tag
-at the final release commit, and publishes the GitHub Release. The exact
+Run the Release workflow from the default branch and supply the release tag. The
+workflow validates that source, prepares the package metadata and bundled
+Action, then atomically commits those files, creates the new point tag at the
+final release commit, and publishes the GitHub Release. The exact
 `v<major>.<minor>.<patch>` tag is created at the final release commit and is not
 retargeted by later releases. Wait for the release workflow to finish before
 recording an exact release ref; use the final commit SHA when a permanently

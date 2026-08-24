@@ -6,9 +6,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag (for example, v2.0.5)
+        description: Release tag (for example, v2.0.5 or v2.1.0-beta.1)
         required: true
         type: string
+      prerelease:
+        description: Publish as a prerelease
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -60,6 +65,7 @@ jobs:
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ github.token }}
+          IS_PRERELEASE: ${{ inputs.prerelease }}
           RELEASE_REF: ${{ github.ref_name }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
@@ -70,8 +76,21 @@ jobs:
             exit 1
           fi
 
+          tag_is_prerelease=false
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            tag_is_prerelease=true
+          fi
+          if [[ "$tag_is_prerelease" != "$IS_PRERELEASE" ]]; then
+            echo "Release tag prerelease suffix and prerelease input must agree." >&2
+            exit 1
+          fi
+
           release_view_error="$RUNNER_TEMP/release-view-error.txt"
-          if gh release view "$RELEASE_TAG" >/dev/null 2>"$release_view_error"; then
+          if existing_release="$(gh release view "$RELEASE_TAG" --json isPrerelease --jq .isPrerelease 2>"$release_view_error")"; then
+            if [[ "$existing_release" != "$IS_PRERELEASE" ]]; then
+              echo "Existing GitHub release prerelease state does not match the request." >&2
+              exit 1
+            fi
             echo "Resuming existing GitHub release: $RELEASE_TAG"
           elif ! grep -Eq "HTTP 404|release not found" "$release_view_error"; then
             cat "$release_view_error" >&2
@@ -141,32 +160,23 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          IS_PRERELEASE: ${{ inputs.prerelease }}
           RELEASE_TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-
-          release_view_error="$RUNNER_TEMP/release-view-error.txt"
-          if release_is_draft="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>"$release_view_error")"; then
-            if [[ "$release_is_draft" != "true" ]]; then
-              echo "GitHub release is already published: $RELEASE_TAG"
-              exit 0
-            fi
-            gh release edit "$RELEASE_TAG" --draft=false
-          elif grep -Eq "HTTP 404|release not found" "$release_view_error"; then
-            gh release create "$RELEASE_TAG" \
-              --generate-notes \
-              --title "$RELEASE_TAG" \
-              --verify-tag
-          else
-            cat "$release_view_error" >&2
-            exit 1
-          fi
+        run: bash .github/scripts/publish-release.sh
 
   update-major:
     needs: [prepare, finalize, publish]
+    if: inputs.prerelease == false
     # Move or create the verified major tag; no other repository writes are needed.
     permissions:
       contents: write
