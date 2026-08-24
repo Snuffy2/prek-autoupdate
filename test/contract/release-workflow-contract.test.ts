@@ -229,6 +229,7 @@ function runReleaseUpdate(
   failure:
     | "none"
     | "release-tag-move"
+    | "point-ref-race"
     | "create-race"
     | "major-ref-read"
     | "major-ref-malformed"
@@ -320,7 +321,10 @@ elif [[ "$*" == "api repos/$GITHUB_REPOSITORY --jq .node_id" ]]; then
   printf '%s\n' 'R_repo_node'
 elif [[ "$*" == api\\ graphql* ]]; then
   [[ "$FAILURE" != "create-race" ]] || exit 1
-  if [[ "$POINT_DIRECT_REF_TYPE" == "tag" && "$*" == *"-f releaseOid=$POINT_DIRECT_REF_OID"* ]]; then
+  if [[ "$FAILURE" == "point-ref-race" && "$*" == *'name: $pointName'* && "$*" == *'beforeOid: $pointOid'* && "$*" == *'afterOid: $pointOid'* && "$*" == *"-f pointName=refs/tags/$RELEASE_TAG"* && "$*" == *"-f pointOid=$POINT_DIRECT_REF_OID"* ]]; then
+    exit 1
+  fi
+  if [[ "$POINT_DIRECT_REF_TYPE" == "tag" && "$*" == *"-f pointOid=$POINT_DIRECT_REF_OID"* ]]; then
     printf '%s\n' 'Invalid object type tag, expected commit' >&2
     exit 1
   fi
@@ -725,6 +729,51 @@ describe("release workflow", () => {
     expect(calls).toContain(`git/tags/${movingChainOid}`);
     expect(calls).toContain("api graphql");
   });
+
+  it.each(["update", "create"] as const)(
+    "atomically rejects lightweight point-tag movement during a major-tag %s",
+    (action) => {
+      const oldSha = "1".repeat(40);
+      const targetSha = "2".repeat(40);
+      const tags = [
+        ...(action === "update"
+          ? [
+              { name: "v1", commit: { sha: oldSha } },
+              { name: "v1.9.9", commit: { sha: oldSha } },
+            ]
+          : []),
+        { name: "v1.10.0", commit: { sha: targetSha } },
+      ];
+      const releases = [
+        ...(action === "update"
+          ? [
+              {
+                tag_name: "v1.9.9",
+                draft: false,
+                prerelease: false,
+                published_at: "2026-01-01T00:00:00Z",
+              },
+            ]
+          : []),
+        {
+          tag_name: "v1.10.0",
+          draft: false,
+          prerelease: false,
+          published_at: "2026-01-01T00:00:00Z",
+        },
+      ];
+
+      expect(() =>
+        runReleaseUpdate(
+          "v1.10.0",
+          targetSha,
+          tags,
+          releases,
+          "point-ref-race",
+        ),
+      ).toThrow();
+    },
+  );
 
   it("verifies the exact finalized release ref before reading tag lists", () => {
     const targetSha = "2".repeat(40);
