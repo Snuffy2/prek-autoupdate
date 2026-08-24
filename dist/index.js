@@ -40880,7 +40880,7 @@ async function gitExit(workspace, arguments_) {
     }
 }
 
-var version = "2.0.4";
+var version = "2.0.6";
 var packageMetadata = {
 	version: version};
 
