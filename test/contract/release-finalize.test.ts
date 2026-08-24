@@ -44,10 +44,12 @@ interface FinalizerOptions {
   cachedDiffStatus?: number;
   changedPaths?: string[];
   noChanges?: boolean;
+  releaseTag?: string;
   mutatePrepared?: (directory: string) => void;
   statusOutput?: string;
   tagCommitSha?: string;
   tagSha?: string;
+  tagMissing?: boolean;
 }
 
 function runFinalizer(options: FinalizerOptions = {}): {
@@ -60,9 +62,10 @@ function runFinalizer(options: FinalizerOptions = {}): {
   const binDirectory = join(directory, "bin");
   const callsPath = join(directory, "calls");
   const outputPath = join(directory, "output");
+  const releaseTag = options.releaseTag ?? "v2.0.3";
   mkdirSync(binDirectory, { recursive: true });
   writeReleaseFiles(releaseDirectory, "2.0.2", "old");
-  writeReleaseFiles(preparedDirectory, "2.0.3", "new");
+  writeReleaseFiles(preparedDirectory, releaseTag.slice(1), "new");
   options.mutatePrepared?.(preparedDirectory);
   const gitPath = join(binDirectory, "git");
   writeFileSync(
@@ -87,8 +90,10 @@ diff)
   ;;
 ls-remote)
   printf '%s\trefs/heads/main\n' "$BRANCH_SHA"
-  printf '%s\trefs/tags/v2.0.3\n' "$TAG_SHA"
-  printf '%s\trefs/tags/v2.0.3^{}\n' "$TAG_COMMIT_SHA"
+  if [[ "$TAG_MISSING" != "true" ]]; then
+    printf '%s\trefs/tags/%s\n' "$TAG_SHA" "$RELEASE_TAG"
+    printf '%s\trefs/tags/%s^{}\n' "$TAG_COMMIT_SHA" "$RELEASE_TAG"
+  fi
   exit 0
   ;;
 add|config|commit)
@@ -132,11 +137,12 @@ exit 2
             PREPARED_DIRECTORY: preparedDirectory,
             RELEASE_DIRECTORY: releaseDirectory,
             RELEASE_SHA,
-            RELEASE_TAG: "v2.0.3",
+            RELEASE_TAG: releaseTag,
             NO_CHANGES: String(options.noChanges ?? false),
             SOURCE_SHA,
             STATUS_OUTPUT: options.statusOutput ?? "",
             TAG_COMMIT_SHA: options.tagCommitSha ?? SOURCE_SHA,
+            TAG_MISSING: String(options.tagMissing ?? false),
             TAG_SHA: options.tagSha ?? SOURCE_SHA,
           },
           stdio: ["ignore", "pipe", "pipe"],
@@ -186,6 +192,25 @@ describe("release finalization", () => {
     );
   });
 
+  it("atomically creates a release tag for a dispatched release", () => {
+    const result = runFinalizer({ tagMissing: true });
+
+    expect(result.output).toBe(`sha=${RELEASE_SHA}\n`);
+    expect(result.calls).toContain("--force-with-lease=refs/tags/v2.0.3:");
+    expect(result.calls).toContain("HEAD:refs/tags/v2.0.3");
+    expect(result.calls).not.toContain("+HEAD:refs/tags/v2.0.3");
+  });
+
+  it("accepts a semantic prerelease tag", () => {
+    const result = runFinalizer({
+      releaseTag: "v2.1.0-beta.1",
+      tagMissing: true,
+    });
+
+    expect(result.output).toBe(`sha=${RELEASE_SHA}\n`);
+    expect(result.calls).toContain("HEAD:refs/tags/v2.1.0-beta.1");
+  });
+
   it("fails if the default branch advances during preparation", () => {
     expect(() => runFinalizer({ branchSha: "3".repeat(40) })).toThrow(
       "Default branch or release tag advanced during preparation",
@@ -218,6 +243,14 @@ describe("release finalization", () => {
 
     expect(result.output).toBe(`sha=${SOURCE_SHA}\n`);
     expect(result.calls).not.toContain("push --atomic");
+  });
+
+  it("creates a missing tag even when release files are already current", () => {
+    const result = runFinalizer({ noChanges: true, tagMissing: true });
+
+    expect(result.output).toBe(`sha=${SOURCE_SHA}\n`);
+    expect(result.calls).toContain("push --atomic");
+    expect(result.calls).toContain("HEAD:refs/tags/v2.0.3");
   });
 
   it("does not mask an unexpected cached diff failure", () => {
