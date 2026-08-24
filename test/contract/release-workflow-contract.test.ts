@@ -414,9 +414,15 @@ describe("release workflow", () => {
         step.with.name.includes("release-resolution"),
     );
     const resolveIndex = prepare.steps.findIndex((step) => step.id === "tag");
+    const releaseCheckout = prepare.steps.find(
+      (step) =>
+        step.uses?.startsWith("actions/checkout@") &&
+        step.with?.ref === "${{ github.sha }}",
+    );
     const restore = prepare.steps[restoreIndex];
     const persist = prepare.steps[persistIndex];
     const resolve = prepare.steps[resolveIndex];
+    const persistedTagPath = resolve?.env?.PERSISTED_TAG_PATH;
 
     expect(prepare.permissions?.actions).toBe("read");
     expect(restoreIndex).toBeGreaterThanOrEqual(0);
@@ -429,7 +435,11 @@ describe("release workflow", () => {
     expect(restore?.with?.name).not.toContain("run_attempt");
     expect(persist?.with?.name).toBe(restore?.with?.name);
     expect(restoreIndex).toBeLessThan(resolveIndex);
-    expect(resolve?.env?.PERSISTED_TAG_PATH).toBeTruthy();
+    expect(persistedTagPath).toBe(persist?.with?.path);
+    expect(persistedTagPath).toContain(`${String(restore?.with?.path)}/`);
+    expect(persistedTagPath).not.toContain(
+      `/${String(releaseCheckout?.with?.path)}/`,
+    );
     expect(resolve?.env?.REQUIRE_PERSISTED_TAG).toContain("github.run_attempt");
   });
 

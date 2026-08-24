@@ -83,7 +83,7 @@ jobs:
         with:
           github-token: ${{ github.token }}
           name: release-resolution-${{ github.run_id }}
-          path: release/resolution
+          path: ${{ runner.temp }}/release-resolution
           repository: ${{ github.repository }}
           run-id: ${{ github.run_id }}
 
@@ -94,8 +94,7 @@ jobs:
           EXPLICIT_TAG: ${{ inputs.tag }}
           GH_TOKEN: ${{ github.token }}
           IS_PRERELEASE: ${{ inputs.prerelease }}
-          PERSISTED_TAG_PATH:
-            ${{ github.workspace }}/release/resolution/release-tag
+          PERSISTED_TAG_PATH: ${{ runner.temp }}/release-resolution/release-tag
           REQUIRE_PERSISTED_TAG: ${{ github.run_attempt != 1 }}
         run: node ../tooling/.github/scripts/resolve-release-tag.mjs
         working-directory: release
@@ -108,7 +107,7 @@ jobs:
         with:
           if-no-files-found: error
           name: release-resolution-${{ github.run_id }}
-          path: release/resolution/release-tag
+          path: ${{ runner.temp }}/release-resolution/release-tag
 
       - name: Prepare and validate release files
         id: release
