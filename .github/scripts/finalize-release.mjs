@@ -74,17 +74,21 @@ function validateExistingTag(releaseTag, sourceSha, tagCommitOid, tagOid) {
     throw new Error("Existing release tag is not annotated");
   }
   git(["fetch", "--no-tags", "origin", `refs/tags/${releaseTag}`]);
-  const ancestry = git(["rev-list", "--parents", "-n", "1", tagCommitOid])
-    .split(" ")
-    .filter(Boolean);
-  const expectedSubject = `Updating to version ${releaseTag} [skip ci]`;
-  if (
-    ancestry.length !== 2 ||
-    ancestry[0] !== tagCommitOid ||
-    ancestry[1] !== sourceSha ||
-    git(["log", "-1", "--format=%s", tagCommitOid]) !== expectedSubject
-  ) {
-    throw new Error("Existing release tag is not the expected release commit");
+  if (tagCommitOid !== sourceSha) {
+    const ancestry = git(["rev-list", "--parents", "-n", "1", tagCommitOid])
+      .split(" ")
+      .filter(Boolean);
+    const expectedSubject = `Updating to version ${releaseTag} [skip ci]`;
+    if (
+      ancestry.length !== 2 ||
+      ancestry[0] !== tagCommitOid ||
+      ancestry[1] !== sourceSha ||
+      git(["log", "-1", "--format=%s", tagCommitOid]) !== expectedSubject
+    ) {
+      throw new Error(
+        "Existing release tag is not the expected release commit",
+      );
+    }
   }
   try {
     git(["diff", "--quiet", tagCommitOid, "--", ...RELEASE_FILES]);

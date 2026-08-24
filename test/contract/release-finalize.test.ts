@@ -223,6 +223,18 @@ describe("release finalization", () => {
     expect(result.calls).not.toContain("push ");
   });
 
+  it("resumes an annotated source tag when prepared files are unchanged", () => {
+    const result = runFinalizer({
+      noChanges: true,
+      tagCommitSha: SOURCE_SHA,
+      tagMissing: false,
+      tagSha: "3".repeat(40),
+    });
+
+    expect(result.output).toBe(`sha=${SOURCE_SHA}\n`);
+    expect(result.calls).not.toContain("push ");
+  });
+
   it("accepts a semantic prerelease tag", () => {
     const result = runFinalizer({
       releaseTag: "v2.1.0-beta.1",
