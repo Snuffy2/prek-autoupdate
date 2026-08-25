@@ -134,6 +134,23 @@ describe("runAction", () => {
     );
   });
 
+  it("reports pull and branch cleanup performed by the update phase", async () => {
+    vi.mocked(runUpdate).mockResolvedValue({
+      operation: "closed",
+      cleanup: {
+        closedPullRequests: [41],
+        deletedBranches: ["chore/prek-updates"],
+      },
+    });
+
+    await runAction();
+
+    expect(core.info).toHaveBeenCalledWith("Closed PRs: 41");
+    expect(core.info).toHaveBeenCalledWith(
+      "Deleted branches: chore/prek-updates",
+    );
+  });
+
   it("runs cleanup and reports both phase failures", async () => {
     vi.mocked(runUpdate).mockRejectedValue(new Error("update failed"));
     vi.mocked(cleanupUpdateBranches).mockRejectedValue(

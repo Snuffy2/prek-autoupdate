@@ -36,6 +36,7 @@ export type PullRequestOperation = "closed" | "created" | "none" | "updated";
 export interface UpdateResult {
   readonly pullRequestNumber?: number;
   readonly operation: PullRequestOperation;
+  readonly cleanup?: CleanupResult;
 }
 
 /** Failure after a pull request was safely published and must survive cleanup. */

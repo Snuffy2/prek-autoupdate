@@ -1224,7 +1224,13 @@ async function closeUnneededPullRequest(
       { cause: error },
     );
   }
-  return { operation: "closed" };
+  return {
+    operation: "closed",
+    cleanup: {
+      closedPullRequests: [pull.number],
+      deletedBranches: [execution.inputs.updateBranch],
+    },
+  };
 }
 
 async function proveBase(execution: ActionExecution): Promise<void> {

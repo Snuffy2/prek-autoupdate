@@ -784,10 +784,14 @@ describe("update publication races", () => {
 });
 
 describe("no-change close compensation", () => {
-  it("returns a closed result without leaking the pull request number", async () => {
+  it("returns the closed pull and deleted branch for reporting", async () => {
     const harness = await makeHarness({ existing: true, noChange: true });
     await expect(runUpdate(harness.execution)).resolves.toEqual({
       operation: "closed",
+      cleanup: {
+        closedPullRequests: [42],
+        deletedBranches: ["chore/prek-updates"],
+      },
     });
   });
 
