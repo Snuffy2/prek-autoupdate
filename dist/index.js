@@ -40661,7 +40661,13 @@ async function closeUnneededPullRequest(execution, remote) {
             ? `Lease-protected branch deletion failed; the exact close of pull request #${pull.number} was compensated`
             : `Lease-protected branch deletion failed; pull request #${pull.number} was not reopened because its state changed after this action's close`, { cause: error });
     }
-    return { operation: "closed" };
+    return {
+        operation: "closed",
+        cleanup: {
+            closedPullRequests: [pull.number],
+            deletedBranches: [execution.inputs.updateBranch],
+        },
+    };
 }
 async function proveBase(execution) {
     const response = await execution.client.rest.git.getRef({
@@ -40931,13 +40937,21 @@ async function runAction(now = new Date()) {
         }
     }
     setOutput("pull-request-number", updateResult.pullRequestNumber?.toString() ?? "");
-    if (cleanupResult !== undefined) {
-        info(`Closed PRs: ${cleanupResult.closedPullRequests.length === 0
-            ? "none"
-            : cleanupResult.closedPullRequests.join(", ")}`);
-        info(`Deleted branches: ${cleanupResult.deletedBranches.length === 0
-            ? "none"
-            : cleanupResult.deletedBranches.join(", ")}`);
+    if (updateResult.cleanup !== undefined || cleanupResult !== undefined) {
+        const closedPullRequests = [
+            ...new Set([
+                ...(updateResult.cleanup?.closedPullRequests ?? []),
+                ...(cleanupResult?.closedPullRequests ?? []),
+            ]),
+        ];
+        const deletedBranches = [
+            ...new Set([
+                ...(updateResult.cleanup?.deletedBranches ?? []),
+                ...(cleanupResult?.deletedBranches ?? []),
+            ]),
+        ];
+        info(`Closed PRs: ${closedPullRequests.length === 0 ? "none" : closedPullRequests.join(", ")}`);
+        info(`Deleted branches: ${deletedBranches.length === 0 ? "none" : deletedBranches.join(", ")}`);
     }
     if (failures.length > 0) {
         for (const failure of failures) {

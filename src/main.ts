@@ -68,19 +68,27 @@ export async function runAction(now: Date = new Date()): Promise<void> {
     "pull-request-number",
     updateResult.pullRequestNumber?.toString() ?? "",
   );
-  if (cleanupResult !== undefined) {
+  if (updateResult.cleanup !== undefined || cleanupResult !== undefined) {
+    const closedPullRequests = [
+      ...new Set([
+        ...(updateResult.cleanup?.closedPullRequests ?? []),
+        ...(cleanupResult?.closedPullRequests ?? []),
+      ]),
+    ];
+    const deletedBranches = [
+      ...new Set([
+        ...(updateResult.cleanup?.deletedBranches ?? []),
+        ...(cleanupResult?.deletedBranches ?? []),
+      ]),
+    ];
     core.info(
       `Closed PRs: ${
-        cleanupResult.closedPullRequests.length === 0
-          ? "none"
-          : cleanupResult.closedPullRequests.join(", ")
+        closedPullRequests.length === 0 ? "none" : closedPullRequests.join(", ")
       }`,
     );
     core.info(
       `Deleted branches: ${
-        cleanupResult.deletedBranches.length === 0
-          ? "none"
-          : cleanupResult.deletedBranches.join(", ")
+        deletedBranches.length === 0 ? "none" : deletedBranches.join(", ")
       }`,
     );
   }
