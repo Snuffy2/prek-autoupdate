@@ -1140,7 +1140,7 @@ async function runPrek(
   try {
     const result = await execFileAsync(
       binary,
-      ["auto-update", "--cooldown-days", cooldownDays],
+      ["autoupdate", "--cooldown-days", cooldownDays],
       {
         cwd: worktree,
         encoding: "utf8",
@@ -1156,7 +1156,7 @@ async function runPrek(
       message?: string;
     };
     throw new Error(
-      `prek auto-update failed: ${sanitizeOutput(`${detail.stdout ?? ""}${detail.stderr ?? ""}${detail.message ?? ""}`, worktree)}`,
+      `prek autoupdate failed: ${sanitizeOutput(`${detail.stdout ?? ""}${detail.stderr ?? ""}${detail.message ?? ""}`, worktree)}`,
       { cause: error },
     );
   }

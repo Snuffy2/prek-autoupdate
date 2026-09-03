@@ -41,7 +41,7 @@ export async function runAction(now: Date = new Date()): Promise<void> {
       updateResult = await runUpdate(execution);
     } else {
       core.info(
-        `Skipping prek auto-update for ${context.eventName}; cleanup will still run.`,
+        `Skipping prek autoupdate for ${context.eventName}; cleanup will still run.`,
       );
     }
   } catch (error: unknown) {

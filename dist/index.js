@@ -40600,7 +40600,7 @@ function isOwned(execution, pull) {
 }
 async function runPrek(binary, worktree, cooldownDays) {
     try {
-        const result = await execFileAsync(binary, ["auto-update", "--cooldown-days", cooldownDays], {
+        const result = await execFileAsync(binary, ["autoupdate", "--cooldown-days", cooldownDays], {
             cwd: worktree,
             encoding: "utf8",
             env: sanitizedChildEnvironment(),
@@ -40610,7 +40610,7 @@ async function runPrek(binary, worktree, cooldownDays) {
     }
     catch (error) {
         const detail = error;
-        throw new Error(`prek auto-update failed: ${sanitizeOutput(`${detail.stdout ?? ""}${detail.stderr ?? ""}${detail.message ?? ""}`, worktree)}`, { cause: error });
+        throw new Error(`prek autoupdate failed: ${sanitizeOutput(`${detail.stdout ?? ""}${detail.stderr ?? ""}${detail.message ?? ""}`, worktree)}`, { cause: error });
     }
 }
 function makeBody(output, workspace) {
@@ -40912,7 +40912,7 @@ async function runAction(now = new Date()) {
             updateResult = await runUpdate(execution);
         }
         else {
-            info(`Skipping prek auto-update for ${context.eventName}; cleanup will still run.`);
+            info(`Skipping prek autoupdate for ${context.eventName}; cleanup will still run.`);
         }
     }
     catch (error) {
