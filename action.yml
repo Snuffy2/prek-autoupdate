@@ -19,7 +19,7 @@ inputs:
     required: false
     default: github-actions[bot]
   cooldown-days:
-    description: Cooldown days passed to prek auto-update.
+    description: Cooldown days passed to prek autoupdate.
     required: false
     default: "7"
   update-day:

@@ -1,6 +1,6 @@
 # prek-autoupdate
 
-`prek-autoupdate` is a GitHub Action that runs `prek auto-update` for you. It
+`prek-autoupdate` is a GitHub Action that runs `prek autoupdate` for you. It
 keeps one pull request for the resulting hook updates, then cleans up older
 action-owned pull requests and branches when they are no longer needed.
 
@@ -50,20 +50,20 @@ the repository's default branch. The job skips forked repositories, preventing
 forks from creating their own automated maintenance pull requests.
 
 Schedule the workflow every day. The action decides which scheduled day actually
-runs `prek auto-update` from `update-day`; cleanup still runs on the other days.
+runs `prek autoupdate` from `update-day`; cleanup still runs on the other days.
 Keep the `push` trigger for `main`: it is a cleanup-only run that reconciles an
 existing action-owned update PR after changes land. It does not run
-`prek auto-update`, open a PR, or update a PR. The concurrency setting lets a
+`prek autoupdate`, open a PR, or update a PR. The concurrency setting lets a
 running cleanup finish instead of cancelling it when another run starts.
 
 ## What each event does
 
-| Event                            | Run `prek auto-update` | Clean up action-owned PRs and branches                                                       |
-| -------------------------------- | ---------------------- | -------------------------------------------------------------------------------------------- |
-| Daily `schedule` on `update-day` | Yes                    | Yes                                                                                          |
-| Daily `schedule` on another day  | No                     | Yes                                                                                          |
-| `workflow_dispatch`              | Yes                    | Yes                                                                                          |
-| `push` to `main`                 | No                     | Yes. It closes an owned update PR only when its files already match the current base branch. |
+| Event                            | Run `prek autoupdate` | Clean up action-owned PRs and branches                                                       |
+| -------------------------------- | --------------------- | -------------------------------------------------------------------------------------------- |
+| Daily `schedule` on `update-day` | Yes                   | Yes                                                                                          |
+| Daily `schedule` on another day  | No                    | Yes                                                                                          |
+| `workflow_dispatch`              | Yes                   | Yes                                                                                          |
+| `push` to `main`                 | No                    | Yes. It closes an owned update PR only when its files already match the current base branch. |
 
 Cleanup is deliberately conservative. Before the action changes a pull request
 or deletes a branch, it checks ownership details such as the configured branch
@@ -101,7 +101,7 @@ not match your repository.
 | `token`          | `${{ github.token }}`      | Credential used to push the update branch and manage pull requests. See [Authentication and permissions](#authentication-and-permissions).       |
 | `auto-merge`     | `false`                    | With a PAT, requests squash auto-merge for the exact pull-request revision published by the action. See [Automatic merging](#automatic-merging). |
 | `author-login`   | `github-actions[bot]`      | Fallback PR-author login used only when GitHub cannot identify the token's user. See [When to set `author-login`](#when-to-set-author-login).    |
-| `cooldown-days`  | `"7"`                      | Passed to `prek auto-update --cooldown-days`.                                                                                                    |
+| `cooldown-days`  | `"7"`                      | Passed to `prek autoupdate --cooldown-days`.                                                                                                     |
 | `update-day`     | `"1"`                      | UTC day for scheduled updates: `0` is Sunday and `6` is Saturday.                                                                                |
 | `update-branch`  | `chore/prek-updates`       | The branch for the update pull request.                                                                                                          |
 | `branch-prefix`  | `chore/prek-updates`       | The branch prefix that cleanup treats as action-owned.                                                                                           |

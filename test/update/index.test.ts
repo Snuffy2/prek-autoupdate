@@ -1,6 +1,6 @@
 import * as core from "@actions/core";
 import { execFile } from "node:child_process";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -584,6 +584,28 @@ describe("non-mutating update preflight", () => {
     expect(status).toBe("");
     expect(worktrees.match(/^worktree /gmu)).toHaveLength(1);
     expect(prekMocks.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("uses the prek autoupdate compatibility command", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "prek-command-test-"));
+    temporaryDirectories.push(directory);
+    const argumentsFile = path.join(directory, "arguments");
+    const binary = path.join(directory, "prek");
+    await writeFile(
+      binary,
+      `#!/bin/sh\nprintf '%s\\n' "$@" > '${argumentsFile}'\n`,
+      { mode: 0o755 },
+    );
+    prekMocks.install.mockResolvedValueOnce({
+      binary,
+      cleanup: prekMocks.cleanup,
+    });
+    const execution = await makeExecution(["prek.toml"]);
+
+    await expect(runUpdate(execution)).resolves.toEqual({ operation: "none" });
+    await expect(readFile(argumentsFile, "utf8")).resolves.toBe(
+      "autoupdate\n--cooldown-days\n7\n",
+    );
   });
 
   it("cleans the installation when running prek fails", async () => {
