@@ -24,7 +24,39 @@ jobs:
       !(contains(github.event.pull_request.labels.*.name, 'dependencies') ||
       github.event.pull_request.user.type == 'Bot')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
+      - name: Verify Dependabot update scope
+        if: github.event.pull_request.user.login == 'dependabot[bot]'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          changed_files="$(gh api --paginate \
+            "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            --jq '.[].filename')"
+          [[ -n "${changed_files}" ]] || {
+            echo "Refusing auto-merge; no changed files were reported"
+            exit 1
+          }
+          npm_invalid_files="$(printf '%s\n' "${changed_files}" | grep -Ev '^package(-lock)?\.json$' || true)"
+          if [[ -z "${npm_invalid_files}" ]] && \
+            printf '%s\n' "${changed_files}" | grep -Fxq 'package-lock.json'; then
+            exit 0
+          fi
+
+          actions_invalid_files="$(printf '%s\n' "${changed_files}" | grep -Ev '^\.github/workflows/[^/]+\.ya?ml$' || true)"
+          if [[ -z "${actions_invalid_files}" ]]; then
+            exit 0
+          fi
+
+          echo "Refusing auto-merge; changed files are neither a supported npm update nor a GitHub Actions-only update:"
+          echo "${changed_files}"
+          exit 1
+
       - name: Checkout repository
         uses: actions/checkout@v7
         with:

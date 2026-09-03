@@ -96,9 +96,16 @@ function verifyChangedFiles(script: string, changedFiles: string[]): number {
 
 describe("Dependabot auto-merge workflow", () => {
   it("keeps Node CI eligible for Dependabot pull requests", () => {
-    expect(normalizedCondition(workflow("ci.yml").jobs.node)).toContain(
+    const nodeCi = workflow("ci.yml").jobs.node;
+
+    expect(normalizedCondition(nodeCi)).toContain(
       "github.event.pull_request.user.login == 'dependabot[bot]'",
     );
+    expect(nodeCi.permissions).toEqual({
+      "contents": "read",
+      "pull-requests": "read",
+    });
+    expect(requiredStepWithCommand(nodeCi, "gh api --paginate")).toBeDefined();
   });
 
   it("gates auto-merge behind read-only ownership and content checks", () => {
@@ -152,21 +159,25 @@ describe("Dependabot auto-merge workflow", () => {
   ])(
     "accepts only supported dependency files: %j",
     (changedFiles, accepted) => {
-      const verification = requiredJobWithCommand(
-        workflow(),
-        "gh api --paginate",
-      );
-      const script = requiredStepWithCommand(
-        verification,
-        "gh api --paginate",
-      ).run;
+      const scripts = [
+        requiredStepWithCommand(
+          requiredJobWithCommand(workflow(), "gh api --paginate"),
+          "gh api --paginate",
+        ).run,
+        requiredStepWithCommand(
+          workflow("ci.yml").jobs.node,
+          "gh api --paginate",
+        ).run,
+      ];
 
-      expect(script).toBeDefined();
-      const status = verifyChangedFiles(script ?? "", changedFiles);
-      if (accepted) {
-        expect(status).toBe(0);
-      } else {
-        expect(status).not.toBe(0);
+      for (const script of scripts) {
+        expect(script).toBeDefined();
+        const status = verifyChangedFiles(script ?? "", changedFiles);
+        if (accepted) {
+          expect(status).toBe(0);
+        } else {
+          expect(status).not.toBe(0);
+        }
       }
     },
   );
