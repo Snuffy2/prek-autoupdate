@@ -16,6 +16,8 @@ interface WorkflowStep {
   readonly if?: string;
   readonly env?: Record<string, string>;
   readonly id?: string;
+  readonly name?: string;
+  readonly run?: string;
   readonly uses?: string;
   readonly with?: Record<string, unknown>;
 }
@@ -29,16 +31,13 @@ interface WorkflowJob {
 
 interface Workflow {
   readonly on: {
-    readonly workflow_dispatch: {
-      readonly inputs: Record<string, Record<string, unknown>>;
+    readonly release: {
+      readonly types: string[];
     };
   };
   readonly permissions: Record<string, string>;
   readonly jobs: {
-    readonly "prepare": WorkflowJob;
-    readonly "finalize": WorkflowJob;
-    readonly "publish": WorkflowJob;
-    readonly "update-major": WorkflowJob;
+    readonly release: WorkflowJob;
   };
 }
 
@@ -48,6 +47,18 @@ function workflow(): Workflow {
   return parse(
     readFileSync(".github/workflows/release.yml", "utf8"),
   ) as Workflow;
+}
+
+function requiredStep(
+  steps: readonly WorkflowStep[],
+  predicate: (step: WorkflowStep) => boolean,
+  description: string,
+): WorkflowStep {
+  const step = steps.find(predicate);
+  if (step === undefined) {
+    throw new Error(`Release workflow is missing the ${description} step`);
+  }
+  return step;
 }
 
 function decideRelease(
@@ -324,10 +335,6 @@ elif [[ "$*" == api\\ graphql* ]]; then
   if [[ "$FAILURE" == "point-ref-race" && "$*" == *'name: $pointName'* && "$*" == *'beforeOid: $pointOid'* && "$*" == *'afterOid: $pointOid'* && "$*" == *"-f pointName=refs/tags/$RELEASE_TAG"* && "$*" == *"-f pointOid=$POINT_DIRECT_REF_OID"* ]]; then
     exit 1
   fi
-  if [[ "$POINT_DIRECT_REF_TYPE" == "tag" && "$*" == *"-f pointOid=$POINT_DIRECT_REF_OID"* ]]; then
-    printf '%s\n' 'Invalid object type tag, expected commit' >&2
-    exit 1
-  fi
   printf '%s\n' '{"data":{"updateRefs":{"clientMutationId":null}}}'
 else
   printf 'unexpected gh call: %s\n' "$*" >&2
@@ -379,116 +386,38 @@ fi
 }
 
 describe("release workflow", () => {
-  it("offers an optional explicit tag and stable bump choices", () => {
+  it("runs only when a GitHub release is published", () => {
     const releaseWorkflow = workflow();
 
-    expect(Object.keys(releaseWorkflow.on)).toEqual(["workflow_dispatch"]);
-    expect(releaseWorkflow.on.workflow_dispatch.inputs.tag).toMatchObject({
-      default: "",
-      required: false,
-      type: "string",
-    });
-    expect(releaseWorkflow.on.workflow_dispatch.inputs.bump).toMatchObject({
-      default: "none",
-      options: ["none", "patch", "minor", "major"],
-      required: true,
-      type: "choice",
-    });
-    expect(
-      releaseWorkflow.on.workflow_dispatch.inputs.prerelease,
-    ).toMatchObject({
-      default: false,
-      required: true,
-      type: "boolean",
-    });
+    expect(Object.keys(releaseWorkflow.on)).toEqual(["release"]);
+    expect(releaseWorkflow.on.release.types).toEqual(["published"]);
   });
 
-  it("passes the resolved tag through release preparation", () => {
-    const prepare = workflow().jobs.prepare;
-
-    expect(prepare.outputs?.["release-tag"]).toBe(
-      "${{ steps.tag.outputs.release-tag }}",
+  it("validates the candidate before lease-guarded atomic promotion", () => {
+    const steps = workflow().jobs.release.steps;
+    const gate = steps.find((step) =>
+      step.run?.includes("verify-release-checks.mjs"),
     );
-    expect(
-      prepare.steps.some(
-        (step) =>
-          step.env?.RELEASE_TAG === "${{ steps.tag.outputs.release-tag }}",
-      ),
-    ).toBe(true);
-  });
-
-  it("persists automatic tags by stable run ID for reruns", () => {
-    const prepare = workflow().jobs.prepare;
-    const restoreIndex = prepare.steps.findIndex(
-      (step) =>
-        step.uses?.includes("download-artifact") &&
-        typeof step.with?.name === "string" &&
-        step.with.name.includes("release-resolution"),
+    const promotion = steps.find((step) =>
+      step.run?.includes("git push --atomic"),
     );
-    const persistIndex = prepare.steps.findIndex(
-      (step) =>
-        step.uses?.includes("upload-artifact") &&
-        typeof step.with?.name === "string" &&
-        step.with.name.includes("release-resolution"),
+    const cleanup = steps.find((step) =>
+      step.run?.includes('origin ":refs/heads/$TEMP_REF"'),
     );
-    const resolveIndex = prepare.steps.findIndex((step) => step.id === "tag");
-    const releaseCheckout = prepare.steps.find(
-      (step) =>
-        step.uses?.startsWith("actions/checkout@") &&
-        step.with?.ref === "${{ github.sha }}",
+
+    expect(gate?.run).toContain("--required-check 'ci.yml::Node CI'");
+    expect(gate?.run).toContain(
+      "--required-check 'prek-autofix-review.yml::review'",
     );
-    const restore = prepare.steps[restoreIndex];
-    const persist = prepare.steps[persistIndex];
-    const resolve = prepare.steps[resolveIndex];
-    const persistedTagPath = resolve?.env?.PERSISTED_TAG_PATH;
-    const releaseCheckoutPath = releaseCheckout?.with?.path;
-
-    expect(prepare.permissions?.actions).toBe("read");
-    expect(restoreIndex).toBeGreaterThanOrEqual(0);
-    expect(persistIndex).toBeGreaterThanOrEqual(0);
-    expect(resolveIndex).toBeGreaterThanOrEqual(0);
-    expect(restore?.if).toContain("github.run_attempt != 1");
-    expect(persist?.if).toContain("github.run_attempt == 1");
-    expect(restore?.with?.name).toContain("github.run_id");
-    expect(restore?.with?.["run-id"]).toBe("${{ github.run_id }}");
-    expect(restore?.with?.name).not.toContain("run_attempt");
-    expect(persist?.with?.name).toBe(restore?.with?.name);
-    expect(restoreIndex).toBeLessThan(resolveIndex);
-    expect(persistedTagPath).toBe(persist?.with?.path);
-    expect(persistedTagPath).toContain(`${String(restore?.with?.path)}/`);
-    expect(releaseCheckoutPath).toBeTypeOf("string");
-    if (typeof releaseCheckoutPath !== "string") {
-      throw new TypeError("Release checkout path must be a string");
-    }
-    expect(persistedTagPath).not.toContain(`/${releaseCheckoutPath}/`);
-    expect(resolve?.env?.REQUIRE_PERSISTED_TAG).toContain("github.run_attempt");
-  });
-
-  it.each(["finalize", "publish", "update-major"] as const)(
-    "passes the resolved tag to the %s job",
-    (jobName) => {
-      expect(
-        workflow().jobs[jobName].steps.some(
-          (step) =>
-            step.env?.RELEASE_TAG ===
-            "${{ needs.prepare.outputs.release-tag }}",
-        ),
-      ).toBe(true);
-    },
-  );
-
-  it("keeps prereleases away from the stable moving tag", () => {
-    const releaseWorkflow = workflow();
-
-    for (const jobName of ["prepare", "publish"] as const) {
-      expect(
-        releaseWorkflow.jobs[jobName].steps.some(
-          (step) => step.env?.IS_PRERELEASE === "${{ inputs.prerelease }}",
-        ),
-      ).toBe(true);
-    }
-    expect(releaseWorkflow.jobs["update-major"].if).toBe(
-      "inputs.prerelease == false",
+    expect(gate?.run).toContain('--sha "$CANDIDATE_SHA"');
+    expect(promotion?.run).toContain(
+      '--force-with-lease="refs/heads/$RELEASE_TARGET:$TARGET_SHA"',
+    );
+    expect(promotion?.run).toContain(
+      '--force-with-lease="refs/tags/$RELEASE_TAG:$ORIGINAL_TAG_OID"',
+    );
+    expect(cleanup?.run).toContain(
+      '--force-with-lease="refs/heads/$TEMP_REF:$CANDIDATE_SHA"',
     );
   });
 
@@ -535,44 +464,118 @@ describe("release workflow", () => {
   });
 
   it("provisions prek before preparing release files", () => {
-    const steps = workflow().jobs.prepare.steps;
+    const steps = workflow().jobs.release.steps;
     const setupIndex = steps.findIndex((step) =>
       step.uses?.startsWith("j178/prek-action@"),
     );
-    const preparationIndex = steps.findIndex((step) => step.id === "release");
+    const preparationIndex = steps.findIndex((step) =>
+      step.run?.includes("prepare-release.sh"),
+    );
 
     expect(setupIndex).toBeGreaterThanOrEqual(0);
     expect(steps[setupIndex]?.with?.["install-only"]).toBe(true);
     expect(preparationIndex).toBeGreaterThan(setupIndex);
   });
 
+  it("never executes prerelease or resumed release-tag code", () => {
+    const steps = workflow().jobs.release.steps;
+    const metadata = requiredStep(
+      steps,
+      (step) => step.id === "base",
+      "release metadata",
+    );
+    const setupPrek = requiredStep(
+      steps,
+      (step) => step.uses?.startsWith("j178/prek-action@") ?? false,
+      "prek setup",
+    );
+    const preparation = requiredStep(
+      steps,
+      (step) => step.run?.includes("prepare-release.sh") ?? false,
+      "release preparation",
+    );
+    const validationPush = requiredStep(
+      steps,
+      (step) => step.run?.includes("refs/heads/$temp_ref") ?? false,
+      "validation branch publication",
+    );
+    const finalIdentity = requiredStep(
+      steps,
+      (step) =>
+        step.run?.includes('git show "$expected_sha:package.json"') ?? false,
+      "final release identity",
+    );
+
+    expect(metadata.run).not.toContain("git checkout");
+    expect(metadata.run).toContain(
+      'git diff --name-only "$tag_sha^" "$tag_sha"',
+    );
+    expect(setupPrek.if).toContain("github.event.release.prerelease == false");
+    expect(setupPrek.if).toContain("steps.base.outputs.resume");
+    expect(preparation.if).toBe(setupPrek.if);
+    expect(validationPush.run).toContain(
+      'git push origin "$CANDIDATE_SHA:refs/heads/$temp_ref"',
+    );
+    expect(validationPush.run).not.toContain('git push origin "HEAD:');
+    expect(finalIdentity.run).toContain(
+      'git cat-file -e "$expected_sha:dist/index.js"',
+    );
+  });
+
   it("keeps release credentials scoped to write-capable jobs", () => {
     const releaseWorkflow = workflow();
-    const checkouts = Object.values(releaseWorkflow.jobs).flatMap((job) =>
-      job.steps.filter((step) => step.uses?.startsWith("actions/checkout@")),
+    const checkouts = releaseWorkflow.jobs.release.steps.filter((step) =>
+      step.uses?.startsWith("actions/checkout@"),
     );
 
     expect(releaseWorkflow.permissions).toEqual({ contents: "read" });
-    expect({
-      ...releaseWorkflow.permissions,
-      ...releaseWorkflow.jobs.prepare.permissions,
-    }).toEqual({ actions: "read", contents: "read" });
-    expect(releaseWorkflow.jobs.finalize.permissions).toEqual({
-      actions: "read",
+    expect(releaseWorkflow.jobs.release.permissions).toEqual({
+      actions: "write",
+      checks: "read",
       contents: "write",
+      statuses: "read",
     });
-    expect(releaseWorkflow.jobs["update-major"].permissions).toEqual({
-      contents: "write",
-    });
-    const finalizeStep = releaseWorkflow.jobs.finalize.steps.find(
-      (step) => step.id === "release",
-    );
-    expect(finalizeStep?.env?.GH_TOKEN).toBe("${{ github.token }}");
     expect(checkouts.length).toBeGreaterThan(0);
     for (const checkout of checkouts) {
       expect(checkout.with?.["persist-credentials"]).toBe(false);
     }
   });
+
+  it.each([
+    ["ci.yml", "node", "${{ inputs.expected_sha || github.sha }}"],
+    [
+      "prek-autofix-review.yml",
+      "review",
+      "${{ github.event.pull_request.head.sha || inputs.expected_sha || github.sha }}",
+    ],
+  ])(
+    "requires %s to check out the exact dispatched SHA",
+    (workflowName, jobName, checkoutRef) => {
+      const gateWorkflow = parse(
+        readFileSync(`.github/workflows/${workflowName}`, "utf8"),
+      ) as {
+        on: {
+          workflow_dispatch: {
+            inputs: Record<string, Record<string, unknown>>;
+          };
+        };
+        jobs: Record<string, WorkflowJob>;
+      };
+      const expectedSha = gateWorkflow.on.workflow_dispatch.inputs.expected_sha;
+      const job = gateWorkflow.jobs[jobName];
+      const guard = job?.steps.find((step) =>
+        step.run?.includes('test "$WORKFLOW_SHA" = "$EXPECTED_SHA"'),
+      );
+      const checkout = job?.steps.find((step) =>
+        step.uses?.startsWith("actions/checkout@"),
+      );
+
+      expect(expectedSha).toMatchObject({ required: true, type: "string" });
+      expect(guard?.run).toContain('[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]');
+      expect(checkout?.with?.ref).toBe(checkoutRef);
+      expect(checkout?.with?.["persist-credentials"]).toBe(false);
+    },
+  );
 
   it("keeps moving major tags monotonic across releases and reruns", () => {
     const oldSha = "1".repeat(40);
@@ -693,6 +696,7 @@ describe("release workflow", () => {
     expect(calls).toContain("api repos/owner/repository --jq .node_id");
     expect(calls).toContain("api graphql");
     expect(calls).toContain("-F repositoryId=R_repo_node");
+    expect(calls).toContain(`-f pointOid=${targetSha}`);
     expect(calls).toContain(`-f majorBeforeOid=${annotatedTagOid}`);
     expect(calls).not.toContain(`-f majorBeforeOid=${oldSha}`);
     expect(calls).toContain(`-f majorAfterOid=${targetSha}`);
@@ -728,11 +732,17 @@ describe("release workflow", () => {
     expect(calls).toContain(`git/tags/${pointChainOid}`);
     expect(calls).toContain(`git/tags/${movingChainOid}`);
     expect(calls).toContain("api graphql");
+    expect(calls).toContain(`-f pointOid=${"e".repeat(40)}`);
   });
 
-  it.each(["update", "create"] as const)(
-    "atomically rejects lightweight point-tag movement during a major-tag %s",
-    (action) => {
+  it.each([
+    ["update", 0],
+    ["update", 1],
+    ["create", 0],
+    ["create", 1],
+  ] as const)(
+    "atomically rejects %s movement with point-tag depth %s",
+    (action, pointTagDepth) => {
       const oldSha = "1".repeat(40);
       const targetSha = "2".repeat(40);
       const tags = [
@@ -770,6 +780,9 @@ describe("release workflow", () => {
           tags,
           releases,
           "point-ref-race",
+          undefined,
+          targetSha,
+          pointTagDepth,
         ),
       ).toThrow();
     },
@@ -942,6 +955,43 @@ describe("release workflow", () => {
     ).toThrow(/changed while its update was being prepared/u);
   });
 
+  it.each(["skip", "noop"] as const)(
+    "rejects release-tag movement before completing a %s decision",
+    (action) => {
+      const targetSha = "2".repeat(40);
+      const newerSha = "3".repeat(40);
+      const tags =
+        action === "skip"
+          ? [
+              { name: "v1", commit: { sha: newerSha } },
+              { name: "v1.10.0", commit: { sha: targetSha } },
+              { name: "v1.11.0", commit: { sha: newerSha } },
+            ]
+          : [
+              { name: "v1", commit: { sha: targetSha } },
+              { name: "v1.10.0", commit: { sha: targetSha } },
+            ];
+      const releases = tags
+        .filter((tag) => tag.name !== "v1")
+        .map((tag) => ({
+          tag_name: tag.name,
+          draft: false,
+          prerelease: false,
+          published_at: "2026-01-01T00:00:00Z",
+        }));
+
+      expect(() =>
+        runReleaseUpdate(
+          "v1.10.0",
+          targetSha,
+          tags,
+          releases,
+          "release-tag-move",
+        ),
+      ).toThrow(/changed while its update was being prepared/u);
+    },
+  );
+
   it("uses absence CAS and rejects a competing major-tag creation", () => {
     const targetSha = "2".repeat(40);
     const releases = [
@@ -964,7 +1014,7 @@ describe("release workflow", () => {
       1,
     );
     expect(calls).toContain(
-      'beforeOid: "0000000000000000000000000000000000000000"',
+      "-f majorBeforeOid=0000000000000000000000000000000000000000",
     );
 
     expect(() =>

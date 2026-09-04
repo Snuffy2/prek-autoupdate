@@ -70,7 +70,17 @@ verify_point_tag() {
 }
 
 release_direct_ref="$(verify_point_tag)"
-IFS=$'\t' read -r release_direct_oid release_direct_type <<< "$release_direct_ref"
+IFS=$'\t' read -r release_direct_oid _release_direct_type <<< "$release_direct_ref"
+
+verify_release_ref_unchanged() {
+  local observed_release_ref
+  observed_release_ref="$(verify_point_tag)"
+  if [[ "$observed_release_ref" != "$release_direct_ref" ]]; then
+    echo "$RELEASE_TAG changed while its update was being prepared" >&2
+    return 1
+  fi
+}
+
 gh api --paginate --slurp \
   "repos/$GITHUB_REPOSITORY/tags?per_page=100" > "$tags_file"
 gh api --paginate --slurp \
@@ -82,46 +92,15 @@ decision="$(
 )"
 
 IFS=$'\t' read -r action update_sha before_oid <<< "$decision"
-case "$action" in
-skip)
-  echo "$major_tag is newer than $RELEASE_TAG; leaving it unchanged"
-  ;;
-noop)
-  echo "$major_tag already points to $RELEASE_TAG"
-  ;;
-update)
-  observed_release_ref="$(verify_point_tag)"
-  if [[ "$observed_release_ref" != "$release_direct_ref" ]]; then
-    echo "$RELEASE_TAG changed while its update was being prepared" >&2
-    exit 1
-  fi
-  major_ref="$(read_git_object \
-    "major tag ref $major_tag" \
-    "repos/$GITHUB_REPOSITORY/git/ref/tags/$major_tag")" || exit 1
-  IFS=$'\t' read -r direct_before_oid direct_type <<< "$major_ref"
-  peeled_oid="$direct_before_oid"
-  peeled_type="$direct_type"
-  depth=0
-  while [[ "$peeled_type" == "tag" && "$depth" -lt "$MAX_TAG_PEEL_DEPTH" ]]; do
-    peeled_object="$(read_git_object \
-      "annotated major tag object $peeled_oid" \
-      "repos/$GITHUB_REPOSITORY/git/tags/$peeled_oid")" || exit 1
-    IFS=$'\t' read -r peeled_oid peeled_type <<< "$peeled_object"
-    ((depth += 1))
-  done
-  if [[ "$peeled_type" == "tag" ]]; then
-    echo "Annotated major tag exceeds maximum peel depth of $MAX_TAG_PEEL_DEPTH" >&2
-    exit 1
-  fi
-  if [[ "$peeled_type" != "commit" || "$peeled_oid" != "$before_oid" ]]; then
-    echo "$major_tag changed while its update was being prepared" >&2
-    exit 1
-  fi
+
+atomic_move_major_tag() {
+  local major_before_oid="$1" repository_id
+  verify_release_ref_unchanged || return 1
+
   repository_id="$(gh api "repos/$GITHUB_REPOSITORY" --jq .node_id)"
-  if [[ "$release_direct_type" == "commit" ]]; then
-    gh api graphql \
-      -f query='
-      mutation UpdateMajorTag(
+  gh api graphql \
+    -f query='
+      mutation MoveMajorTag(
         $repositoryId: ID!
         $pointName: GitRefname!
         $pointOid: GitObjectID!
@@ -151,119 +130,51 @@ update)
           clientMutationId
         }
       }
-      ' \
-      -F repositoryId="$repository_id" \
-      -f pointName="refs/tags/$RELEASE_TAG" \
-      -f pointOid="$release_direct_oid" \
-      -f majorName="refs/tags/$major_tag" \
-      -f majorBeforeOid="$direct_before_oid" \
-      -f majorAfterOid="$update_sha"
-  else
-    gh api graphql \
-      -f query='
-        mutation UpdateMajorTag(
-          $repositoryId: ID!
-          $majorName: GitRefname!
-          $majorBeforeOid: GitObjectID!
-          $majorAfterOid: GitObjectID!
-        ) {
-          updateRefs(
-            input: {
-              repositoryId: $repositoryId
-              refUpdates: [
-                {
-                  name: $majorName
-                  beforeOid: $majorBeforeOid
-                  afterOid: $majorAfterOid
-                  force: true
-                }
-              ]
-            }
-          ) {
-            clientMutationId
-          }
-        }
-      ' \
-      -F repositoryId="$repository_id" \
-      -f majorName="refs/tags/$major_tag" \
-      -f majorBeforeOid="$direct_before_oid" \
-      -f majorAfterOid="$update_sha"
-  fi
+    ' \
+    -F repositoryId="$repository_id" \
+    -f pointName="refs/tags/$RELEASE_TAG" \
+    -f pointOid="$release_direct_oid" \
+    -f majorName="refs/tags/$major_tag" \
+    -f majorBeforeOid="$major_before_oid" \
+    -f majorAfterOid="$update_sha"
+}
+
+case "$action" in
+skip)
+  verify_release_ref_unchanged || exit 1
+  echo "$major_tag is newer than $RELEASE_TAG; leaving it unchanged"
   ;;
-create)
-  observed_release_ref="$(verify_point_tag)"
-  if [[ "$observed_release_ref" != "$release_direct_ref" ]]; then
-    echo "$RELEASE_TAG changed while its update was being prepared" >&2
+noop)
+  verify_release_ref_unchanged || exit 1
+  echo "$major_tag already points to $RELEASE_TAG"
+  ;;
+update)
+  major_ref="$(read_git_object \
+    "major tag ref $major_tag" \
+    "repos/$GITHUB_REPOSITORY/git/ref/tags/$major_tag")" || exit 1
+  IFS=$'\t' read -r direct_before_oid direct_type <<< "$major_ref"
+  peeled_oid="$direct_before_oid"
+  peeled_type="$direct_type"
+  depth=0
+  while [[ "$peeled_type" == "tag" && "$depth" -lt "$MAX_TAG_PEEL_DEPTH" ]]; do
+    peeled_object="$(read_git_object \
+      "annotated major tag object $peeled_oid" \
+      "repos/$GITHUB_REPOSITORY/git/tags/$peeled_oid")" || exit 1
+    IFS=$'\t' read -r peeled_oid peeled_type <<< "$peeled_object"
+    ((depth += 1))
+  done
+  if [[ "$peeled_type" == "tag" ]]; then
+    echo "Annotated major tag exceeds maximum peel depth of $MAX_TAG_PEEL_DEPTH" >&2
     exit 1
   fi
-  repository_id="$(gh api "repos/$GITHUB_REPOSITORY" --jq .node_id)"
-  if [[ "$release_direct_type" == "commit" ]]; then
-    gh api graphql \
-      -f query='
-      mutation CreateMajorTag(
-        $repositoryId: ID!
-        $pointName: GitRefname!
-        $pointOid: GitObjectID!
-        $majorName: GitRefname!
-        $majorAfterOid: GitObjectID!
-      ) {
-        updateRefs(
-          input: {
-            repositoryId: $repositoryId
-            refUpdates: [
-              {
-                name: $pointName
-                beforeOid: $pointOid
-                afterOid: $pointOid
-                force: false
-              }
-              {
-                name: $majorName
-                beforeOid: "0000000000000000000000000000000000000000"
-                afterOid: $majorAfterOid
-                force: false
-              }
-            ]
-          }
-        ) {
-          clientMutationId
-        }
-      }
-      ' \
-      -F repositoryId="$repository_id" \
-      -f pointName="refs/tags/$RELEASE_TAG" \
-      -f pointOid="$release_direct_oid" \
-      -f majorName="refs/tags/$major_tag" \
-      -f majorAfterOid="$update_sha"
-  else
-    gh api graphql \
-      -f query='
-        mutation CreateMajorTag(
-          $repositoryId: ID!
-          $majorName: GitRefname!
-          $majorAfterOid: GitObjectID!
-        ) {
-          updateRefs(
-            input: {
-              repositoryId: $repositoryId
-              refUpdates: [
-                {
-                  name: $majorName
-                  beforeOid: "0000000000000000000000000000000000000000"
-                  afterOid: $majorAfterOid
-                  force: false
-                }
-              ]
-            }
-          ) {
-            clientMutationId
-          }
-        }
-      ' \
-      -F repositoryId="$repository_id" \
-      -f majorName="refs/tags/$major_tag" \
-      -f majorAfterOid="$update_sha"
+  if [[ "$peeled_type" != "commit" || "$peeled_oid" != "$before_oid" ]]; then
+    echo "$major_tag changed while its update was being prepared" >&2
+    exit 1
   fi
+  atomic_move_major_tag "$direct_before_oid"
+  ;;
+create)
+  atomic_move_major_tag "0000000000000000000000000000000000000000"
   ;;
 *)
   echo "Unable to determine a safe moving-tag update" >&2
