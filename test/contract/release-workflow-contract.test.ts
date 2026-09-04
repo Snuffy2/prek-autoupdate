@@ -24,6 +24,7 @@ interface WorkflowStep {
 
 interface WorkflowJob {
   readonly if?: string;
+  readonly needs?: string;
   readonly outputs?: Record<string, string>;
   readonly permissions?: Record<string, string>;
   readonly steps: WorkflowStep[];
@@ -37,6 +38,8 @@ interface Workflow {
   };
   readonly permissions: Record<string, string>;
   readonly jobs: {
+    readonly prepare: WorkflowJob;
+    readonly prerelease: WorkflowJob;
     readonly release: WorkflowJob;
   };
 }
@@ -464,7 +467,7 @@ describe("release workflow", () => {
   });
 
   it("provisions prek before preparing release files", () => {
-    const steps = workflow().jobs.release.steps;
+    const steps = workflow().jobs.prepare.steps;
     const setupIndex = steps.findIndex((step) =>
       step.uses?.startsWith("j178/prek-action@"),
     );
@@ -477,22 +480,16 @@ describe("release workflow", () => {
     expect(preparationIndex).toBeGreaterThan(setupIndex);
   });
 
-  it("never executes prerelease or resumed release-tag code", () => {
-    const steps = workflow().jobs.release.steps;
+  it("isolates untrusted preparation from privileged release mutation", () => {
+    const releaseWorkflow = workflow();
+    const preparation = releaseWorkflow.jobs.prepare;
+    const release = releaseWorkflow.jobs.release;
+    const prerelease = releaseWorkflow.jobs.prerelease;
+    const steps = release.steps;
     const metadata = requiredStep(
       steps,
       (step) => step.id === "base",
       "release metadata",
-    );
-    const setupPrek = requiredStep(
-      steps,
-      (step) => step.uses?.startsWith("j178/prek-action@") ?? false,
-      "prek setup",
-    );
-    const preparation = requiredStep(
-      steps,
-      (step) => step.run?.includes("prepare-release.sh") ?? false,
-      "release preparation",
     );
     const validationPush = requiredStep(
       steps,
@@ -510,9 +507,25 @@ describe("release workflow", () => {
     expect(metadata.run).toContain(
       'git diff --name-only "$tag_sha^" "$tag_sha"',
     );
-    expect(setupPrek.if).toContain("github.event.release.prerelease == false");
-    expect(setupPrek.if).toContain("steps.base.outputs.resume");
-    expect(preparation.if).toBe(setupPrek.if);
+    expect(preparation.permissions).toEqual({ contents: "read" });
+    expect(preparation.if).toBe("github.event.release.prerelease == false");
+    expect(
+      preparation.steps.some((step) =>
+        step.uses?.startsWith("j178/prek-action@"),
+      ),
+    ).toBe(true);
+    expect(release.needs).toBe("prepare");
+    expect(release.if).toBe("github.event.release.prerelease == false");
+    expect(
+      release.steps
+        .filter((step) => step.uses !== undefined)
+        .every((step) => step.uses?.startsWith("actions/")),
+    ).toBe(true);
+    expect(prerelease.permissions).toEqual({ contents: "read" });
+    expect(prerelease.if).toBe("github.event.release.prerelease == true");
+    expect(
+      prerelease.steps.some((step) => step.run?.includes("git push")),
+    ).toBe(false);
     expect(validationPush.run).toContain(
       'git push origin "$CANDIDATE_SHA:refs/heads/$temp_ref"',
     );
@@ -524,11 +537,17 @@ describe("release workflow", () => {
 
   it("keeps release credentials scoped to write-capable jobs", () => {
     const releaseWorkflow = workflow();
-    const checkouts = releaseWorkflow.jobs.release.steps.filter((step) =>
-      step.uses?.startsWith("actions/checkout@"),
+    const checkouts = Object.values(releaseWorkflow.jobs).flatMap((job) =>
+      job.steps.filter((step) => step.uses?.startsWith("actions/checkout@")),
     );
 
     expect(releaseWorkflow.permissions).toEqual({ contents: "read" });
+    expect(releaseWorkflow.jobs.prepare.permissions).toEqual({
+      contents: "read",
+    });
+    expect(releaseWorkflow.jobs.prerelease.permissions).toEqual({
+      contents: "read",
+    });
     expect(releaseWorkflow.jobs.release.permissions).toEqual({
       actions: "write",
       checks: "read",
