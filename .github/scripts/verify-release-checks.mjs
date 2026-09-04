@@ -220,7 +220,7 @@ export function parseRequiredChecks(values) {
   const checks = new Map();
   for (const value of values) {
     const separator = value.indexOf("::");
-    if (separator <= 0 || separator === value.length - 2) {
+    if (separator <= 0 || separator + 2 >= value.length) {
       throw new TypeError("Required checks must use workflow::exact job name.");
     }
     const workflow = value.slice(0, separator);

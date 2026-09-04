@@ -323,10 +323,6 @@ elif [[ "$*" == api\\ graphql* ]]; then
   if [[ "$FAILURE" == "point-ref-race" && "$*" == *'name: $pointName'* && "$*" == *'beforeOid: $pointOid'* && "$*" == *'afterOid: $pointOid'* && "$*" == *"-f pointName=refs/tags/$RELEASE_TAG"* && "$*" == *"-f pointOid=$POINT_DIRECT_REF_OID"* ]]; then
     exit 1
   fi
-  if [[ "$POINT_DIRECT_REF_TYPE" == "tag" && "$*" == *"-f pointOid=$POINT_DIRECT_REF_OID"* ]]; then
-    printf '%s\n' 'Invalid object type tag, expected commit' >&2
-    exit 1
-  fi
   printf '%s\n' '{"data":{"updateRefs":{"clientMutationId":null}}}'
 else
   printf 'unexpected gh call: %s\n' "$*" >&2
@@ -467,6 +463,38 @@ describe("release workflow", () => {
     expect(setupIndex).toBeGreaterThanOrEqual(0);
     expect(steps[setupIndex]?.with?.["install-only"]).toBe(true);
     expect(preparationIndex).toBeGreaterThan(setupIndex);
+  });
+
+  it("never executes prerelease or resumed release-tag code", () => {
+    const steps = workflow().jobs.release.steps;
+    const metadata = steps.find((step) => step.id === "base");
+    const setupPrek = steps.find((step) =>
+      step.uses?.startsWith("j178/prek-action@"),
+    );
+    const preparation = steps.find((step) =>
+      step.run?.includes("prepare-release.sh"),
+    );
+    const validationPush = steps.find((step) =>
+      step.run?.includes("refs/heads/$temp_ref"),
+    );
+    const finalIdentity = steps.find((step) =>
+      step.run?.includes('git show "$expected_sha:package.json"'),
+    );
+
+    expect(metadata?.run).not.toContain("git checkout");
+    expect(metadata?.run).toContain(
+      'git diff --name-only "$tag_sha^" "$tag_sha"',
+    );
+    expect(setupPrek?.if).toContain("github.event.release.prerelease == false");
+    expect(setupPrek?.if).toContain("steps.base.outputs.resume");
+    expect(preparation?.if).toBe(setupPrek?.if);
+    expect(validationPush?.run).toContain(
+      'git push origin "$CANDIDATE_SHA:refs/heads/$temp_ref"',
+    );
+    expect(validationPush?.run).not.toContain('git push origin "HEAD:');
+    expect(finalIdentity?.run).toContain(
+      'git cat-file -e "$expected_sha:dist/index.js"',
+    );
   });
 
   it("keeps release credentials scoped to write-capable jobs", () => {
@@ -643,6 +671,7 @@ describe("release workflow", () => {
     expect(calls).toContain("api repos/owner/repository --jq .node_id");
     expect(calls).toContain("api graphql");
     expect(calls).toContain("-F repositoryId=R_repo_node");
+    expect(calls).toContain(`-f pointOid=${targetSha}`);
     expect(calls).toContain(`-f majorBeforeOid=${annotatedTagOid}`);
     expect(calls).not.toContain(`-f majorBeforeOid=${oldSha}`);
     expect(calls).toContain(`-f majorAfterOid=${targetSha}`);
@@ -678,11 +707,17 @@ describe("release workflow", () => {
     expect(calls).toContain(`git/tags/${pointChainOid}`);
     expect(calls).toContain(`git/tags/${movingChainOid}`);
     expect(calls).toContain("api graphql");
+    expect(calls).toContain(`-f pointOid=${"e".repeat(40)}`);
   });
 
-  it.each(["update", "create"] as const)(
-    "atomically rejects lightweight point-tag movement during a major-tag %s",
-    (action) => {
+  it.each([
+    ["update", 0],
+    ["update", 1],
+    ["create", 0],
+    ["create", 1],
+  ] as const)(
+    "atomically rejects %s movement with point-tag depth %s",
+    (action, pointTagDepth) => {
       const oldSha = "1".repeat(40);
       const targetSha = "2".repeat(40);
       const tags = [
@@ -720,6 +755,9 @@ describe("release workflow", () => {
           tags,
           releases,
           "point-ref-race",
+          undefined,
+          targetSha,
+          pointTagDepth,
         ),
       ).toThrow();
     },
@@ -914,7 +952,7 @@ describe("release workflow", () => {
       1,
     );
     expect(calls).toContain(
-      'beforeOid: "0000000000000000000000000000000000000000"',
+      "-f majorBeforeOid=0000000000000000000000000000000000000000",
     );
 
     expect(() =>

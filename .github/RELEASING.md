@@ -39,8 +39,10 @@ Fix the condition that failed and rerun the same release workflow run. Do not
 publish a second release for the same version.
 
 Stable reruns recognize a completed `Release vX.Y.Z` commit when the point tag
-still identifies that commit and the commit remains in the default branch's
-history. They revalidate that immutable commit and safely repeat the final
-identity and moving-tag checks. A failed validation may leave its uniquely named
-`release-validation/...` branch for diagnosis; delete it only after confirming
-it still points to the candidate SHA reported by the failed run.
+still identifies that commit, the commit changes only the three release files,
+and the commit remains in the default branch's history. Prerelease and resumed
+tag contents are inspected without executing their scripts. Reruns revalidate
+the immutable commit and safely repeat the final identity and moving-tag checks.
+A failed validation may leave its uniquely named `release-validation/...` branch
+for diagnosis; delete it only after confirming it still points to the candidate
+SHA reported by the failed run.

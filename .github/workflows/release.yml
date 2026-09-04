@@ -80,24 +80,38 @@ jobs:
           fi
 
           resume=false
-          source_sha="$target_sha"
           tagged_version="$(git show "$tag_sha:package.json" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')"
+          tagged_lock_version="$(git show "$tag_sha:package-lock.json" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')"
+          tagged_root_version="$(git show "$tag_sha:package-lock.json" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).packages[""].version')"
+          git cat-file -e "$tag_sha:dist/index.js"
           if [[ "$IS_PRERELEASE" == true ]]; then
             if ! git merge-base --is-ancestor "$tag_sha" "$target_sha" || \
-              [[ "v$tagged_version" != "$RELEASE_TAG" ]]; then
+              [[ "v$tagged_version" != "$RELEASE_TAG" ]] || \
+              [[ "$tagged_lock_version" != "$tagged_version" ]] || \
+              [[ "$tagged_root_version" != "$tagged_version" ]]; then
               echo "Prerelease tag must be a matching default-branch commit." >&2
               exit 1
             fi
-            source_sha="$tag_sha"
           elif [[ "$(git log -1 --format=%s "$tag_sha")" == "Release $RELEASE_TAG" ]]; then
             if [[ "$(git rev-list --parents -n 1 "$tag_sha" | wc -w)" -ne 2 ]] || \
               [[ "v$tagged_version" != "$RELEASE_TAG" ]] || \
+              [[ "$tagged_lock_version" != "$tagged_version" ]] || \
+              [[ "$tagged_root_version" != "$tagged_version" ]] || \
               ! git merge-base --is-ancestor "$tag_sha" "$target_sha"; then
               echo "Matching branch/tag release commit has invalid release contents." >&2
               exit 1
             fi
+            changed_paths="$(git diff --name-only "$tag_sha^" "$tag_sha")"
+            while IFS= read -r changed_path; do
+              case "$changed_path" in
+                dist/index.js | package-lock.json | package.json) ;;
+                *)
+                  echo "Matching release commit changes unexpected path: $changed_path" >&2
+                  exit 1
+                  ;;
+              esac
+            done <<< "$changed_paths"
             resume=true
-            source_sha="$tag_sha"
             echo "candidate-sha=$tag_sha" >> "$GITHUB_OUTPUT"
           elif [[ "$target_sha" != "$tag_sha" ]]; then
             echo "Release tag and target branch must start at the same commit." >&2
@@ -105,32 +119,34 @@ jobs:
           fi
           {
             echo "resume=$resume"
-            echo "source-sha=$source_sha"
+            echo "tag-sha=$tag_sha"
             echo "target-sha=$target_sha"
             echo "tag-oid=$tag_oid"
           } >> "$GITHUB_OUTPUT"
-          git checkout --detach "$source_sha"
 
       - name: Set up prek
+        if:
+          github.event.release.prerelease == false && steps.base.outputs.resume
+          != 'true'
         uses: j178/prek-action@v2
         with:
           install-only: true
 
       - name: Install dependencies
+        if:
+          github.event.release.prerelease == false && steps.base.outputs.resume
+          != 'true'
         run: npm ci --ignore-scripts
 
       - name: Prepare and validate release files
+        if:
+          github.event.release.prerelease == false && steps.base.outputs.resume
+          != 'true'
         env:
-          IS_PRERELEASE: ${{ github.event.release.prerelease }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
           bash .github/scripts/prepare-release.sh
-          if [[ "$IS_PRERELEASE" == true ]] && \
-            ! git diff --cached --quiet; then
-            echo "Prerelease source must already contain its versioned release files." >&2
-            exit 1
-          fi
 
       - name: Create deterministic stable release commit
         if: github.event.release.prerelease == false
@@ -158,6 +174,7 @@ jobs:
         if: github.event.release.prerelease == false
         id: validation_ref
         env:
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
@@ -165,7 +182,7 @@ jobs:
           temp_ref="release-validation/${RELEASE_TAG}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           git check-ref-format --branch "$temp_ref"
           gh auth setup-git --hostname github.com
-          git push origin "HEAD:refs/heads/$temp_ref"
+          git push origin "$CANDIDATE_SHA:refs/heads/$temp_ref"
           echo "name=$temp_ref" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch and verify immutable release gate
@@ -217,20 +234,29 @@ jobs:
           IS_PRERELEASE: ${{ github.event.release.prerelease }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           RELEASE_TARGET: ${{ steps.release.outputs.target }}
-          SOURCE_SHA: ${{ steps.base.outputs.source-sha }}
+          RESUME: ${{ steps.base.outputs.resume }}
           STABLE_SHA: ${{ steps.candidate.outputs.sha }}
+          TAG_SHA: ${{ steps.base.outputs.tag-sha }}
         run: |
           set -euo pipefail
           expected_sha="$STABLE_SHA"
-          [[ "$IS_PRERELEASE" == true ]] && expected_sha="$SOURCE_SHA"
+          [[ "$IS_PRERELEASE" == true ]] && expected_sha="$TAG_SHA"
           git fetch --force --no-tags origin \
             "refs/heads/$RELEASE_TARGET:refs/remotes/origin/$RELEASE_TARGET" \
             "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
           [[ "$(git rev-parse "refs/tags/$RELEASE_TAG^{}")" == "$expected_sha" ]]
           git merge-base --is-ancestor \
             "$expected_sha" "refs/remotes/origin/$RELEASE_TARGET"
-          [[ "v$(node -p 'require("./package.json").version')" == "$RELEASE_TAG" ]]
-          npm run check:dist
+          package_version="$(git show "$expected_sha:package.json" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')"
+          lock_version="$(git show "$expected_sha:package-lock.json" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')"
+          root_version="$(git show "$expected_sha:package-lock.json" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).packages[""].version')"
+          [[ "v$package_version" == "$RELEASE_TAG" ]]
+          [[ "$lock_version" == "$package_version" ]]
+          [[ "$root_version" == "$package_version" ]]
+          git cat-file -e "$expected_sha:dist/index.js"
+          if [[ "$IS_PRERELEASE" == false && "$RESUME" != true ]]; then
+            npm run check:dist
+          fi
 
       - name: Update stable moving major tag
         if: github.event.release.prerelease == false
