@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -24,6 +25,7 @@ interface WorkflowStep {
 
 interface WorkflowJob {
   readonly if?: string;
+  readonly needs?: string | string[];
   readonly outputs?: Record<string, string>;
   readonly permissions?: Record<string, string>;
   readonly steps: WorkflowStep[];
@@ -37,8 +39,15 @@ interface Workflow {
   };
   readonly permissions: Record<string, string>;
   readonly jobs: {
+    readonly candidate: WorkflowJob;
+    readonly prerelease: WorkflowJob;
     readonly release: WorkflowJob;
   };
+}
+
+interface CandidateStagingResult {
+  readonly error: Error | undefined;
+  readonly hasStagedChanges: boolean;
 }
 
 const RELEASE_DECISION_SCRIPT = resolve(".github/scripts/decide-major-tag.mjs");
@@ -59,6 +68,132 @@ function requiredStep(
     throw new Error(`Release workflow is missing the ${description} step`);
   }
   return step;
+}
+
+function runCandidateStaging(
+  candidatePackage: Record<string, unknown>,
+  candidateLock?: Record<string, unknown>,
+  candidateSha = "1".repeat(40),
+  tagSha = candidateSha,
+): CandidateStagingResult {
+  const stagingRun = requiredStep(
+    workflow().jobs.release.steps,
+    (step) =>
+      step.run?.includes(
+        "expected_paths=(dist/index.js package-lock.json package.json)",
+      ) ?? false,
+    "read-only candidate validation",
+  ).run!;
+  const directory = mkdtempSync(join(tmpdir(), "prek-release-candidate-"));
+  const artifactDirectory = mkdtempSync(
+    join(tmpdir(), "prek-release-candidate-artifact-"),
+  );
+  const packageLock = {
+    lockfileVersion: 3,
+    name: "candidate-fixture",
+    packages: {
+      "": { name: "candidate-fixture", version: "1.0.0" },
+    },
+    version: "1.0.0",
+  };
+  try {
+    mkdirSync(join(directory, "dist"), { recursive: true });
+    mkdirSync(join(artifactDirectory, "dist"), { recursive: true });
+    writeFileSync(
+      join(directory, "package.json"),
+      JSON.stringify({
+        name: "candidate-fixture",
+        private: true,
+        version: "1.0.0",
+      }),
+    );
+    writeFileSync(
+      join(directory, "package-lock.json"),
+      JSON.stringify(packageLock),
+    );
+    writeFileSync(join(directory, "dist", "index.js"), "export {};\n");
+    execFileSync("git", ["init", "--initial-branch=main"], { cwd: directory });
+    execFileSync(
+      "git",
+      ["add", "dist/index.js", "package-lock.json", "package.json"],
+      {
+        cwd: directory,
+      },
+    );
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "user.name=Release test",
+        "commit",
+        "-m",
+        "base",
+      ],
+      { cwd: directory },
+    );
+    writeFileSync(
+      join(artifactDirectory, "package.json"),
+      JSON.stringify(candidatePackage),
+    );
+    writeFileSync(
+      join(artifactDirectory, "package-lock.json"),
+      JSON.stringify(
+        candidateLock ?? {
+          ...packageLock,
+          packages: {
+            "": { name: "candidate-fixture", version: "1.0.1" },
+          },
+          version: "1.0.1",
+        },
+      ),
+    );
+    writeFileSync(join(artifactDirectory, "dist", "index.js"), "export {};\n");
+    let error: Error | undefined;
+    try {
+      execFileSync("bash", ["-c", stagingRun], {
+        cwd: directory,
+        env: {
+          ...process.env,
+          CANDIDATE_SHA: candidateSha,
+          RELEASE_ARTIFACT: artifactDirectory,
+          RELEASE_TAG: "v1.0.1",
+          TAG_SHA: tagSha,
+        },
+        stdio: "pipe",
+      });
+    } catch (caught) {
+      const output = caught as {
+        stderr?: Buffer | string;
+        stdout?: Buffer | string;
+      };
+      const stderr = output.stderr;
+      const stdout = output.stdout;
+      error = new Error(
+        stderr?.toString().trim() ||
+          stdout?.toString().trim() ||
+          "candidate staging failed",
+        { cause: caught },
+      );
+    }
+    let hasStagedChanges = false;
+    try {
+      execFileSync("git", ["diff", "--cached", "--quiet"], {
+        cwd: directory,
+        stdio: "ignore",
+      });
+    } catch {
+      hasStagedChanges = true;
+    }
+    return {
+      error,
+      hasStagedChanges,
+    };
+  } finally {
+    rmSync(directory, { recursive: true });
+    rmSync(artifactDirectory, { recursive: true });
+  }
 }
 
 function decideRelease(
@@ -161,67 +296,65 @@ function prepareRelease(
   }
 }
 
-function runPreparationWithGitFailure(failure: "diff" | "ls-files"): void {
-  const directory = mkdtempSync(
-    join(tmpdir(), "prek-autoupdate-prepare-script-"),
-  );
-  const gitPath = join(directory, "git");
-  const nodePath = join(directory, "node");
-  const npmPath = join(directory, "npm");
-  writeFileSync(
-    gitPath,
-    `#!/usr/bin/env bash
-set -euo pipefail
-case "$*" in
-"status --porcelain"|"diff --check")
-  exit 0
-  ;;
-"diff --name-only")
-  if [[ "$FAILURE" == "diff" ]]; then
-    echo "simulated git diff failure" >&2
-    exit 23
-  fi
-  exit 0
-  ;;
-"ls-files --others --exclude-standard")
-  if [[ "$FAILURE" == "ls-files" ]]; then
-    echo "simulated git ls-files failure" >&2
-    exit 24
-  fi
-  exit 0
-  ;;
-*)
-  echo "unexpected git call: $*" >&2
-  exit 2
-  ;;
-esac
-`,
-  );
-  writeFileSync(nodePath, "#!/usr/bin/env bash\nexit 0\n");
-  writeFileSync(npmPath, "#!/usr/bin/env bash\nexit 0\n");
-  chmodSync(gitPath, 0o755);
-  chmodSync(nodePath, 0o755);
-  chmodSync(npmPath, 0o755);
+function runPrereleaseValidation(releaseTag: string): Error | undefined {
+  const verification = requiredStep(
+    workflow().jobs.prerelease.steps,
+    (step) => step.name === "Verify prerelease identity without mutating refs",
+    "prerelease identity verification",
+  ).run!;
+  const directory = mkdtempSync(join(tmpdir(), "prek-prerelease-validation-"));
+  const version = releaseTag.slice(1);
   try {
+    mkdirSync(join(directory, "dist"), { recursive: true });
+    writeFileSync(join(directory, "package.json"), JSON.stringify({ version }));
+    writeFileSync(
+      join(directory, "package-lock.json"),
+      JSON.stringify({ version, packages: { "": { version } } }),
+    );
+    writeFileSync(join(directory, "dist", "index.js"), "export {};\n");
+    execFileSync("git", ["init", "--initial-branch=main"], { cwd: directory });
+    execFileSync("git", ["add", "."], { cwd: directory });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "user.name=Prerelease test",
+        "commit",
+        "-m",
+        "release",
+      ],
+      { cwd: directory },
+    );
+    execFileSync("git", ["tag", releaseTag], { cwd: directory });
+    execFileSync("git", ["remote", "add", "origin", directory], {
+      cwd: directory,
+    });
     try {
-      execFileSync("bash", [resolve(".github/scripts/prepare-release.sh")], {
+      execFileSync("bash", ["-c", verification], {
         cwd: directory,
         env: {
           ...process.env,
-          FAILURE: failure,
-          PATH: `${directory}:${process.env.PATH}`,
+          DEFAULT_BRANCH: "main",
+          RELEASE_TAG: releaseTag,
+          RELEASE_TARGET: "main",
         },
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: "pipe",
       });
-    } catch (error) {
-      const stderr = (error as { stderr?: Buffer | string }).stderr;
-      throw new Error(
-        stderr?.toString().trim() || "release preparation failed",
-        {
-          cause: error,
-        },
+    } catch (caught) {
+      const error = caught as {
+        stderr?: Buffer | string;
+        stdout?: Buffer | string;
+      };
+      return new Error(
+        error.stderr?.toString().trim() ||
+          error.stdout?.toString().trim() ||
+          "prerelease validation failed",
+        { cause: caught },
       );
     }
+    return undefined;
   } finally {
     rmSync(directory, { recursive: true });
   }
@@ -395,104 +528,95 @@ describe("release workflow", () => {
 
   it("validates the candidate before lease-guarded atomic promotion", () => {
     const steps = workflow().jobs.release.steps;
-    const gate = steps.find((step) =>
-      step.run?.includes("verify-release-checks.mjs"),
+    const gate = requiredStep(
+      steps,
+      (step) => step.run?.includes("verify-release-checks.mjs") ?? false,
+      "immutable release gate",
     );
-    const promotion = steps.find((step) =>
-      step.run?.includes("git push --atomic"),
+    const promotion = requiredStep(
+      steps,
+      (step) => step.run?.includes("git push --atomic") ?? false,
+      "atomic promotion",
     );
-    const cleanup = steps.find((step) =>
-      step.run?.includes('origin ":refs/heads/$TEMP_REF"'),
+    const cleanup = requiredStep(
+      steps,
+      (step) => step.run?.includes('origin ":refs/heads/$TEMP_REF"') ?? false,
+      "validated-branch cleanup",
     );
 
-    expect(gate?.run).toContain("--required-check 'ci.yml::Node CI'");
-    expect(gate?.run).toContain(
+    expect(gate.run).toContain("--required-check 'ci.yml::Node CI'");
+    expect(gate.run).toContain(
       "--required-check 'prek-autofix-review.yml::review'",
     );
-    expect(gate?.run).toContain('--sha "$CANDIDATE_SHA"');
-    expect(promotion?.run).toContain(
+    expect(gate.run).toContain('--sha "$CANDIDATE_SHA"');
+    expect(promotion.run).toContain(
       '--force-with-lease="refs/heads/$RELEASE_TARGET:$TARGET_SHA"',
     );
-    expect(promotion?.run).toContain(
+    expect(promotion.env).toMatchObject({
+      RELEASE_TARGET: "${{ steps.base.outputs.target }}",
+    });
+    expect(promotion.run).toContain(
       '--force-with-lease="refs/tags/$RELEASE_TAG:$ORIGINAL_TAG_OID"',
     );
-    expect(cleanup?.run).toContain(
+    expect(cleanup.run).toContain(
       '--force-with-lease="refs/heads/$TEMP_REF:$CANDIDATE_SHA"',
     );
   });
 
   it.each([
-    ["diff", "Unable to collect changed release paths"],
-    ["ls-files", "Unable to collect untracked release paths"],
+    ["stable", "v2.0.3", "2.0.2", "v2.0.1", "2.0.2", "v2"],
+    [
+      "prerelease",
+      "v2.1.0-beta.2",
+      "2.1.0-beta.1",
+      "v2.1.0-beta.1",
+      "2.1.0-beta.2",
+      "v2.1.0-beta.01",
+    ],
   ] as const)(
-    "fails closed when git %s path collection fails",
-    (failure, message) => {
-      expect(() => runPreparationWithGitFailure(failure)).toThrow(message);
+    "updates package metadata to a valid %s version",
+    (
+      _kind,
+      releaseTag,
+      currentVersion,
+      downgradeTag,
+      downgradeCurrentVersion,
+      invalidTag,
+    ) => {
+      const version = releaseTag.slice(1);
+      const prepared = prepareRelease(releaseTag, currentVersion);
+
+      expect(prepared.output).toMatch(
+        /^major-tag=v2\nsource-sha=[0-9a-f]{40}\n$/,
+      );
+      expect(prepared.packageJson.version).toBe(version);
+      expect(prepared.packageLock.version).toBe(version);
+      expect(prepared.packageLock.packages[""].version).toBe(version);
+      expect(() =>
+        prepareRelease(downgradeTag, downgradeCurrentVersion),
+      ).toThrow(/downgrade/u);
+      expect(() => prepareRelease(invalidTag, currentVersion)).toThrow(
+        /vMAJOR\.MINOR\.PATCH/u,
+      );
     },
   );
 
-  it("updates package metadata to the published release version", () => {
-    const prepared = prepareRelease("v2.0.3", "2.0.2");
-
-    expect(prepared.output).toMatch(
-      /^major-tag=v2\nsource-sha=[0-9a-f]{40}\n$/,
-    );
-    expect(prepared.packageJson.version).toBe("2.0.3");
-    expect(prepared.packageLock.version).toBe("2.0.3");
-    expect(prepared.packageLock.packages[""].version).toBe("2.0.3");
-    expect(() => prepareRelease("v2.0.1", "2.0.2")).toThrow(/downgrade/u);
-    expect(() => prepareRelease("v2", "2.0.2")).toThrow(
-      /vMAJOR\.MINOR\.PATCH/u,
-    );
+  it("enforces SemVer prerelease identifiers before inspecting release refs", () => {
+    expect(runPrereleaseValidation("v2.1.0-beta.01")).toBeDefined();
+    expect(runPrereleaseValidation("v2.1.0-beta.1")).toBeUndefined();
+    expect(runPrereleaseValidation("v2.1.0-beta.rc-1")).toBeUndefined();
   });
 
-  it("updates package metadata to a valid prerelease version", () => {
-    const prepared = prepareRelease("v2.1.0-beta.2", "2.1.0-beta.1");
-
-    expect(prepared.output).toMatch(
-      /^major-tag=v2\nsource-sha=[0-9a-f]{40}\n$/,
-    );
-    expect(prepared.packageJson.version).toBe("2.1.0-beta.2");
-    expect(prepared.packageLock.version).toBe("2.1.0-beta.2");
-    expect(prepared.packageLock.packages[""].version).toBe("2.1.0-beta.2");
-    expect(() => prepareRelease("v2.1.0-beta.1", "2.1.0-beta.2")).toThrow(
-      /downgrade/u,
-    );
-    expect(() => prepareRelease("v2.1.0-beta.01", "2.0.4")).toThrow(
-      /vMAJOR\.MINOR\.PATCH/u,
-    );
-  });
-
-  it("provisions prek before preparing release files", () => {
-    const steps = workflow().jobs.release.steps;
-    const setupIndex = steps.findIndex((step) =>
-      step.uses?.startsWith("j178/prek-action@"),
-    );
-    const preparationIndex = steps.findIndex((step) =>
-      step.run?.includes("prepare-release.sh"),
-    );
-
-    expect(setupIndex).toBeGreaterThanOrEqual(0);
-    expect(steps[setupIndex]?.with?.["install-only"]).toBe(true);
-    expect(preparationIndex).toBeGreaterThan(setupIndex);
-  });
-
-  it("never executes prerelease or resumed release-tag code", () => {
-    const steps = workflow().jobs.release.steps;
+  it("isolates candidate construction from privileged release mutation", () => {
+    const releaseWorkflow = workflow();
+    const candidate = releaseWorkflow.jobs.candidate;
+    const release = releaseWorkflow.jobs.release;
+    const prerelease = releaseWorkflow.jobs.prerelease;
+    const steps = release.steps;
     const metadata = requiredStep(
       steps,
       (step) => step.id === "base",
       "release metadata",
-    );
-    const setupPrek = requiredStep(
-      steps,
-      (step) => step.uses?.startsWith("j178/prek-action@") ?? false,
-      "prek setup",
-    );
-    const preparation = requiredStep(
-      steps,
-      (step) => step.run?.includes("prepare-release.sh") ?? false,
-      "release preparation",
     );
     const validationPush = requiredStep(
       steps,
@@ -505,14 +629,89 @@ describe("release workflow", () => {
         step.run?.includes('git show "$expected_sha:package.json"') ?? false,
       "final release identity",
     );
+    const preparationGate = requiredStep(
+      steps,
+      (step) =>
+        step.run?.includes("Read-only candidate construction must succeed") ??
+        false,
+      "new-release preparation gate",
+    );
+    const staging = requiredStep(
+      steps,
+      (step) =>
+        step.run?.includes(
+          "expected_paths=(dist/index.js package-lock.json package.json)",
+        ) ?? false,
+      "read-only candidate validation",
+    );
+    const candidateCheckout = requiredStep(
+      candidate.steps,
+      (step) => step.uses?.startsWith("actions/checkout@") ?? false,
+      "candidate checkout",
+    );
+    const candidateArtifact = requiredStep(
+      candidate.steps,
+      (step) => step.uses?.startsWith("actions/upload-artifact@") ?? false,
+      "candidate artifact export",
+    );
 
-    expect(metadata.run).not.toContain("git checkout");
+    expect(metadata.env).toMatchObject({
+      DEFAULT_BRANCH: "${{ github.event.repository.default_branch }}",
+      RELEASE_TARGET: "${{ github.event.release.target_commitish }}",
+    });
+    expect(metadata.run).toContain(
+      'if [[ "$RELEASE_TARGET" != "$DEFAULT_BRANCH" ]]',
+    );
     expect(metadata.run).toContain(
       'git diff --name-only "$tag_sha^" "$tag_sha"',
     );
-    expect(setupPrek.if).toContain("github.event.release.prerelease == false");
-    expect(setupPrek.if).toContain("steps.base.outputs.resume");
-    expect(preparation.if).toBe(setupPrek.if);
+    expect(candidate.if).toBe("github.event.release.prerelease == false");
+    expect(candidateCheckout.with?.ref).toBe(
+      "${{ github.event.release.tag_name }}",
+    );
+    expect(
+      candidate.steps.some((step) => step.run?.includes("npm run check:dist")),
+    ).toBe(true);
+    expect(
+      String(candidateArtifact.with?.path).trim().split("\n").sort(),
+    ).toEqual(["dist/index.js", "package-lock.json", "package.json"]);
+    expect(candidate.outputs?.sha).toBe("${{ steps.revision.outputs.sha }}");
+    const candidateRevision = requiredStep(
+      candidate.steps,
+      (step) => step.id === "revision",
+      "candidate revision export",
+    );
+    expect(candidateRevision.run).toContain("git rev-parse HEAD");
+    expect(release.needs).toBe("candidate");
+    expect(release.if).toContain("always()");
+    expect(release.if).toContain("!cancelled()");
+    expect(release.if).toContain("github.event.release.prerelease == false");
+    expect(
+      [...candidate.steps, ...release.steps]
+        .filter((step) => step.uses !== undefined)
+        .every((step) => step.uses?.startsWith("actions/")),
+    ).toBe(true);
+    expect(release.steps.some((step) => step.run?.includes("npm "))).toBe(
+      false,
+    );
+    expect(preparationGate.if).toContain("steps.base.outputs.resume != 'true'");
+    expect(preparationGate.if).toContain("needs.candidate.result != 'success'");
+    expect(staging.if).toBe("steps.base.outputs.resume != 'true'");
+    expect(staging.env).toMatchObject({
+      CANDIDATE_SHA: "${{ needs.candidate.outputs.sha }}",
+      TAG_SHA: "${{ steps.base.outputs.tag-sha }}",
+    });
+    expect(staging.run).toContain('[[ "$CANDIDATE_SHA" != "$TAG_SHA" ]]');
+    expect(staging.run).toContain(
+      'cd "$RELEASE_ARTIFACT" && find . -type f -print',
+    );
+    expect(staging.run).not.toMatch(
+      /\.github\/scripts\/|\b(?:bash|node|sh)\s+["']?\$RELEASE_ARTIFACT/u,
+    );
+    expect(prerelease.if).toBe("github.event.release.prerelease == true");
+    expect(
+      prerelease.steps.some((step) => step.run?.includes("git push")),
+    ).toBe(false);
     expect(validationPush.run).toContain(
       'git push origin "$CANDIDATE_SHA:refs/heads/$temp_ref"',
     );
@@ -522,13 +721,68 @@ describe("release workflow", () => {
     );
   });
 
+  it("rejects candidate metadata changes beyond release version fields", () => {
+    const packageMetadata = {
+      name: "candidate-fixture",
+      private: true,
+      version: "1.0.1",
+    };
+
+    expect(runCandidateStaging(packageMetadata).error).toBeUndefined();
+    expect(
+      runCandidateStaging({
+        ...packageMetadata,
+        scripts: { preinstall: "unexpected" },
+      }).error,
+    ).toBeDefined();
+    expect(
+      runCandidateStaging(packageMetadata, {
+        lockfileVersion: 3,
+        name: "candidate-fixture",
+        packages: {
+          "": {
+            name: "candidate-fixture",
+            packageManager: "unexpected",
+            version: "1.0.1",
+          },
+        },
+        version: "1.0.1",
+      }).error,
+    ).toBeDefined();
+  });
+
+  it("rejects a candidate artifact from a different release revision before staging", () => {
+    const result = runCandidateStaging(
+      {
+        name: "candidate-fixture",
+        private: true,
+        version: "1.0.1",
+      },
+      undefined,
+      "1".repeat(40),
+      "2".repeat(40),
+    );
+
+    expect(result.error).toBeDefined();
+    expect(result.error?.message).toContain(
+      "does not match the validated release tag",
+    );
+    expect(result.hasStagedChanges).toBe(false);
+  });
+
   it("keeps release credentials scoped to write-capable jobs", () => {
     const releaseWorkflow = workflow();
-    const checkouts = releaseWorkflow.jobs.release.steps.filter((step) =>
-      step.uses?.startsWith("actions/checkout@"),
+    const checkouts = Object.values(releaseWorkflow.jobs).flatMap((job) =>
+      job.steps.filter((step) => step.uses?.startsWith("actions/checkout@")),
     );
 
     expect(releaseWorkflow.permissions).toEqual({ contents: "read" });
+    expect(releaseWorkflow.jobs.candidate.permissions).toEqual({
+      contents: "read",
+    });
+    expect(releaseWorkflow.jobs.prerelease.permissions).toEqual({
+      contents: "read",
+    });
     expect(releaseWorkflow.jobs.release.permissions).toEqual({
       actions: "write",
       checks: "read",
@@ -788,31 +1042,6 @@ describe("release workflow", () => {
     },
   );
 
-  it("verifies the exact finalized release ref before reading tag lists", () => {
-    const targetSha = "2".repeat(40);
-    const calls = runReleaseUpdate(
-      "v1.10.0",
-      targetSha,
-      [{ name: "v1.10.0", commit: { sha: targetSha } }],
-      [
-        {
-          tag_name: "v1.10.0",
-          draft: false,
-          prerelease: false,
-          published_at: "2026-01-01T00:00:00Z",
-        },
-      ],
-    );
-
-    const exactRefCall = "git/ref/tags/v1.10.0";
-    const tagListCall = "tags?per_page=100";
-    expect(calls).toContain(exactRefCall);
-    expect(calls).toContain(tagListCall);
-    expect(calls.indexOf(exactRefCall)).toBeLessThan(
-      calls.indexOf(tagListCall),
-    );
-  });
-
   it("accepts a stale paginated SHA after verifying the exact release ref", () => {
     const staleSha = "1".repeat(40);
     const targetSha = "2".repeat(40);
@@ -830,7 +1059,13 @@ describe("release workflow", () => {
       ],
     );
 
-    expect(calls).toContain("git/ref/tags/v1.10.0");
+    const exactRefCall = "git/ref/tags/v1.10.0";
+    const tagListCall = "tags?per_page=100";
+    expect(calls).toContain(exactRefCall);
+    expect(calls).toContain(tagListCall);
+    expect(calls.indexOf(exactRefCall)).toBeLessThan(
+      calls.indexOf(tagListCall),
+    );
     expect(calls).toContain(`-f majorAfterOid=${targetSha}`);
   });
 

@@ -14,7 +14,65 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  candidate:
+    if: github.event.release.prerelease == false
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.revision.outputs.sha }}
+    steps:
+      - name: Check out the immutable release revision
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record the checked-out release revision
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Build and validate the release candidate
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+          node .github/scripts/prepare-release.mjs
+          npm run check:dist
+          changed_paths="$(git diff --name-only)"
+          while IFS= read -r changed_path; do
+            case "$changed_path" in
+              dist/index.js | package-lock.json | package.json) ;;
+              *)
+                echo "Candidate construction changed unexpected path: $changed_path" >&2
+                exit 1
+                ;;
+            esac
+          done <<< "$changed_paths"
+          [[ -z "$(git ls-files --others --exclude-standard)" ]]
+
+      - name: Export the narrow release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/index.js
+            package-lock.json
+            package.json
+          if-no-files-found: error
+          retention-days: 1
+
   release:
+    if: >-
+      always() && !cancelled() && github.event.release.prerelease == false
+    needs: candidate
     permissions:
       actions: write
       checks: read
@@ -22,19 +80,6 @@ jobs:
       statuses: write
     runs-on: ubuntu-latest
     steps:
-      - name: Require the default-branch release target
-        id: release
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          RELEASE_TARGET: ${{ github.event.release.target_commitish }}
-        run: |
-          set -euo pipefail
-          if [[ "$RELEASE_TARGET" != "$DEFAULT_BRANCH" ]]; then
-            echo "Release target must be the default branch." >&2
-            exit 1
-          fi
-          echo "target=$RELEASE_TARGET" >> "$GITHUB_OUTPUT"
-
       - name: Check out trusted default-branch revision
         uses: actions/checkout@v7
         with:
@@ -46,23 +91,25 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
-          cache: npm
 
       - name: Validate release metadata and immutable starting refs
         id: base
         env:
           IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-          RELEASE_TARGET: ${{ steps.release.outputs.target }}
+          RELEASE_TARGET: ${{ github.event.release.target_commitish }}
         run: |
           set -euo pipefail
+          if [[ "$RELEASE_TARGET" != "$DEFAULT_BRANCH" ]]; then
+            echo "Release target must be the default branch." >&2
+            exit 1
+          fi
           if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
             echo "Release tag must use semantic vMAJOR.MINOR.PATCH syntax." >&2
             exit 1
           fi
-          tag_is_prerelease=false
-          [[ "$RELEASE_TAG" == *-* ]] && tag_is_prerelease=true
-          if [[ "$tag_is_prerelease" != "$IS_PRERELEASE" ]]; then
+          if [[ "$IS_PRERELEASE" != false || "$RELEASE_TAG" == *-* ]]; then
             echo "Release tag and published prerelease state disagree." >&2
             exit 1
           fi
@@ -84,15 +131,7 @@ jobs:
           tagged_lock_version="$(git show "$tag_sha:package-lock.json" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')"
           tagged_root_version="$(git show "$tag_sha:package-lock.json" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).packages[""].version')"
           git cat-file -e "$tag_sha:dist/index.js"
-          if [[ "$IS_PRERELEASE" == true ]]; then
-            if ! git merge-base --is-ancestor "$tag_sha" "$target_sha" || \
-              [[ "v$tagged_version" != "$RELEASE_TAG" ]] || \
-              [[ "$tagged_lock_version" != "$tagged_version" ]] || \
-              [[ "$tagged_root_version" != "$tagged_version" ]]; then
-              echo "Prerelease tag must be a matching default-branch commit." >&2
-              exit 1
-            fi
-          elif [[ "$(git log -1 --format=%s "$tag_sha")" == "Release $RELEASE_TAG" ]]; then
+          if [[ "$(git log -1 --format=%s "$tag_sha")" == "Release $RELEASE_TAG" ]]; then
             if [[ "$(git rev-list --parents -n 1 "$tag_sha" | wc -w)" -ne 2 ]] || \
               [[ "v$tagged_version" != "$RELEASE_TAG" ]] || \
               [[ "$tagged_lock_version" != "$tagged_version" ]] || \
@@ -119,37 +158,103 @@ jobs:
           fi
           {
             echo "resume=$resume"
+            echo "target=$RELEASE_TARGET"
             echo "tag-sha=$tag_sha"
             echo "target-sha=$target_sha"
             echo "tag-oid=$tag_oid"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Set up prek
-        if:
-          github.event.release.prerelease == false && steps.base.outputs.resume
-          != 'true'
-        uses: j178/prek-action@v2
+      - name: Require a read-only candidate for a new release
+        if: >-
+          steps.base.outputs.resume != 'true' && needs.candidate.result !=
+          'success'
+        run: |
+          echo "Read-only candidate construction must succeed before creating a new release." >&2
+          exit 1
+
+      - name: Download the read-only release candidate
+        if: steps.base.outputs.resume != 'true'
+        uses: actions/download-artifact@v5
         with:
-          install-only: true
+          name: release-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-candidate
 
-      - name: Install dependencies
-        if:
-          github.event.release.prerelease == false && steps.base.outputs.resume
-          != 'true'
-        run: npm ci --ignore-scripts
-
-      - name: Prepare and validate release files
-        if:
-          github.event.release.prerelease == false && steps.base.outputs.resume
-          != 'true'
+      - name: Validate and stage the read-only release candidate
+        if: steps.base.outputs.resume != 'true'
         env:
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          RELEASE_ARTIFACT: ${{ runner.temp }}/release-candidate
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          TAG_SHA: ${{ steps.base.outputs.tag-sha }}
         run: |
           set -euo pipefail
-          bash .github/scripts/prepare-release.sh
+          if [[ "$CANDIDATE_SHA" != "$TAG_SHA" ]]; then
+            echo "Release candidate revision does not match the validated release tag." >&2
+            exit 1
+          fi
+          expected_paths=(dist/index.js package-lock.json package.json)
+          artifact_paths=()
+          while IFS= read -r artifact_path; do
+            artifact_paths+=("$artifact_path")
+          done < <(
+            (cd "$RELEASE_ARTIFACT" && find . -type f -print) |
+              LC_ALL=C sort | sed 's|^\./||'
+          )
+          [[ "${#artifact_paths[@]}" -eq "${#expected_paths[@]}" ]]
+          for index in "${!expected_paths[@]}"; do
+            [[ "${artifact_paths[$index]}" == "${expected_paths[$index]}" ]]
+          done
+          node - "$RELEASE_TAG" "$RELEASE_ARTIFACT/package.json" "$RELEASE_ARTIFACT/package-lock.json" <<'NODE'
+          const { deepStrictEqual } = require("node:assert");
+          const { readFileSync } = require("node:fs");
+
+          const [releaseTag, candidatePackagePath, candidateLockPath] = process.argv.slice(2);
+          const version = releaseTag.slice(1);
+          const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
+          const expectedPackage = readJson("package.json");
+          const expectedLock = readJson("package-lock.json");
+
+          if (
+            typeof expectedPackage.version !== "string" ||
+            typeof expectedLock.version !== "string" ||
+            typeof expectedLock.packages?.[""]?.version !== "string"
+          ) {
+            throw new Error("Trusted release metadata is missing a version field.");
+          }
+          expectedPackage.version = version;
+          expectedLock.version = version;
+          expectedLock.packages[""].version = version;
+
+          for (const [name, candidatePath, expected] of [
+            ["package.json", candidatePackagePath, expectedPackage],
+            ["package-lock.json", candidateLockPath, expectedLock],
+          ]) {
+            try {
+              deepStrictEqual(readJson(candidatePath), expected);
+            } catch {
+              throw new Error(`Release candidate ${name} changes metadata beyond its version.`);
+            }
+          }
+          NODE
+          [[ -s "$RELEASE_ARTIFACT/dist/index.js" ]]
+          cp "$RELEASE_ARTIFACT/dist/index.js" dist/index.js
+          cp "$RELEASE_ARTIFACT/package-lock.json" package-lock.json
+          cp "$RELEASE_ARTIFACT/package.json" package.json
+          changed_paths="$(git diff --name-only)"
+          while IFS= read -r changed_path; do
+            case "$changed_path" in
+              dist/index.js | package-lock.json | package.json) ;;
+              *)
+                echo "Release reconstruction changed unexpected path: $changed_path" >&2
+                exit 1
+                ;;
+            esac
+          done <<< "$changed_paths"
+          [[ -z "$(git ls-files --others --exclude-standard)" ]]
+          git add -- dist/index.js package-lock.json package.json
+          git diff --cached --check
 
       - name: Create deterministic stable release commit
-        if: github.event.release.prerelease == false
         id: candidate
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -171,7 +276,6 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Publish candidate to an isolated validation branch
-        if: github.event.release.prerelease == false
         id: validation_ref
         env:
           CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
@@ -186,7 +290,6 @@ jobs:
           echo "name=$temp_ref" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch and verify immutable release gate
-        if: github.event.release.prerelease == false
         env:
           CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
           GH_TOKEN: ${{ github.token }}
@@ -201,14 +304,12 @@ jobs:
             --required-check 'prek-autofix-review.yml::review'
 
       - name: Atomically advance target and guarded release tag
-        if:
-          github.event.release.prerelease == false && steps.base.outputs.resume
-          != 'true'
+        if: steps.base.outputs.resume != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           ORIGINAL_TAG_OID: ${{ steps.base.outputs.tag-oid }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-          RELEASE_TARGET: ${{ steps.release.outputs.target }}
+          RELEASE_TARGET: ${{ steps.base.outputs.target }}
           TARGET_SHA: ${{ steps.base.outputs.target-sha }}
         run: |
           set -euo pipefail
@@ -231,16 +332,13 @@ jobs:
 
       - name: Verify final release identity
         env:
-          IS_PRERELEASE: ${{ github.event.release.prerelease }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-          RELEASE_TARGET: ${{ steps.release.outputs.target }}
+          RELEASE_TARGET: ${{ steps.base.outputs.target }}
           RESUME: ${{ steps.base.outputs.resume }}
           STABLE_SHA: ${{ steps.candidate.outputs.sha }}
-          TAG_SHA: ${{ steps.base.outputs.tag-sha }}
         run: |
           set -euo pipefail
           expected_sha="$STABLE_SHA"
-          [[ "$IS_PRERELEASE" == true ]] && expected_sha="$TAG_SHA"
           git fetch --force --no-tags origin \
             "refs/heads/$RELEASE_TARGET:refs/remotes/origin/$RELEASE_TARGET" \
             "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
@@ -254,12 +352,8 @@ jobs:
           [[ "$lock_version" == "$package_version" ]]
           [[ "$root_version" == "$package_version" ]]
           git cat-file -e "$expected_sha:dist/index.js"
-          if [[ "$IS_PRERELEASE" == false && "$RESUME" != true ]]; then
-            npm run check:dist
-          fi
 
       - name: Update stable moving major tag
-        if: github.event.release.prerelease == false
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -269,7 +363,7 @@ jobs:
           bash .github/scripts/update-major-tag.sh
 
       - name: Delete validated temporary branch
-        if: github.event.release.prerelease == false && success()
+        if: success()
         env:
           CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
           GH_TOKEN: ${{ github.token }}
@@ -280,3 +374,39 @@ jobs:
           git push \
             --force-with-lease="refs/heads/$TEMP_REF:$CANDIDATE_SHA" \
             origin ":refs/heads/$TEMP_REF"
+
+  prerelease:
+    if: github.event.release.prerelease == true
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out trusted default-branch revision
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify prerelease identity without mutating refs
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TARGET: ${{ github.event.release.target_commitish }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TARGET" == "$DEFAULT_BRANCH" ]]
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*$ ]]
+          git fetch --force --no-tags origin \
+            "refs/heads/$RELEASE_TARGET:refs/remotes/origin/$RELEASE_TARGET" \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          target_sha="$(git rev-parse "refs/remotes/origin/$RELEASE_TARGET")"
+          tag_sha="$(git rev-parse "refs/tags/$RELEASE_TAG^{}")"
+          git merge-base --is-ancestor "$tag_sha" "$target_sha"
+          package_version="$(git show "$tag_sha:package.json" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')"
+          lock_version="$(git show "$tag_sha:package-lock.json" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')"
+          root_version="$(git show "$tag_sha:package-lock.json" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).packages[""].version')"
+          [[ "v$package_version" == "$RELEASE_TAG" ]]
+          [[ "$lock_version" == "$package_version" ]]
+          [[ "$root_version" == "$package_version" ]]
+          git cat-file -e "$tag_sha:dist/index.js"
