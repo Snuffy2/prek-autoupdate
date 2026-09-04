@@ -296,6 +296,70 @@ function prepareRelease(
   }
 }
 
+function runPrereleaseValidation(releaseTag: string): Error | undefined {
+  const verification = requiredStep(
+    workflow().jobs.prerelease.steps,
+    (step) => step.name === "Verify prerelease identity without mutating refs",
+    "prerelease identity verification",
+  ).run!;
+  const directory = mkdtempSync(join(tmpdir(), "prek-prerelease-validation-"));
+  const version = releaseTag.slice(1);
+  try {
+    mkdirSync(join(directory, "dist"), { recursive: true });
+    writeFileSync(join(directory, "package.json"), JSON.stringify({ version }));
+    writeFileSync(
+      join(directory, "package-lock.json"),
+      JSON.stringify({ version, packages: { "": { version } } }),
+    );
+    writeFileSync(join(directory, "dist", "index.js"), "export {};\n");
+    execFileSync("git", ["init", "--initial-branch=main"], { cwd: directory });
+    execFileSync("git", ["add", "."], { cwd: directory });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "user.name=Prerelease test",
+        "commit",
+        "-m",
+        "release",
+      ],
+      { cwd: directory },
+    );
+    execFileSync("git", ["tag", releaseTag], { cwd: directory });
+    execFileSync("git", ["remote", "add", "origin", directory], {
+      cwd: directory,
+    });
+    try {
+      execFileSync("bash", ["-c", verification], {
+        cwd: directory,
+        env: {
+          ...process.env,
+          DEFAULT_BRANCH: "main",
+          RELEASE_TAG: releaseTag,
+          RELEASE_TARGET: "main",
+        },
+        stdio: "pipe",
+      });
+    } catch (caught) {
+      const error = caught as {
+        stderr?: Buffer | string;
+        stdout?: Buffer | string;
+      };
+      return new Error(
+        error.stderr?.toString().trim() ||
+          error.stdout?.toString().trim() ||
+          "prerelease validation failed",
+        { cause: caught },
+      );
+    }
+    return undefined;
+  } finally {
+    rmSync(directory, { recursive: true });
+  }
+}
+
 function runReleaseUpdate(
   releaseTag: string,
   targetSha: string,
@@ -536,6 +600,12 @@ describe("release workflow", () => {
       );
     },
   );
+
+  it("enforces SemVer prerelease identifiers before inspecting release refs", () => {
+    expect(runPrereleaseValidation("v2.1.0-beta.01")).toBeDefined();
+    expect(runPrereleaseValidation("v2.1.0-beta.1")).toBeUndefined();
+    expect(runPrereleaseValidation("v2.1.0-beta.rc-1")).toBeUndefined();
+  });
 
   it("isolates candidate construction from privileged release mutation", () => {
     const releaseWorkflow = workflow();
