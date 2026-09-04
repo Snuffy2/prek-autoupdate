@@ -14,44 +14,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  prepare:
-    if: github.event.release.prerelease == false
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out trusted default-branch revision
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
-
-      - name: Set up prek
-        uses: j178/prek-action@v2
-        with:
-          install-only: true
-
-      - name: Install dependencies
-        run: npm ci --ignore-scripts
-
-      - name: Prepare and validate release files
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          set -euo pipefail
-          bash .github/scripts/prepare-release.sh
-
   candidate:
-    if: >-
-      needs.prepare.result == 'success' && github.event.release.prerelease ==
-      false
-    needs: prepare
+    if: github.event.release.prerelease == false
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -108,7 +72,7 @@ jobs:
   release:
     if: >-
       always() && !cancelled() && github.event.release.prerelease == false
-    needs: [prepare, candidate]
+    needs: candidate
     permissions:
       actions: write
       checks: read
@@ -116,19 +80,6 @@ jobs:
       statuses: write
     runs-on: ubuntu-latest
     steps:
-      - name: Require the default-branch release target
-        id: release
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          RELEASE_TARGET: ${{ github.event.release.target_commitish }}
-        run: |
-          set -euo pipefail
-          if [[ "$RELEASE_TARGET" != "$DEFAULT_BRANCH" ]]; then
-            echo "Release target must be the default branch." >&2
-            exit 1
-          fi
-          echo "target=$RELEASE_TARGET" >> "$GITHUB_OUTPUT"
-
       - name: Check out trusted default-branch revision
         uses: actions/checkout@v7
         with:
@@ -145,10 +96,15 @@ jobs:
         id: base
         env:
           IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-          RELEASE_TARGET: ${{ steps.release.outputs.target }}
+          RELEASE_TARGET: ${{ github.event.release.target_commitish }}
         run: |
           set -euo pipefail
+          if [[ "$RELEASE_TARGET" != "$DEFAULT_BRANCH" ]]; then
+            echo "Release target must be the default branch." >&2
+            exit 1
+          fi
           if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
             echo "Release tag must use semantic vMAJOR.MINOR.PATCH syntax." >&2
             exit 1
@@ -202,6 +158,7 @@ jobs:
           fi
           {
             echo "resume=$resume"
+            echo "target=$RELEASE_TARGET"
             echo "tag-sha=$tag_sha"
             echo "target-sha=$target_sha"
             echo "tag-oid=$tag_oid"
@@ -298,7 +255,6 @@ jobs:
           git diff --cached --check
 
       - name: Create deterministic stable release commit
-        if: github.event.release.prerelease == false
         id: candidate
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -320,7 +276,6 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Publish candidate to an isolated validation branch
-        if: github.event.release.prerelease == false
         id: validation_ref
         env:
           CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
@@ -335,7 +290,6 @@ jobs:
           echo "name=$temp_ref" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch and verify immutable release gate
-        if: github.event.release.prerelease == false
         env:
           CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
           GH_TOKEN: ${{ github.token }}
@@ -350,14 +304,12 @@ jobs:
             --required-check 'prek-autofix-review.yml::review'
 
       - name: Atomically advance target and guarded release tag
-        if:
-          github.event.release.prerelease == false && steps.base.outputs.resume
-          != 'true'
+        if: steps.base.outputs.resume != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           ORIGINAL_TAG_OID: ${{ steps.base.outputs.tag-oid }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-          RELEASE_TARGET: ${{ steps.release.outputs.target }}
+          RELEASE_TARGET: ${{ steps.base.outputs.target }}
           TARGET_SHA: ${{ steps.base.outputs.target-sha }}
         run: |
           set -euo pipefail
@@ -381,7 +333,7 @@ jobs:
       - name: Verify final release identity
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-          RELEASE_TARGET: ${{ steps.release.outputs.target }}
+          RELEASE_TARGET: ${{ steps.base.outputs.target }}
           RESUME: ${{ steps.base.outputs.resume }}
           STABLE_SHA: ${{ steps.candidate.outputs.sha }}
         run: |
@@ -402,7 +354,6 @@ jobs:
           git cat-file -e "$expected_sha:dist/index.js"
 
       - name: Update stable moving major tag
-        if: github.event.release.prerelease == false
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -412,7 +363,7 @@ jobs:
           bash .github/scripts/update-major-tag.sh
 
       - name: Delete validated temporary branch
-        if: github.event.release.prerelease == false && success()
+        if: success()
         env:
           CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
           GH_TOKEN: ${{ github.token }}

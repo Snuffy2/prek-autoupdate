@@ -39,7 +39,6 @@ interface Workflow {
   };
   readonly permissions: Record<string, string>;
   readonly jobs: {
-    readonly prepare: WorkflowJob;
     readonly candidate: WorkflowJob;
     readonly prerelease: WorkflowJob;
     readonly release: WorkflowJob;
@@ -297,72 +296,6 @@ function prepareRelease(
   }
 }
 
-function runPreparationWithGitFailure(failure: "diff" | "ls-files"): void {
-  const directory = mkdtempSync(
-    join(tmpdir(), "prek-autoupdate-prepare-script-"),
-  );
-  const gitPath = join(directory, "git");
-  const nodePath = join(directory, "node");
-  const npmPath = join(directory, "npm");
-  writeFileSync(
-    gitPath,
-    `#!/usr/bin/env bash
-set -euo pipefail
-case "$*" in
-"status --porcelain"|"diff --check")
-  exit 0
-  ;;
-"diff --name-only")
-  if [[ "$FAILURE" == "diff" ]]; then
-    echo "simulated git diff failure" >&2
-    exit 23
-  fi
-  exit 0
-  ;;
-"ls-files --others --exclude-standard")
-  if [[ "$FAILURE" == "ls-files" ]]; then
-    echo "simulated git ls-files failure" >&2
-    exit 24
-  fi
-  exit 0
-  ;;
-*)
-  echo "unexpected git call: $*" >&2
-  exit 2
-  ;;
-esac
-`,
-  );
-  writeFileSync(nodePath, "#!/usr/bin/env bash\nexit 0\n");
-  writeFileSync(npmPath, "#!/usr/bin/env bash\nexit 0\n");
-  chmodSync(gitPath, 0o755);
-  chmodSync(nodePath, 0o755);
-  chmodSync(npmPath, 0o755);
-  try {
-    try {
-      execFileSync("bash", [resolve(".github/scripts/prepare-release.sh")], {
-        cwd: directory,
-        env: {
-          ...process.env,
-          FAILURE: failure,
-          PATH: `${directory}:${process.env.PATH}`,
-        },
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-    } catch (error) {
-      const stderr = (error as { stderr?: Buffer | string }).stderr;
-      throw new Error(
-        stderr?.toString().trim() || "release preparation failed",
-        {
-          cause: error,
-        },
-      );
-    }
-  } finally {
-    rmSync(directory, { recursive: true });
-  }
-}
-
 function runReleaseUpdate(
   releaseTag: string,
   targetSha: string,
@@ -557,16 +490,6 @@ describe("release workflow", () => {
     );
   });
 
-  it.each([
-    ["diff", "Unable to collect changed release paths"],
-    ["ls-files", "Unable to collect untracked release paths"],
-  ] as const)(
-    "fails closed when git %s path collection fails",
-    (failure, message) => {
-      expect(() => runPreparationWithGitFailure(failure)).toThrow(message);
-    },
-  );
-
   it("updates package metadata to the published release version", () => {
     const prepared = prepareRelease("v2.0.3", "2.0.2");
 
@@ -599,23 +522,8 @@ describe("release workflow", () => {
     );
   });
 
-  it("provisions prek before preparing release files", () => {
-    const steps = workflow().jobs.prepare.steps;
-    const setupIndex = steps.findIndex((step) =>
-      step.uses?.startsWith("j178/prek-action@"),
-    );
-    const preparationIndex = steps.findIndex((step) =>
-      step.run?.includes("prepare-release.sh"),
-    );
-
-    expect(setupIndex).toBeGreaterThanOrEqual(0);
-    expect(steps[setupIndex]?.with?.["install-only"]).toBe(true);
-    expect(preparationIndex).toBeGreaterThan(setupIndex);
-  });
-
   it("isolates untrusted preparation from privileged release mutation", () => {
     const releaseWorkflow = workflow();
-    const preparation = releaseWorkflow.jobs.prepare;
     const candidate = releaseWorkflow.jobs.candidate;
     const release = releaseWorkflow.jobs.release;
     const prerelease = releaseWorkflow.jobs.prerelease;
@@ -663,24 +571,20 @@ describe("release workflow", () => {
     );
 
     expect(metadata.run).not.toContain("git checkout");
+    expect(metadata.env).toMatchObject({
+      DEFAULT_BRANCH: "${{ github.event.repository.default_branch }}",
+      RELEASE_TARGET: "${{ github.event.release.target_commitish }}",
+    });
+    expect(metadata.run).toContain(
+      'if [[ "$RELEASE_TARGET" != "$DEFAULT_BRANCH" ]]',
+    );
+    expect(metadata.run).toContain('echo "target=$RELEASE_TARGET"');
     expect(metadata.run).toContain(
       'git diff --name-only "$tag_sha^" "$tag_sha"',
     );
-    expect(preparation.permissions).toEqual({ contents: "read" });
-    expect(preparation.if).toBe("github.event.release.prerelease == false");
-    expect(
-      preparation.steps.some((step) =>
-        step.uses?.startsWith("j178/prek-action@"),
-      ),
-    ).toBe(true);
-    expect(
-      preparation.steps.some((step) =>
-        step.uses?.startsWith("actions/upload-artifact@"),
-      ),
-    ).toBe(false);
-    expect(candidate.needs).toBe("prepare");
+    expect(candidate.needs).toBeUndefined();
     expect(candidate.permissions).toEqual({ contents: "read" });
-    expect(candidate.if).toContain("needs.prepare.result == 'success'");
+    expect(candidate.if).toBe("github.event.release.prerelease == false");
     expect(candidateCheckout.with?.ref).toBe(
       "${{ github.event.release.tag_name }}",
     );
@@ -708,7 +612,7 @@ describe("release workflow", () => {
       "candidate revision export",
     );
     expect(candidateRevision.run).toContain("git rev-parse HEAD");
-    expect(release.needs).toEqual(["prepare", "candidate"]);
+    expect(release.needs).toBe("candidate");
     expect(release.if).toContain("always()");
     expect(release.if).toContain("!cancelled()");
     expect(release.if).toContain("github.event.release.prerelease == false");
@@ -726,6 +630,16 @@ describe("release workflow", () => {
     expect(staging.env).toMatchObject({
       CANDIDATE_SHA: "${{ needs.candidate.outputs.sha }}",
       TAG_SHA: "${{ steps.base.outputs.tag-sha }}",
+    });
+    expect(
+      requiredStep(
+        steps,
+        (step) =>
+          step.name === "Atomically advance target and guarded release tag",
+        "atomic promotion",
+      ).env,
+    ).toMatchObject({
+      RELEASE_TARGET: "${{ steps.base.outputs.target }}",
     });
     expect(staging.run).toContain('[[ "$CANDIDATE_SHA" != "$TAG_SHA" ]]');
     expect(staging.run).toContain(
@@ -806,9 +720,6 @@ describe("release workflow", () => {
     );
 
     expect(releaseWorkflow.permissions).toEqual({ contents: "read" });
-    expect(releaseWorkflow.jobs.prepare.permissions).toEqual({
-      contents: "read",
-    });
     expect(releaseWorkflow.jobs.prerelease.permissions).toEqual({
       contents: "read",
     });
