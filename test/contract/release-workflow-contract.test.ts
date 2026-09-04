@@ -515,7 +515,9 @@ describe("release workflow", () => {
       ),
     ).toBe(true);
     expect(release.needs).toBe("prepare");
-    expect(release.if).toBe("github.event.release.prerelease == false");
+    expect(release.if).toContain("always()");
+    expect(release.if).toContain("!cancelled()");
+    expect(release.if).toContain("github.event.release.prerelease == false");
     expect(
       release.steps
         .filter((step) => step.uses !== undefined)

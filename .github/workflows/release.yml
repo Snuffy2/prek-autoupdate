@@ -56,7 +56,8 @@ jobs:
           retention-days: 1
 
   release:
-    if: github.event.release.prerelease == false
+    if: >-
+      always() && !cancelled() && github.event.release.prerelease == false
     needs: prepare
     permissions:
       actions: write
