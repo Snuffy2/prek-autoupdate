@@ -16,6 +16,8 @@ interface WorkflowStep {
   readonly if?: string;
   readonly env?: Record<string, string>;
   readonly id?: string;
+  readonly name?: string;
+  readonly run?: string;
   readonly uses?: string;
   readonly with?: Record<string, unknown>;
 }
@@ -29,16 +31,13 @@ interface WorkflowJob {
 
 interface Workflow {
   readonly on: {
-    readonly workflow_dispatch: {
-      readonly inputs: Record<string, Record<string, unknown>>;
+    readonly release: {
+      readonly types: string[];
     };
   };
   readonly permissions: Record<string, string>;
   readonly jobs: {
-    readonly "prepare": WorkflowJob;
-    readonly "finalize": WorkflowJob;
-    readonly "publish": WorkflowJob;
-    readonly "update-major": WorkflowJob;
+    readonly release: WorkflowJob;
   };
 }
 
@@ -379,116 +378,38 @@ fi
 }
 
 describe("release workflow", () => {
-  it("offers an optional explicit tag and stable bump choices", () => {
+  it("runs only when a GitHub release is published", () => {
     const releaseWorkflow = workflow();
 
-    expect(Object.keys(releaseWorkflow.on)).toEqual(["workflow_dispatch"]);
-    expect(releaseWorkflow.on.workflow_dispatch.inputs.tag).toMatchObject({
-      default: "",
-      required: false,
-      type: "string",
-    });
-    expect(releaseWorkflow.on.workflow_dispatch.inputs.bump).toMatchObject({
-      default: "none",
-      options: ["none", "patch", "minor", "major"],
-      required: true,
-      type: "choice",
-    });
-    expect(
-      releaseWorkflow.on.workflow_dispatch.inputs.prerelease,
-    ).toMatchObject({
-      default: false,
-      required: true,
-      type: "boolean",
-    });
+    expect(Object.keys(releaseWorkflow.on)).toEqual(["release"]);
+    expect(releaseWorkflow.on.release.types).toEqual(["published"]);
   });
 
-  it("passes the resolved tag through release preparation", () => {
-    const prepare = workflow().jobs.prepare;
-
-    expect(prepare.outputs?.["release-tag"]).toBe(
-      "${{ steps.tag.outputs.release-tag }}",
+  it("validates the candidate before lease-guarded atomic promotion", () => {
+    const steps = workflow().jobs.release.steps;
+    const gate = steps.find((step) =>
+      step.run?.includes("verify-release-checks.mjs"),
     );
-    expect(
-      prepare.steps.some(
-        (step) =>
-          step.env?.RELEASE_TAG === "${{ steps.tag.outputs.release-tag }}",
-      ),
-    ).toBe(true);
-  });
-
-  it("persists automatic tags by stable run ID for reruns", () => {
-    const prepare = workflow().jobs.prepare;
-    const restoreIndex = prepare.steps.findIndex(
-      (step) =>
-        step.uses?.includes("download-artifact") &&
-        typeof step.with?.name === "string" &&
-        step.with.name.includes("release-resolution"),
+    const promotion = steps.find((step) =>
+      step.run?.includes("git push --atomic"),
     );
-    const persistIndex = prepare.steps.findIndex(
-      (step) =>
-        step.uses?.includes("upload-artifact") &&
-        typeof step.with?.name === "string" &&
-        step.with.name.includes("release-resolution"),
+    const cleanup = steps.find((step) =>
+      step.run?.includes('origin ":refs/heads/$TEMP_REF"'),
     );
-    const resolveIndex = prepare.steps.findIndex((step) => step.id === "tag");
-    const releaseCheckout = prepare.steps.find(
-      (step) =>
-        step.uses?.startsWith("actions/checkout@") &&
-        step.with?.ref === "${{ github.sha }}",
+
+    expect(gate?.run).toContain("--required-check 'ci.yml::Node CI'");
+    expect(gate?.run).toContain(
+      "--required-check 'prek-autofix-review.yml::review'",
     );
-    const restore = prepare.steps[restoreIndex];
-    const persist = prepare.steps[persistIndex];
-    const resolve = prepare.steps[resolveIndex];
-    const persistedTagPath = resolve?.env?.PERSISTED_TAG_PATH;
-    const releaseCheckoutPath = releaseCheckout?.with?.path;
-
-    expect(prepare.permissions?.actions).toBe("read");
-    expect(restoreIndex).toBeGreaterThanOrEqual(0);
-    expect(persistIndex).toBeGreaterThanOrEqual(0);
-    expect(resolveIndex).toBeGreaterThanOrEqual(0);
-    expect(restore?.if).toContain("github.run_attempt != 1");
-    expect(persist?.if).toContain("github.run_attempt == 1");
-    expect(restore?.with?.name).toContain("github.run_id");
-    expect(restore?.with?.["run-id"]).toBe("${{ github.run_id }}");
-    expect(restore?.with?.name).not.toContain("run_attempt");
-    expect(persist?.with?.name).toBe(restore?.with?.name);
-    expect(restoreIndex).toBeLessThan(resolveIndex);
-    expect(persistedTagPath).toBe(persist?.with?.path);
-    expect(persistedTagPath).toContain(`${String(restore?.with?.path)}/`);
-    expect(releaseCheckoutPath).toBeTypeOf("string");
-    if (typeof releaseCheckoutPath !== "string") {
-      throw new TypeError("Release checkout path must be a string");
-    }
-    expect(persistedTagPath).not.toContain(`/${releaseCheckoutPath}/`);
-    expect(resolve?.env?.REQUIRE_PERSISTED_TAG).toContain("github.run_attempt");
-  });
-
-  it.each(["finalize", "publish", "update-major"] as const)(
-    "passes the resolved tag to the %s job",
-    (jobName) => {
-      expect(
-        workflow().jobs[jobName].steps.some(
-          (step) =>
-            step.env?.RELEASE_TAG ===
-            "${{ needs.prepare.outputs.release-tag }}",
-        ),
-      ).toBe(true);
-    },
-  );
-
-  it("keeps prereleases away from the stable moving tag", () => {
-    const releaseWorkflow = workflow();
-
-    for (const jobName of ["prepare", "publish"] as const) {
-      expect(
-        releaseWorkflow.jobs[jobName].steps.some(
-          (step) => step.env?.IS_PRERELEASE === "${{ inputs.prerelease }}",
-        ),
-      ).toBe(true);
-    }
-    expect(releaseWorkflow.jobs["update-major"].if).toBe(
-      "inputs.prerelease == false",
+    expect(gate?.run).toContain('--sha "$CANDIDATE_SHA"');
+    expect(promotion?.run).toContain(
+      '--force-with-lease="refs/heads/$RELEASE_TARGET:$TARGET_SHA"',
+    );
+    expect(promotion?.run).toContain(
+      '--force-with-lease="refs/tags/$RELEASE_TAG:$ORIGINAL_TAG_OID"',
+    );
+    expect(cleanup?.run).toContain(
+      '--force-with-lease="refs/heads/$TEMP_REF:$CANDIDATE_SHA"',
     );
   });
 
@@ -535,11 +456,13 @@ describe("release workflow", () => {
   });
 
   it("provisions prek before preparing release files", () => {
-    const steps = workflow().jobs.prepare.steps;
+    const steps = workflow().jobs.release.steps;
     const setupIndex = steps.findIndex((step) =>
       step.uses?.startsWith("j178/prek-action@"),
     );
-    const preparationIndex = steps.findIndex((step) => step.id === "release");
+    const preparationIndex = steps.findIndex((step) =>
+      step.run?.includes("prepare-release.sh"),
+    );
 
     expect(setupIndex).toBeGreaterThanOrEqual(0);
     expect(steps[setupIndex]?.with?.["install-only"]).toBe(true);
@@ -548,31 +471,58 @@ describe("release workflow", () => {
 
   it("keeps release credentials scoped to write-capable jobs", () => {
     const releaseWorkflow = workflow();
-    const checkouts = Object.values(releaseWorkflow.jobs).flatMap((job) =>
-      job.steps.filter((step) => step.uses?.startsWith("actions/checkout@")),
+    const checkouts = releaseWorkflow.jobs.release.steps.filter((step) =>
+      step.uses?.startsWith("actions/checkout@"),
     );
 
     expect(releaseWorkflow.permissions).toEqual({ contents: "read" });
-    expect({
-      ...releaseWorkflow.permissions,
-      ...releaseWorkflow.jobs.prepare.permissions,
-    }).toEqual({ actions: "read", contents: "read" });
-    expect(releaseWorkflow.jobs.finalize.permissions).toEqual({
-      actions: "read",
+    expect(releaseWorkflow.jobs.release.permissions).toEqual({
+      actions: "write",
+      checks: "read",
       contents: "write",
+      statuses: "read",
     });
-    expect(releaseWorkflow.jobs["update-major"].permissions).toEqual({
-      contents: "write",
-    });
-    const finalizeStep = releaseWorkflow.jobs.finalize.steps.find(
-      (step) => step.id === "release",
-    );
-    expect(finalizeStep?.env?.GH_TOKEN).toBe("${{ github.token }}");
     expect(checkouts.length).toBeGreaterThan(0);
     for (const checkout of checkouts) {
       expect(checkout.with?.["persist-credentials"]).toBe(false);
     }
   });
+
+  it.each([
+    ["ci.yml", "node", "${{ inputs.expected_sha || github.sha }}"],
+    [
+      "prek-autofix-review.yml",
+      "review",
+      "${{ github.event.pull_request.head.sha || inputs.expected_sha || github.sha }}",
+    ],
+  ])(
+    "requires %s to check out the exact dispatched SHA",
+    (workflowName, jobName, checkoutRef) => {
+      const gateWorkflow = parse(
+        readFileSync(`.github/workflows/${workflowName}`, "utf8"),
+      ) as {
+        on: {
+          workflow_dispatch: {
+            inputs: Record<string, Record<string, unknown>>;
+          };
+        };
+        jobs: Record<string, WorkflowJob>;
+      };
+      const expectedSha = gateWorkflow.on.workflow_dispatch.inputs.expected_sha;
+      const job = gateWorkflow.jobs[jobName];
+      const guard = job?.steps.find((step) =>
+        step.run?.includes('test "$WORKFLOW_SHA" = "$EXPECTED_SHA"'),
+      );
+      const checkout = job?.steps.find((step) =>
+        step.uses?.startsWith("actions/checkout@"),
+      );
+
+      expect(expectedSha).toMatchObject({ required: true, type: "string" });
+      expect(guard?.run).toContain('[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]');
+      expect(checkout?.with?.ref).toBe(checkoutRef);
+      expect(checkout?.with?.["persist-credentials"]).toBe(false);
+    },
+  );
 
   it("keeps moving major tags monotonic across releases and reruns", () => {
     const oldSha = "1".repeat(40);

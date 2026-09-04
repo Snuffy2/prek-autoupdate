@@ -6,6 +6,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact candidate SHA required by the release workflow
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -28,6 +33,16 @@ jobs:
       contents: read
       pull-requests: read
     steps:
+      - name: Require the dispatched release candidate SHA
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$WORKFLOW_SHA" = "$EXPECTED_SHA"
+
       - name: Verify Dependabot update scope
         if: github.event.pull_request.user.login == 'dependabot[bot]'
         env:
@@ -60,6 +75,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.expected_sha || github.sha }}
           persist-credentials: false
 
       - name: Set up Node.js

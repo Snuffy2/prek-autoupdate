@@ -1,30 +1,10 @@
 name: Release
 
-run-name: Release ${{ inputs.tag || inputs.bump }}
+run-name: Release ${{ github.event.release.tag_name }}
 
 on:
-  workflow_dispatch:
-    inputs:
-      bump:
-        description: Stable version bump when tag is blank
-        required: true
-        default: none
-        type: choice
-        options:
-          - none
-          - patch
-          - minor
-          - major
-      tag:
-        description: Release tag (for example, v2.0.5 or v2.1.0-beta.1)
-        required: false
-        default: ""
-        type: string
-      prerelease:
-        description: Publish as a prerelease
-        required: true
-        default: false
-        type: boolean
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -34,30 +14,32 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  prepare:
-    outputs:
-      major-tag: ${{ steps.release.outputs.major-tag }}
-      release-tag: ${{ steps.tag.outputs.release-tag }}
-      source-sha: ${{ steps.release.outputs.source-sha }}
+  release:
     permissions:
-      actions: read
-      contents: read
+      actions: write
+      checks: read
+      contents: write
+      statuses: read
     runs-on: ubuntu-latest
     steps:
-      - name: Check out release source
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.sha }}
-          path: release
-          fetch-depth: 0
-          persist-credentials: false
+      - name: Require the default-branch release target
+        id: release
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_TARGET: ${{ github.event.release.target_commitish }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_TARGET" != "$DEFAULT_BRANCH" ]]; then
+            echo "Release target must be the default branch." >&2
+            exit 1
+          fi
+          echo "target=$RELEASE_TARGET" >> "$GITHUB_OUTPUT"
 
-      - name: Check out trusted release tooling
+      - name: Check out trusted default-branch revision
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.workflow_sha }}
-          path: tooling
-          sparse-checkout: .github/scripts
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Node.js
@@ -65,160 +47,210 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: release/package-lock.json
+
+      - name: Validate release metadata and immutable starting refs
+        id: base
+        env:
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TARGET: ${{ steps.release.outputs.target }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "Release tag must use semantic vMAJOR.MINOR.PATCH syntax." >&2
+            exit 1
+          fi
+          tag_is_prerelease=false
+          [[ "$RELEASE_TAG" == *-* ]] && tag_is_prerelease=true
+          if [[ "$tag_is_prerelease" != "$IS_PRERELEASE" ]]; then
+            echo "Release tag and published prerelease state disagree." >&2
+            exit 1
+          fi
+
+          trusted_sha="$(git rev-parse HEAD)"
+          git fetch --force --no-tags origin \
+            "refs/heads/$RELEASE_TARGET:refs/remotes/origin/$RELEASE_TARGET" \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          target_sha="$(git rev-parse "refs/remotes/origin/$RELEASE_TARGET")"
+          tag_sha="$(git rev-parse "refs/tags/$RELEASE_TAG^{}")"
+          tag_oid="$(git rev-parse "refs/tags/$RELEASE_TAG")"
+          if [[ "$target_sha" != "$trusted_sha" ]]; then
+            echo "Default branch moved before trusted helper execution." >&2
+            exit 1
+          fi
+
+          resume=false
+          source_sha="$target_sha"
+          tagged_version="$(git show "$tag_sha:package.json" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')"
+          if [[ "$IS_PRERELEASE" == true ]]; then
+            if ! git merge-base --is-ancestor "$tag_sha" "$target_sha" || \
+              [[ "v$tagged_version" != "$RELEASE_TAG" ]]; then
+              echo "Prerelease tag must be a matching default-branch commit." >&2
+              exit 1
+            fi
+            source_sha="$tag_sha"
+          elif [[ "$(git log -1 --format=%s "$tag_sha")" == "Release $RELEASE_TAG" ]]; then
+            if [[ "$(git rev-list --parents -n 1 "$tag_sha" | wc -w)" -ne 2 ]] || \
+              [[ "v$tagged_version" != "$RELEASE_TAG" ]] || \
+              ! git merge-base --is-ancestor "$tag_sha" "$target_sha"; then
+              echo "Matching branch/tag release commit has invalid release contents." >&2
+              exit 1
+            fi
+            resume=true
+            source_sha="$tag_sha"
+            echo "candidate-sha=$tag_sha" >> "$GITHUB_OUTPUT"
+          elif [[ "$target_sha" != "$tag_sha" ]]; then
+            echo "Release tag and target branch must start at the same commit." >&2
+            exit 1
+          fi
+          {
+            echo "resume=$resume"
+            echo "source-sha=$source_sha"
+            echo "target-sha=$target_sha"
+            echo "tag-oid=$tag_oid"
+          } >> "$GITHUB_OUTPUT"
+          git checkout --detach "$source_sha"
 
       - name: Set up prek
         uses: j178/prek-action@v2
         with:
           install-only: true
 
-      - run: npm ci --ignore-scripts
-        working-directory: release
-
-      - name: Restore automatic release tag
-        if:
-          inputs.tag == '' && inputs.prerelease == false && github.run_attempt
-          != 1
-        uses: actions/download-artifact@v8
-        with:
-          github-token: ${{ github.token }}
-          name: release-resolution-${{ github.run_id }}
-          path: ${{ runner.temp }}/release-resolution
-          repository: ${{ github.repository }}
-          run-id: ${{ github.run_id }}
-
-      - name: Resolve release tag
-        id: tag
-        env:
-          BUMP_TYPE: ${{ inputs.bump }}
-          EXPLICIT_TAG: ${{ inputs.tag }}
-          GH_TOKEN: ${{ github.token }}
-          IS_PRERELEASE: ${{ inputs.prerelease }}
-          PERSISTED_TAG_PATH: ${{ runner.temp }}/release-resolution/release-tag
-          REQUIRE_PERSISTED_TAG: ${{ github.run_attempt != 1 }}
-        run: node ../tooling/.github/scripts/resolve-release-tag.mjs
-        working-directory: release
-
-      - name: Persist automatic release tag
-        if:
-          inputs.tag == '' && inputs.prerelease == false && github.run_attempt
-          == 1
-        uses: actions/upload-artifact@v7
-        with:
-          if-no-files-found: error
-          name: release-resolution-${{ github.run_id }}
-          path: ${{ runner.temp }}/release-resolution/release-tag
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
 
       - name: Prepare and validate release files
-        id: release
         env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          GH_TOKEN: ${{ github.token }}
-          IS_PRERELEASE: ${{ inputs.prerelease }}
-          RELEASE_REF: ${{ github.ref_name }}
-          RELEASE_TAG: ${{ steps.tag.outputs.release-tag }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          bash ../tooling/.github/scripts/validate-release-request.sh
-          bash ../tooling/.github/scripts/prepare-release.sh
-        working-directory: release
+          set -euo pipefail
+          bash .github/scripts/prepare-release.sh
+          if [[ "$IS_PRERELEASE" == true ]] && \
+            ! git diff --cached --quiet; then
+            echo "Prerelease source must already contain its versioned release files." >&2
+            exit 1
+          fi
 
-      - name: Upload prepared release files
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            release/dist/index.js
-            release/package-lock.json
-            release/package.json
-          if-no-files-found: error
-          retention-days: 1
-
-  finalize:
-    needs: prepare
-    # Create the release commit locally and publish only its annotated point tag.
-    permissions:
-      actions: read
-      contents: write
-    outputs:
-      release-sha: ${{ steps.release.outputs.sha }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out trusted release tooling
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: tooling
-          sparse-checkout: .github/scripts
-          persist-credentials: false
-
-      - name: Check out release source
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.prepare.outputs.source-sha }}
-          path: release
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Download prepared release files
-        uses: actions/download-artifact@v8
-        with:
-          name: release-${{ github.run_id }}-${{ github.run_attempt }}
-          path: prepared
-
-      - name: Commit release files and finalize release tag
-        id: release
+      - name: Create deterministic stable release commit
+        if: github.event.release.prerelease == false
+        id: candidate
         env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          GH_TOKEN: ${{ github.token }}
-          PREPARED_DIRECTORY: ${{ github.workspace }}/prepared
-          RELEASE_DIRECTORY: ${{ github.workspace }}/release
-          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
-          SOURCE_SHA: ${{ needs.prepare.outputs.source-sha }}
-        run: node tooling/.github/scripts/finalize-release.mjs
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RESUME: ${{ steps.base.outputs.resume }}
+          RESUME_SHA: ${{ steps.base.outputs.candidate-sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$RESUME" == true ]]; then
+            git diff --cached --quiet
+            echo "sha=$RESUME_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --cached --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --cached --quiet; then
+            git commit -m "Release $RELEASE_TAG"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-  publish:
-    needs: [prepare, finalize]
-    permissions:
-      contents: write
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out trusted release tooling
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.workflow_sha }}
-          sparse-checkout: .github/scripts
-          persist-credentials: false
-
-      - name: Publish GitHub release
+      - name: Publish candidate to an isolated validation branch
+        if: github.event.release.prerelease == false
+        id: validation_ref
         env:
           GH_TOKEN: ${{ github.token }}
-          IS_PRERELEASE: ${{ inputs.prerelease }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
-        run: bash .github/scripts/publish-release.sh
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          temp_ref="release-validation/${RELEASE_TAG}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git check-ref-format --branch "$temp_ref"
+          gh auth setup-git --hostname github.com
+          git push origin "HEAD:refs/heads/$temp_ref"
+          echo "name=$temp_ref" >> "$GITHUB_OUTPUT"
 
-  update-major:
-    needs: [prepare, finalize, publish]
-    if: inputs.prerelease == false
-    # Move or create the verified major tag; no other repository writes are needed.
-    permissions:
-      contents: write
-    concurrency:
-      group:
-        release-major-${{ github.repository }}-${{
-        needs.prepare.outputs.major-tag }}
-      cancel-in-progress: false
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out trusted release tooling
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.workflow_sha }}
-          sparse-checkout: .github/scripts
-          persist-credentials: false
+      - name: Dispatch and verify immutable release gate
+        if: github.event.release.prerelease == false
+        env:
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+          TEMP_REF: ${{ steps.validation_ref.outputs.name }}
+        run: |
+          set -euo pipefail
+          node .github/scripts/verify-release-checks.mjs \
+            --repository "$GITHUB_REPOSITORY" \
+            --ref "$TEMP_REF" \
+            --sha "$CANDIDATE_SHA" \
+            --required-check 'ci.yml::Node CI' \
+            --required-check 'prek-autofix-review.yml::review'
 
-      - name: Update moving major tag
+      - name: Atomically advance target and guarded release tag
+        if:
+          github.event.release.prerelease == false && steps.base.outputs.resume
+          != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
-          TARGET_SHA: ${{ needs.finalize.outputs.release-sha }}
-        run: bash .github/scripts/update-major-tag.sh
+          ORIGINAL_TAG_OID: ${{ steps.base.outputs.tag-oid }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TARGET: ${{ steps.release.outputs.target }}
+          TARGET_SHA: ${{ steps.base.outputs.target-sha }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin \
+            "refs/heads/$RELEASE_TARGET:refs/remotes/origin/$RELEASE_TARGET" \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          [[ "$(git rev-parse "refs/remotes/origin/$RELEASE_TARGET")" == "$TARGET_SHA" ]]
+          [[ "$(git rev-parse "refs/tags/$RELEASE_TAG")" == "$ORIGINAL_TAG_OID" ]]
+          candidate_sha="$(git rev-parse HEAD)"
+          if [[ "$candidate_sha" != "$TARGET_SHA" ]]; then
+            [[ "$(git rev-parse HEAD^)" == "$TARGET_SHA" ]]
+          fi
+          git tag -fa "$RELEASE_TAG" -m "Release $RELEASE_TAG" HEAD
+          gh auth setup-git --hostname github.com
+          git push --atomic \
+            --force-with-lease="refs/heads/$RELEASE_TARGET:$TARGET_SHA" \
+            --force-with-lease="refs/tags/$RELEASE_TAG:$ORIGINAL_TAG_OID" \
+            origin "HEAD:refs/heads/$RELEASE_TARGET" \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+
+      - name: Verify final release identity
+        env:
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TARGET: ${{ steps.release.outputs.target }}
+          SOURCE_SHA: ${{ steps.base.outputs.source-sha }}
+          STABLE_SHA: ${{ steps.candidate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          expected_sha="$STABLE_SHA"
+          [[ "$IS_PRERELEASE" == true ]] && expected_sha="$SOURCE_SHA"
+          git fetch --force --no-tags origin \
+            "refs/heads/$RELEASE_TARGET:refs/remotes/origin/$RELEASE_TARGET" \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          [[ "$(git rev-parse "refs/tags/$RELEASE_TAG^{}")" == "$expected_sha" ]]
+          git merge-base --is-ancestor \
+            "$expected_sha" "refs/remotes/origin/$RELEASE_TARGET"
+          [[ "v$(node -p 'require("./package.json").version')" == "$RELEASE_TAG" ]]
+          npm run check:dist
+
+      - name: Update stable moving major tag
+        if: github.event.release.prerelease == false
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          TARGET_SHA: ${{ steps.candidate.outputs.sha }}
+        run: |
+          gh auth setup-git --hostname github.com
+          bash .github/scripts/update-major-tag.sh
+
+      - name: Delete validated temporary branch
+        if: github.event.release.prerelease == false && success()
+        env:
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+          TEMP_REF: ${{ steps.validation_ref.outputs.name }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git --hostname github.com
+          git push \
+            --force-with-lease="refs/heads/$TEMP_REF:$CANDIDATE_SHA" \
+            origin ":refs/heads/$TEMP_REF"

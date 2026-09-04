@@ -3,12 +3,18 @@ name: prek-autofix
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Immutable commit SHA required by release orchestration
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: prek-autofix-${{ github.event.pull_request.number }}
+  group: prek-autofix-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -16,11 +22,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: Require the dispatched release candidate SHA
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$WORKFLOW_SHA" = "$EXPECTED_SHA"
+
       - name: Checkout pull request
         uses: actions/checkout@v7
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
+          repository:
+            ${{ github.event.pull_request.head.repo.full_name ||
+            github.repository }}
+          ref:
+            ${{ github.event.pull_request.head.sha || inputs.expected_sha ||
+            github.sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -29,4 +49,13 @@ jobs:
 
       - name: Review with prek
         id: review
+        if: github.event_name == 'pull_request'
         uses: Snuffy2/prek-autofix/review@v1
+
+      - name: Verify prek without pull-request context
+        if: github.event_name == 'workflow_dispatch'
+        uses: j178/prek-action@v2
+
+      - name: Require a clean review result
+        if: github.event_name == 'workflow_dispatch'
+        run: git diff --exit-code
