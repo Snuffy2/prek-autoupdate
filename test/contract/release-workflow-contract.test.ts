@@ -66,8 +66,11 @@ function requiredStep(
   return step;
 }
 
-function candidateStagingRun(): string {
-  return requiredStep(
+function runCandidateStaging(
+  candidatePackage: Record<string, unknown>,
+  candidateLock?: Record<string, unknown>,
+): void {
+  const stagingRun = requiredStep(
     workflow().jobs.release.steps,
     (step) =>
       step.run?.includes(
@@ -75,12 +78,6 @@ function candidateStagingRun(): string {
       ) ?? false,
     "read-only candidate validation",
   ).run!;
-}
-
-function runCandidateStaging(
-  candidatePackage: Record<string, unknown>,
-  candidateLock?: Record<string, unknown>,
-): void {
   const directory = mkdtempSync(join(tmpdir(), "prek-release-candidate-"));
   const artifactDirectory = mkdtempSync(
     join(tmpdir(), "prek-release-candidate-artifact-"),
@@ -148,7 +145,7 @@ function runCandidateStaging(
     );
     writeFileSync(join(artifactDirectory, "dist", "index.js"), "export {};\n");
     try {
-      execFileSync("bash", ["-c", candidateStagingRun()], {
+      execFileSync("bash", ["-c", stagingRun], {
         cwd: directory,
         env: {
           ...process.env,
