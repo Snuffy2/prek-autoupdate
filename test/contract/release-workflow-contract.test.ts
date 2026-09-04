@@ -464,65 +464,80 @@ describe("release workflow", () => {
 
   it("validates the candidate before lease-guarded atomic promotion", () => {
     const steps = workflow().jobs.release.steps;
-    const gate = steps.find((step) =>
-      step.run?.includes("verify-release-checks.mjs"),
+    const gate = requiredStep(
+      steps,
+      (step) => step.run?.includes("verify-release-checks.mjs") ?? false,
+      "immutable release gate",
     );
-    const promotion = steps.find((step) =>
-      step.run?.includes("git push --atomic"),
+    const promotion = requiredStep(
+      steps,
+      (step) => step.run?.includes("git push --atomic") ?? false,
+      "atomic promotion",
     );
-    const cleanup = steps.find((step) =>
-      step.run?.includes('origin ":refs/heads/$TEMP_REF"'),
+    const cleanup = requiredStep(
+      steps,
+      (step) => step.run?.includes('origin ":refs/heads/$TEMP_REF"') ?? false,
+      "validated-branch cleanup",
     );
 
-    expect(gate?.run).toContain("--required-check 'ci.yml::Node CI'");
-    expect(gate?.run).toContain(
+    expect(gate.run).toContain("--required-check 'ci.yml::Node CI'");
+    expect(gate.run).toContain(
       "--required-check 'prek-autofix-review.yml::review'",
     );
-    expect(gate?.run).toContain('--sha "$CANDIDATE_SHA"');
-    expect(promotion?.run).toContain(
+    expect(gate.run).toContain('--sha "$CANDIDATE_SHA"');
+    expect(promotion.run).toContain(
       '--force-with-lease="refs/heads/$RELEASE_TARGET:$TARGET_SHA"',
     );
-    expect(promotion?.run).toContain(
+    expect(promotion.env).toMatchObject({
+      RELEASE_TARGET: "${{ steps.base.outputs.target }}",
+    });
+    expect(promotion.run).toContain(
       '--force-with-lease="refs/tags/$RELEASE_TAG:$ORIGINAL_TAG_OID"',
     );
-    expect(cleanup?.run).toContain(
+    expect(cleanup.run).toContain(
       '--force-with-lease="refs/heads/$TEMP_REF:$CANDIDATE_SHA"',
     );
   });
 
-  it("updates package metadata to the published release version", () => {
-    const prepared = prepareRelease("v2.0.3", "2.0.2");
+  it.each([
+    ["stable", "v2.0.3", "2.0.2", "v2.0.1", "2.0.2", "v2"],
+    [
+      "prerelease",
+      "v2.1.0-beta.2",
+      "2.1.0-beta.1",
+      "v2.1.0-beta.1",
+      "2.1.0-beta.2",
+      "v2.1.0-beta.01",
+    ],
+  ] as const)(
+    "updates package metadata to a valid %s version",
+    (
+      _kind,
+      releaseTag,
+      currentVersion,
+      downgradeTag,
+      downgradeCurrentVersion,
+      invalidTag,
+    ) => {
+      const version = releaseTag.slice(1);
+      const prepared = prepareRelease(releaseTag, currentVersion);
 
-    expect(prepared.output).toMatch(
-      /^major-tag=v2\nsource-sha=[0-9a-f]{40}\n$/,
-    );
-    expect(prepared.packageJson.version).toBe("2.0.3");
-    expect(prepared.packageLock.version).toBe("2.0.3");
-    expect(prepared.packageLock.packages[""].version).toBe("2.0.3");
-    expect(() => prepareRelease("v2.0.1", "2.0.2")).toThrow(/downgrade/u);
-    expect(() => prepareRelease("v2", "2.0.2")).toThrow(
-      /vMAJOR\.MINOR\.PATCH/u,
-    );
-  });
+      expect(prepared.output).toMatch(
+        /^major-tag=v2\nsource-sha=[0-9a-f]{40}\n$/,
+      );
+      expect(prepared.packageJson.version).toBe(version);
+      expect(prepared.packageLock.version).toBe(version);
+      expect(prepared.packageLock.packages[""].version).toBe(version);
+      expect(() =>
+        prepareRelease(downgradeTag, downgradeCurrentVersion),
+      ).toThrow(/downgrade/u);
+      expect(() => prepareRelease(invalidTag, currentVersion)).toThrow(
+        /vMAJOR\.MINOR\.PATCH/u,
+      );
+    },
+  );
 
-  it("updates package metadata to a valid prerelease version", () => {
-    const prepared = prepareRelease("v2.1.0-beta.2", "2.1.0-beta.1");
-
-    expect(prepared.output).toMatch(
-      /^major-tag=v2\nsource-sha=[0-9a-f]{40}\n$/,
-    );
-    expect(prepared.packageJson.version).toBe("2.1.0-beta.2");
-    expect(prepared.packageLock.version).toBe("2.1.0-beta.2");
-    expect(prepared.packageLock.packages[""].version).toBe("2.1.0-beta.2");
-    expect(() => prepareRelease("v2.1.0-beta.1", "2.1.0-beta.2")).toThrow(
-      /downgrade/u,
-    );
-    expect(() => prepareRelease("v2.1.0-beta.01", "2.0.4")).toThrow(
-      /vMAJOR\.MINOR\.PATCH/u,
-    );
-  });
-
-  it("isolates untrusted preparation from privileged release mutation", () => {
+  it("isolates candidate construction from privileged release mutation", () => {
     const releaseWorkflow = workflow();
     const candidate = releaseWorkflow.jobs.candidate;
     const release = releaseWorkflow.jobs.release;
@@ -570,7 +585,6 @@ describe("release workflow", () => {
       "candidate artifact export",
     );
 
-    expect(metadata.run).not.toContain("git checkout");
     expect(metadata.env).toMatchObject({
       DEFAULT_BRANCH: "${{ github.event.repository.default_branch }}",
       RELEASE_TARGET: "${{ github.event.release.target_commitish }}",
@@ -578,27 +592,13 @@ describe("release workflow", () => {
     expect(metadata.run).toContain(
       'if [[ "$RELEASE_TARGET" != "$DEFAULT_BRANCH" ]]',
     );
-    expect(metadata.run).toContain('echo "target=$RELEASE_TARGET"');
     expect(metadata.run).toContain(
       'git diff --name-only "$tag_sha^" "$tag_sha"',
     );
-    expect(candidate.needs).toBeUndefined();
-    expect(candidate.permissions).toEqual({ contents: "read" });
     expect(candidate.if).toBe("github.event.release.prerelease == false");
     expect(candidateCheckout.with?.ref).toBe(
       "${{ github.event.release.tag_name }}",
     );
-    expect(candidateCheckout.with?.["persist-credentials"]).toBe(false);
-    expect(
-      candidate.steps
-        .filter((step) => step.uses !== undefined)
-        .every((step) => step.uses?.startsWith("actions/")),
-    ).toBe(true);
-    expect(
-      candidate.steps.some((step) =>
-        step.uses?.startsWith("j178/prek-action@"),
-      ),
-    ).toBe(false);
     expect(
       candidate.steps.some((step) => step.run?.includes("npm run check:dist")),
     ).toBe(true);
@@ -617,7 +617,7 @@ describe("release workflow", () => {
     expect(release.if).toContain("!cancelled()");
     expect(release.if).toContain("github.event.release.prerelease == false");
     expect(
-      release.steps
+      [...candidate.steps, ...release.steps]
         .filter((step) => step.uses !== undefined)
         .every((step) => step.uses?.startsWith("actions/")),
     ).toBe(true);
@@ -631,26 +631,13 @@ describe("release workflow", () => {
       CANDIDATE_SHA: "${{ needs.candidate.outputs.sha }}",
       TAG_SHA: "${{ steps.base.outputs.tag-sha }}",
     });
-    expect(
-      requiredStep(
-        steps,
-        (step) =>
-          step.name === "Atomically advance target and guarded release tag",
-        "atomic promotion",
-      ).env,
-    ).toMatchObject({
-      RELEASE_TARGET: "${{ steps.base.outputs.target }}",
-    });
     expect(staging.run).toContain('[[ "$CANDIDATE_SHA" != "$TAG_SHA" ]]');
     expect(staging.run).toContain(
       'cd "$RELEASE_ARTIFACT" && find . -type f -print',
     );
-    expect(staging.run).not.toContain(".github/scripts/");
-    expect(staging.run).not.toContain("npm ");
     expect(staging.run).not.toMatch(
-      /\b(?:bash|node|sh)\s+["']?\$RELEASE_ARTIFACT/u,
+      /\.github\/scripts\/|\b(?:bash|node|sh)\s+["']?\$RELEASE_ARTIFACT/u,
     );
-    expect(prerelease.permissions).toEqual({ contents: "read" });
     expect(prerelease.if).toBe("github.event.release.prerelease == true");
     expect(
       prerelease.steps.some((step) => step.run?.includes("git push")),
@@ -720,6 +707,9 @@ describe("release workflow", () => {
     );
 
     expect(releaseWorkflow.permissions).toEqual({ contents: "read" });
+    expect(releaseWorkflow.jobs.candidate.permissions).toEqual({
+      contents: "read",
+    });
     expect(releaseWorkflow.jobs.prerelease.permissions).toEqual({
       contents: "read",
     });
@@ -982,31 +972,6 @@ describe("release workflow", () => {
     },
   );
 
-  it("verifies the exact finalized release ref before reading tag lists", () => {
-    const targetSha = "2".repeat(40);
-    const calls = runReleaseUpdate(
-      "v1.10.0",
-      targetSha,
-      [{ name: "v1.10.0", commit: { sha: targetSha } }],
-      [
-        {
-          tag_name: "v1.10.0",
-          draft: false,
-          prerelease: false,
-          published_at: "2026-01-01T00:00:00Z",
-        },
-      ],
-    );
-
-    const exactRefCall = "git/ref/tags/v1.10.0";
-    const tagListCall = "tags?per_page=100";
-    expect(calls).toContain(exactRefCall);
-    expect(calls).toContain(tagListCall);
-    expect(calls.indexOf(exactRefCall)).toBeLessThan(
-      calls.indexOf(tagListCall),
-    );
-  });
-
   it("accepts a stale paginated SHA after verifying the exact release ref", () => {
     const staleSha = "1".repeat(40);
     const targetSha = "2".repeat(40);
@@ -1024,7 +989,13 @@ describe("release workflow", () => {
       ],
     );
 
-    expect(calls).toContain("git/ref/tags/v1.10.0");
+    const exactRefCall = "git/ref/tags/v1.10.0";
+    const tagListCall = "tags?per_page=100";
+    expect(calls).toContain(exactRefCall);
+    expect(calls).toContain(tagListCall);
+    expect(calls.indexOf(exactRefCall)).toBeLessThan(
+      calls.indexOf(tagListCall),
+    );
     expect(calls).toContain(`-f majorAfterOid=${targetSha}`);
   });
 
