@@ -46,6 +46,11 @@ interface Workflow {
   };
 }
 
+interface CandidateStagingResult {
+  readonly error: Error | undefined;
+  readonly hasStagedChanges: boolean;
+}
+
 const RELEASE_DECISION_SCRIPT = resolve(".github/scripts/decide-major-tag.mjs");
 
 function workflow(): Workflow {
@@ -69,7 +74,9 @@ function requiredStep(
 function runCandidateStaging(
   candidatePackage: Record<string, unknown>,
   candidateLock?: Record<string, unknown>,
-): void {
+  candidateSha = "1".repeat(40),
+  tagSha = candidateSha,
+): CandidateStagingResult {
   const stagingRun = requiredStep(
     workflow().jobs.release.steps,
     (step) =>
@@ -144,30 +151,46 @@ function runCandidateStaging(
       ),
     );
     writeFileSync(join(artifactDirectory, "dist", "index.js"), "export {};\n");
+    let error: Error | undefined;
     try {
       execFileSync("bash", ["-c", stagingRun], {
         cwd: directory,
         env: {
           ...process.env,
+          CANDIDATE_SHA: candidateSha,
           RELEASE_ARTIFACT: artifactDirectory,
           RELEASE_TAG: "v1.0.1",
+          TAG_SHA: tagSha,
         },
         stdio: "pipe",
       });
-    } catch (error) {
-      const output = error as {
+    } catch (caught) {
+      const output = caught as {
         stderr?: Buffer | string;
         stdout?: Buffer | string;
       };
       const stderr = output.stderr;
       const stdout = output.stdout;
-      throw new Error(
+      error = new Error(
         stderr?.toString().trim() ||
           stdout?.toString().trim() ||
           "candidate staging failed",
-        { cause: error },
+        { cause: caught },
       );
     }
+    let hasStagedChanges = false;
+    try {
+      execFileSync("git", ["diff", "--cached", "--quiet"], {
+        cwd: directory,
+        stdio: "ignore",
+      });
+    } catch {
+      hasStagedChanges = true;
+    }
+    return {
+      error,
+      hasStagedChanges,
+    };
   } finally {
     rmSync(directory, { recursive: true });
     rmSync(artifactDirectory, { recursive: true });
@@ -678,6 +701,13 @@ describe("release workflow", () => {
     expect(
       String(candidateArtifact.with?.path).trim().split("\n").sort(),
     ).toEqual(["dist/index.js", "package-lock.json", "package.json"]);
+    expect(candidate.outputs?.sha).toBe("${{ steps.revision.outputs.sha }}");
+    const candidateRevision = requiredStep(
+      candidate.steps,
+      (step) => step.id === "revision",
+      "candidate revision export",
+    );
+    expect(candidateRevision.run).toContain("git rev-parse HEAD");
     expect(release.needs).toEqual(["prepare", "candidate"]);
     expect(release.if).toContain("always()");
     expect(release.if).toContain("!cancelled()");
@@ -693,6 +723,11 @@ describe("release workflow", () => {
     expect(preparationGate.if).toContain("steps.base.outputs.resume != 'true'");
     expect(preparationGate.if).toContain("needs.candidate.result != 'success'");
     expect(staging.if).toBe("steps.base.outputs.resume != 'true'");
+    expect(staging.env).toMatchObject({
+      CANDIDATE_SHA: "${{ needs.candidate.outputs.sha }}",
+      TAG_SHA: "${{ steps.base.outputs.tag-sha }}",
+    });
+    expect(staging.run).toContain('[[ "$CANDIDATE_SHA" != "$TAG_SHA" ]]');
     expect(staging.run).toContain(
       'cd "$RELEASE_ARTIFACT" && find . -type f -print',
     );
@@ -722,14 +757,14 @@ describe("release workflow", () => {
       version: "1.0.1",
     };
 
-    expect(() => runCandidateStaging(packageMetadata)).not.toThrow();
-    expect(() =>
+    expect(runCandidateStaging(packageMetadata).error).toBeUndefined();
+    expect(
       runCandidateStaging({
         ...packageMetadata,
         scripts: { preinstall: "unexpected" },
-      }),
-    ).toThrow();
-    expect(() =>
+      }).error,
+    ).toBeDefined();
+    expect(
       runCandidateStaging(packageMetadata, {
         lockfileVersion: 3,
         name: "candidate-fixture",
@@ -741,8 +776,27 @@ describe("release workflow", () => {
           },
         },
         version: "1.0.1",
-      }),
-    ).toThrow();
+      }).error,
+    ).toBeDefined();
+  });
+
+  it("rejects a candidate artifact from a different release revision before staging", () => {
+    const result = runCandidateStaging(
+      {
+        name: "candidate-fixture",
+        private: true,
+        version: "1.0.1",
+      },
+      undefined,
+      "1".repeat(40),
+      "2".repeat(40),
+    );
+
+    expect(result.error).toBeDefined();
+    expect(result.error?.message).toContain(
+      "does not match the validated release tag",
+    );
+    expect(result.hasStagedChanges).toBe(false);
   });
 
   it("keeps release credentials scoped to write-capable jobs", () => {

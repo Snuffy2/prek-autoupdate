@@ -55,6 +55,8 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.revision.outputs.sha }}
     steps:
       - name: Check out the immutable release revision
         uses: actions/checkout@v7
@@ -62,6 +64,10 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Record the checked-out release revision
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -219,10 +225,16 @@ jobs:
       - name: Validate and stage the read-only release candidate
         if: steps.base.outputs.resume != 'true'
         env:
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
           RELEASE_ARTIFACT: ${{ runner.temp }}/release-candidate
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          TAG_SHA: ${{ steps.base.outputs.tag-sha }}
         run: |
           set -euo pipefail
+          if [[ "$CANDIDATE_SHA" != "$TAG_SHA" ]]; then
+            echo "Release candidate revision does not match the validated release tag." >&2
+            exit 1
+          fi
           expected_paths=(dist/index.js package-lock.json package.json)
           artifact_paths=()
           while IFS= read -r artifact_path; do
