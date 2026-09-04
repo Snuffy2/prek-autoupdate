@@ -955,6 +955,43 @@ describe("release workflow", () => {
     ).toThrow(/changed while its update was being prepared/u);
   });
 
+  it.each(["skip", "noop"] as const)(
+    "rejects release-tag movement before completing a %s decision",
+    (action) => {
+      const targetSha = "2".repeat(40);
+      const newerSha = "3".repeat(40);
+      const tags =
+        action === "skip"
+          ? [
+              { name: "v1", commit: { sha: newerSha } },
+              { name: "v1.10.0", commit: { sha: targetSha } },
+              { name: "v1.11.0", commit: { sha: newerSha } },
+            ]
+          : [
+              { name: "v1", commit: { sha: targetSha } },
+              { name: "v1.10.0", commit: { sha: targetSha } },
+            ];
+      const releases = tags
+        .filter((tag) => tag.name !== "v1")
+        .map((tag) => ({
+          tag_name: tag.name,
+          draft: false,
+          prerelease: false,
+          published_at: "2026-01-01T00:00:00Z",
+        }));
+
+      expect(() =>
+        runReleaseUpdate(
+          "v1.10.0",
+          targetSha,
+          tags,
+          releases,
+          "release-tag-move",
+        ),
+      ).toThrow(/changed while its update was being prepared/u);
+    },
+  );
+
   it("uses absence CAS and rejects a competing major-tag creation", () => {
     const targetSha = "2".repeat(40);
     const releases = [

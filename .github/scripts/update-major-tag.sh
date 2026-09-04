@@ -71,6 +71,16 @@ verify_point_tag() {
 
 release_direct_ref="$(verify_point_tag)"
 IFS=$'\t' read -r release_direct_oid _release_direct_type <<< "$release_direct_ref"
+
+verify_release_ref_unchanged() {
+  local observed_release_ref
+  observed_release_ref="$(verify_point_tag)"
+  if [[ "$observed_release_ref" != "$release_direct_ref" ]]; then
+    echo "$RELEASE_TAG changed while its update was being prepared" >&2
+    return 1
+  fi
+}
+
 gh api --paginate --slurp \
   "repos/$GITHUB_REPOSITORY/tags?per_page=100" > "$tags_file"
 gh api --paginate --slurp \
@@ -84,12 +94,8 @@ decision="$(
 IFS=$'\t' read -r action update_sha before_oid <<< "$decision"
 
 atomic_move_major_tag() {
-  local major_before_oid="$1" observed_release_ref repository_id
-  observed_release_ref="$(verify_point_tag)"
-  if [[ "$observed_release_ref" != "$release_direct_ref" ]]; then
-    echo "$RELEASE_TAG changed while its update was being prepared" >&2
-    return 1
-  fi
+  local major_before_oid="$1" repository_id
+  verify_release_ref_unchanged || return 1
 
   repository_id="$(gh api "repos/$GITHUB_REPOSITORY" --jq .node_id)"
   gh api graphql \
@@ -135,9 +141,11 @@ atomic_move_major_tag() {
 
 case "$action" in
 skip)
+  verify_release_ref_unchanged || exit 1
   echo "$major_tag is newer than $RELEASE_TAG; leaving it unchanged"
   ;;
 noop)
+  verify_release_ref_unchanged || exit 1
   echo "$major_tag already points to $RELEASE_TAG"
   ;;
 update)
