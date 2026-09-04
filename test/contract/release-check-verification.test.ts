@@ -25,6 +25,10 @@ set -euo pipefail
 printf '%s\n' "$*" >> "$CALLS_PATH"
 case "$*" in
 *'/dispatches'*)
+  if [[ " $* " != *" -F return_run_details=true "* ]]; then
+    echo 'For properties/return_run_details, "true" is not a boolean. (HTTP 422)' >&2
+    exit 1
+  fi
   if [[ "$MODE" == invalid-run-id ]]; then
     payload='{"workflow_run_id":true}'
   else
@@ -105,7 +109,7 @@ describe("release check verification", () => {
   it("dispatches the exact candidate and verifies the authoritative run", () => {
     const calls = runVerifier();
 
-    expect(calls).toContain("return_run_details=true");
+    expect(calls).toContain("-F return_run_details=true");
     expect(calls).toContain("ref=release-validation/v2.1.0-10-1");
     expect(calls).toContain(`inputs[expected_sha]=${SHA}`);
     expect(calls).toContain("actions/runs/42/jobs?per_page=100");

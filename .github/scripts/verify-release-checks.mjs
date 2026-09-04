@@ -69,7 +69,7 @@ export function dispatchWorkflow(
       "-H",
       "X-GitHub-Api-Version: 2026-03-10",
       `repos/${repository}/actions/workflows/${workflow}/dispatches`,
-      "-f",
+      "-F",
       "return_run_details=true",
       "-f",
       `ref=${ref}`,
