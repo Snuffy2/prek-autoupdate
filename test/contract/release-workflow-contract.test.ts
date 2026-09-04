@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -24,7 +25,7 @@ interface WorkflowStep {
 
 interface WorkflowJob {
   readonly if?: string;
-  readonly needs?: string;
+  readonly needs?: string | string[];
   readonly outputs?: Record<string, string>;
   readonly permissions?: Record<string, string>;
   readonly steps: WorkflowStep[];
@@ -39,6 +40,7 @@ interface Workflow {
   readonly permissions: Record<string, string>;
   readonly jobs: {
     readonly prepare: WorkflowJob;
+    readonly candidate: WorkflowJob;
     readonly prerelease: WorkflowJob;
     readonly release: WorkflowJob;
   };
@@ -62,6 +64,117 @@ function requiredStep(
     throw new Error(`Release workflow is missing the ${description} step`);
   }
   return step;
+}
+
+function candidateStagingRun(): string {
+  return requiredStep(
+    workflow().jobs.release.steps,
+    (step) =>
+      step.run?.includes(
+        "expected_paths=(dist/index.js package-lock.json package.json)",
+      ) ?? false,
+    "read-only candidate validation",
+  ).run!;
+}
+
+function runCandidateStaging(
+  candidatePackage: Record<string, unknown>,
+  candidateLock?: Record<string, unknown>,
+): void {
+  const directory = mkdtempSync(join(tmpdir(), "prek-release-candidate-"));
+  const artifactDirectory = mkdtempSync(
+    join(tmpdir(), "prek-release-candidate-artifact-"),
+  );
+  const packageLock = {
+    lockfileVersion: 3,
+    name: "candidate-fixture",
+    packages: {
+      "": { name: "candidate-fixture", version: "1.0.0" },
+    },
+    version: "1.0.0",
+  };
+  try {
+    mkdirSync(join(directory, "dist"), { recursive: true });
+    mkdirSync(join(artifactDirectory, "dist"), { recursive: true });
+    writeFileSync(
+      join(directory, "package.json"),
+      JSON.stringify({
+        name: "candidate-fixture",
+        private: true,
+        version: "1.0.0",
+      }),
+    );
+    writeFileSync(
+      join(directory, "package-lock.json"),
+      JSON.stringify(packageLock),
+    );
+    writeFileSync(join(directory, "dist", "index.js"), "export {};\n");
+    execFileSync("git", ["init", "--initial-branch=main"], { cwd: directory });
+    execFileSync(
+      "git",
+      ["add", "dist/index.js", "package-lock.json", "package.json"],
+      {
+        cwd: directory,
+      },
+    );
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "user.name=Release test",
+        "commit",
+        "-m",
+        "base",
+      ],
+      { cwd: directory },
+    );
+    writeFileSync(
+      join(artifactDirectory, "package.json"),
+      JSON.stringify(candidatePackage),
+    );
+    writeFileSync(
+      join(artifactDirectory, "package-lock.json"),
+      JSON.stringify(
+        candidateLock ?? {
+          ...packageLock,
+          packages: {
+            "": { name: "candidate-fixture", version: "1.0.1" },
+          },
+          version: "1.0.1",
+        },
+      ),
+    );
+    writeFileSync(join(artifactDirectory, "dist", "index.js"), "export {};\n");
+    try {
+      execFileSync("bash", ["-c", candidateStagingRun()], {
+        cwd: directory,
+        env: {
+          ...process.env,
+          RELEASE_ARTIFACT: artifactDirectory,
+          RELEASE_TAG: "v1.0.1",
+        },
+        stdio: "pipe",
+      });
+    } catch (error) {
+      const output = error as {
+        stderr?: Buffer | string;
+        stdout?: Buffer | string;
+      };
+      const stderr = output.stderr;
+      const stdout = output.stdout;
+      throw new Error(
+        stderr?.toString().trim() ||
+          stdout?.toString().trim() ||
+          "candidate staging failed",
+        { cause: error },
+      );
+    }
+  } finally {
+    rmSync(directory, { recursive: true });
+    rmSync(artifactDirectory, { recursive: true });
+  }
 }
 
 function decideRelease(
@@ -483,6 +596,7 @@ describe("release workflow", () => {
   it("isolates untrusted preparation from privileged release mutation", () => {
     const releaseWorkflow = workflow();
     const preparation = releaseWorkflow.jobs.prepare;
+    const candidate = releaseWorkflow.jobs.candidate;
     const release = releaseWorkflow.jobs.release;
     const prerelease = releaseWorkflow.jobs.prerelease;
     const steps = release.steps;
@@ -502,6 +616,31 @@ describe("release workflow", () => {
         step.run?.includes('git show "$expected_sha:package.json"') ?? false,
       "final release identity",
     );
+    const preparationGate = requiredStep(
+      steps,
+      (step) =>
+        step.run?.includes("Read-only candidate construction must succeed") ??
+        false,
+      "new-release preparation gate",
+    );
+    const staging = requiredStep(
+      steps,
+      (step) =>
+        step.run?.includes(
+          "expected_paths=(dist/index.js package-lock.json package.json)",
+        ) ?? false,
+      "read-only candidate validation",
+    );
+    const candidateCheckout = requiredStep(
+      candidate.steps,
+      (step) => step.uses?.startsWith("actions/checkout@") ?? false,
+      "candidate checkout",
+    );
+    const candidateArtifact = requiredStep(
+      candidate.steps,
+      (step) => step.uses?.startsWith("actions/upload-artifact@") ?? false,
+      "candidate artifact export",
+    );
 
     expect(metadata.run).not.toContain("git checkout");
     expect(metadata.run).toContain(
@@ -514,7 +653,35 @@ describe("release workflow", () => {
         step.uses?.startsWith("j178/prek-action@"),
       ),
     ).toBe(true);
-    expect(release.needs).toBe("prepare");
+    expect(
+      preparation.steps.some((step) =>
+        step.uses?.startsWith("actions/upload-artifact@"),
+      ),
+    ).toBe(false);
+    expect(candidate.needs).toBe("prepare");
+    expect(candidate.permissions).toEqual({ contents: "read" });
+    expect(candidate.if).toContain("needs.prepare.result == 'success'");
+    expect(candidateCheckout.with?.ref).toBe(
+      "${{ github.event.release.tag_name }}",
+    );
+    expect(candidateCheckout.with?.["persist-credentials"]).toBe(false);
+    expect(
+      candidate.steps
+        .filter((step) => step.uses !== undefined)
+        .every((step) => step.uses?.startsWith("actions/")),
+    ).toBe(true);
+    expect(
+      candidate.steps.some((step) =>
+        step.uses?.startsWith("j178/prek-action@"),
+      ),
+    ).toBe(false);
+    expect(
+      candidate.steps.some((step) => step.run?.includes("npm run check:dist")),
+    ).toBe(true);
+    expect(
+      String(candidateArtifact.with?.path).trim().split("\n").sort(),
+    ).toEqual(["dist/index.js", "package-lock.json", "package.json"]);
+    expect(release.needs).toEqual(["prepare", "candidate"]);
     expect(release.if).toContain("always()");
     expect(release.if).toContain("!cancelled()");
     expect(release.if).toContain("github.event.release.prerelease == false");
@@ -523,6 +690,20 @@ describe("release workflow", () => {
         .filter((step) => step.uses !== undefined)
         .every((step) => step.uses?.startsWith("actions/")),
     ).toBe(true);
+    expect(release.steps.some((step) => step.run?.includes("npm "))).toBe(
+      false,
+    );
+    expect(preparationGate.if).toContain("steps.base.outputs.resume != 'true'");
+    expect(preparationGate.if).toContain("needs.candidate.result != 'success'");
+    expect(staging.if).toBe("steps.base.outputs.resume != 'true'");
+    expect(staging.run).toContain(
+      'cd "$RELEASE_ARTIFACT" && find . -type f -print',
+    );
+    expect(staging.run).not.toContain(".github/scripts/");
+    expect(staging.run).not.toContain("npm ");
+    expect(staging.run).not.toMatch(
+      /\b(?:bash|node|sh)\s+["']?\$RELEASE_ARTIFACT/u,
+    );
     expect(prerelease.permissions).toEqual({ contents: "read" });
     expect(prerelease.if).toBe("github.event.release.prerelease == true");
     expect(
@@ -535,6 +716,36 @@ describe("release workflow", () => {
     expect(finalIdentity.run).toContain(
       'git cat-file -e "$expected_sha:dist/index.js"',
     );
+  });
+
+  it("rejects candidate metadata changes beyond release version fields", () => {
+    const packageMetadata = {
+      name: "candidate-fixture",
+      private: true,
+      version: "1.0.1",
+    };
+
+    expect(() => runCandidateStaging(packageMetadata)).not.toThrow();
+    expect(() =>
+      runCandidateStaging({
+        ...packageMetadata,
+        scripts: { preinstall: "unexpected" },
+      }),
+    ).toThrow();
+    expect(() =>
+      runCandidateStaging(packageMetadata, {
+        lockfileVersion: 3,
+        name: "candidate-fixture",
+        packages: {
+          "": {
+            name: "candidate-fixture",
+            packageManager: "unexpected",
+            version: "1.0.1",
+          },
+        },
+        version: "1.0.1",
+      }),
+    ).toThrow();
   });
 
   it("keeps release credentials scoped to write-capable jobs", () => {
