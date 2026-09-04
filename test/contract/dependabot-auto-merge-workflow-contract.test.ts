@@ -207,6 +207,13 @@ describe("Dependabot auto-merge workflow", () => {
     expect(cleanupCondition).toContain(
       "github.event.pull_request.user.login == 'dependabot[bot]'",
     );
+    expect(cleanupCondition).toContain("github.event.repository.fork == false");
+    expect(cleanupCondition).toContain(
+      "github.event.pull_request.head.repo.full_name == github.repository",
+    );
+    expect(cleanupCondition).toContain(
+      "github.event.pull_request.base.ref == github.event.repository.default_branch",
+    );
     expect(cleanup.permissions).toEqual({
       "contents": "write",
       "pull-requests": "write",
