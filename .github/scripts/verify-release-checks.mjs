@@ -148,6 +148,37 @@ export function verifyJobs(repository, runId, requiredChecks, api = githubApi) {
   }
 }
 
+export function publishVerifiedStatus(
+  repository,
+  sha,
+  check,
+  runId,
+  api = githubApi,
+) {
+  const response = api([
+    "--method",
+    "POST",
+    "-H",
+    "Accept: application/vnd.github+json",
+    "-H",
+    "X-GitHub-Api-Version: 2026-03-10",
+    `repos/${repository}/statuses/${sha}`,
+    "-f",
+    "state=success",
+    "-f",
+    `context=${check}`,
+    "-f",
+    `description=Verified by release workflow run ${String(runId)}`,
+    "-f",
+    `target_url=https://github.com/${repository}/actions/runs/${String(runId)}`,
+  ]);
+  if (response.state !== "success" || response.context !== check) {
+    throw new GitHubCommandError(
+      `GitHub did not confirm verified status ${JSON.stringify(check)}.`,
+    );
+  }
+}
+
 const delay = (milliseconds) =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -280,6 +311,7 @@ export async function main(arguments_ = process.argv.slice(2)) {
     ]),
   );
   const deadline = Date.now() + options.timeoutSeconds * 1_000;
+  const verifiedRuns = new Map();
   for (const [workflow, requiredChecks] of checks) {
     const runId = await waitForWorkflow({
       repository: options.repository,
@@ -290,9 +322,19 @@ export async function main(arguments_ = process.argv.slice(2)) {
       deadline,
       expectedRunId: dispatched.get(workflow),
     });
+    verifiedRuns.set(workflow, runId);
     process.stdout.write(
       `Verified ${workflow} run ${String(runId)} for ${options.sha}.\n`,
     );
+  }
+  for (const [workflow, requiredChecks] of checks) {
+    const runId = verifiedRuns.get(workflow);
+    for (const check of [...requiredChecks].sort()) {
+      publishVerifiedStatus(options.repository, options.sha, check, runId);
+      process.stdout.write(
+        `Published verified status ${JSON.stringify(check)} for ${options.sha}.\n`,
+      );
+    }
   }
 }
 
