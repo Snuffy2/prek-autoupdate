@@ -533,7 +533,7 @@ describe("release workflow", () => {
       actions: "write",
       checks: "read",
       contents: "write",
-      statuses: "read",
+      statuses: "write",
     });
     expect(checkouts.length).toBeGreaterThan(0);
     for (const checkout of checkouts) {
