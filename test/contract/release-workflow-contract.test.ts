@@ -49,6 +49,18 @@ function workflow(): Workflow {
   ) as Workflow;
 }
 
+function requiredStep(
+  steps: readonly WorkflowStep[],
+  predicate: (step: WorkflowStep) => boolean,
+  description: string,
+): WorkflowStep {
+  const step = steps.find(predicate);
+  if (step === undefined) {
+    throw new Error(`Release workflow is missing the ${description} step`);
+  }
+  return step;
+}
+
 function decideRelease(
   releaseTag: string,
   targetSha: string,
@@ -467,32 +479,45 @@ describe("release workflow", () => {
 
   it("never executes prerelease or resumed release-tag code", () => {
     const steps = workflow().jobs.release.steps;
-    const metadata = steps.find((step) => step.id === "base");
-    const setupPrek = steps.find((step) =>
-      step.uses?.startsWith("j178/prek-action@"),
+    const metadata = requiredStep(
+      steps,
+      (step) => step.id === "base",
+      "release metadata",
     );
-    const preparation = steps.find((step) =>
-      step.run?.includes("prepare-release.sh"),
+    const setupPrek = requiredStep(
+      steps,
+      (step) => step.uses?.startsWith("j178/prek-action@") ?? false,
+      "prek setup",
     );
-    const validationPush = steps.find((step) =>
-      step.run?.includes("refs/heads/$temp_ref"),
+    const preparation = requiredStep(
+      steps,
+      (step) => step.run?.includes("prepare-release.sh") ?? false,
+      "release preparation",
     );
-    const finalIdentity = steps.find((step) =>
-      step.run?.includes('git show "$expected_sha:package.json"'),
+    const validationPush = requiredStep(
+      steps,
+      (step) => step.run?.includes("refs/heads/$temp_ref") ?? false,
+      "validation branch publication",
+    );
+    const finalIdentity = requiredStep(
+      steps,
+      (step) =>
+        step.run?.includes('git show "$expected_sha:package.json"') ?? false,
+      "final release identity",
     );
 
-    expect(metadata?.run).not.toContain("git checkout");
-    expect(metadata?.run).toContain(
+    expect(metadata.run).not.toContain("git checkout");
+    expect(metadata.run).toContain(
       'git diff --name-only "$tag_sha^" "$tag_sha"',
     );
-    expect(setupPrek?.if).toContain("github.event.release.prerelease == false");
-    expect(setupPrek?.if).toContain("steps.base.outputs.resume");
-    expect(preparation?.if).toBe(setupPrek?.if);
-    expect(validationPush?.run).toContain(
+    expect(setupPrek.if).toContain("github.event.release.prerelease == false");
+    expect(setupPrek.if).toContain("steps.base.outputs.resume");
+    expect(preparation.if).toBe(setupPrek.if);
+    expect(validationPush.run).toContain(
       'git push origin "$CANDIDATE_SHA:refs/heads/$temp_ref"',
     );
-    expect(validationPush?.run).not.toContain('git push origin "HEAD:');
-    expect(finalIdentity?.run).toContain(
+    expect(validationPush.run).not.toContain('git push origin "HEAD:');
+    expect(finalIdentity.run).toContain(
       'git cat-file -e "$expected_sha:dist/index.js"',
     );
   });
