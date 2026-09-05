@@ -777,19 +777,23 @@ describe("release workflow", () => {
     expect(runPrereleaseValidation("v2.1.0-beta.rc-1")).toBeUndefined();
   });
 
-  it("builds a candidate after updating release metadata", () => {
-    const currentVersion = "1.2.3";
-    const releaseVersion = "1.2.4";
-    const result = runCandidateConstruction(
-      `v${releaseVersion}`,
-      currentVersion,
-    );
+  it.each([
+    ["new release", "1.2.3", "1.2.4"],
+    ["release rerun", "1.2.4", "1.2.4"],
+  ] as const)(
+    "builds a candidate for a %s",
+    (_scenario, currentVersion, releaseVersion) => {
+      const result = runCandidateConstruction(
+        `v${releaseVersion}`,
+        currentVersion,
+      );
 
-    expect(result.error).toBeUndefined();
-    expect(result.packageVersion).toBe(releaseVersion);
-    expect(result.lockVersion).toBe(releaseVersion);
-    expect(result.bundle).toContain(`var version = "${releaseVersion}";`);
-  });
+      expect(result.error).toBeUndefined();
+      expect(result.packageVersion).toBe(releaseVersion);
+      expect(result.lockVersion).toBe(releaseVersion);
+      expect(result.bundle).toContain(`var version = "${releaseVersion}";`);
+    },
+  );
 
   it("isolates candidate construction from privileged release mutation", () => {
     const releaseWorkflow = workflow();
