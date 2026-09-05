@@ -74,13 +74,25 @@ decision="$(
 IFS=$'\t' read -r action update_sha before_oid <<< "$decision"
 
 move_major_tag() {
-  local major_before_oid="$1"
+  local major_before_oid="$1" restore_ref
   verify_release_ref_unchanged || return 1
   git cat-file -e "$update_sha^{commit}"
   git push \
     --force-with-lease="refs/tags/$major_tag:$major_before_oid" \
     origin "${update_sha}:refs/tags/$major_tag"
-  verify_release_ref_unchanged
+  if ! verify_release_ref_unchanged; then
+    if [[ -n "$major_before_oid" ]]; then
+      restore_ref="${major_before_oid}:refs/tags/$major_tag"
+    else
+      restore_ref=":refs/tags/$major_tag"
+    fi
+    if ! git push \
+      --force-with-lease="refs/tags/$major_tag:$update_sha" \
+      origin "$restore_ref"; then
+      echo "Unable to restore $major_tag after $RELEASE_TAG changed" >&2
+    fi
+    return 1
+  fi
 }
 
 case "$action" in
@@ -99,6 +111,9 @@ update)
     echo "$major_tag changed while its update was being prepared" >&2
     exit 1
   fi
+  git cat-file -e "$direct_before_oid" 2>/dev/null || \
+    git fetch --no-tags origin "refs/tags/$major_tag"
+  git cat-file -e "$direct_before_oid"
   move_major_tag "$direct_before_oid"
   ;;
 create)

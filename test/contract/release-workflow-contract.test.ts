@@ -484,10 +484,16 @@ function runPrereleaseValidation(releaseTag: string): Error | undefined {
 
 type ReleaseUpdateAction = "create" | "noop" | "skip" | "update";
 type ReleaseUpdateFailure =
-  "create-race" | "major-race" | "none" | "point-mismatch" | "release-tag-move";
+  | "create-race"
+  | "major-race"
+  | "none"
+  | "point-mismatch"
+  | "release-tag-move"
+  | "release-tag-move-at-push";
 
 interface ReleaseUpdateResult {
   readonly error: Error | undefined;
+  readonly initialMajorDirectOid: string | undefined;
   readonly initialMajorSha: string | undefined;
   readonly majorDirectOid: string | undefined;
   readonly majorSha: string | undefined;
@@ -565,8 +571,9 @@ function runReleaseUpdate(
     if (action === "skip") runGit(["push", "origin", "refs/tags/v1.11.0"]);
     if (action !== "create") runGit(["push", "origin", "refs/tags/v1"]);
 
+    const initialMajorDirectOid = remoteOid("refs/tags/v1");
     const initialMajorSha =
-      remoteOid("refs/tags/v1^{}") ?? remoteOid("refs/tags/v1");
+      remoteOid("refs/tags/v1^{}") ?? initialMajorDirectOid;
     const listedPointSha = staleListedPointSha ? oldSha : targetSha;
     const tags = [
       ...(action === "create"
@@ -626,6 +633,9 @@ if [[ "$1" == "ls-remote" && "$*" == *"refs/tags/$RELEASE_TAG"* ]]; then
     "$REAL_GIT" --git-dir="$REMOTE_PATH" update-ref "refs/tags/$RELEASE_TAG" "$RACE_SHA"
   fi
 elif [[ "$1" == "push" ]]; then
+  if [[ "$FAILURE" == "release-tag-move-at-push" ]]; then
+    "$REAL_GIT" --git-dir="$REMOTE_PATH" update-ref "refs/tags/$RELEASE_TAG" "$RACE_SHA"
+  fi
   if [[ "$FAILURE" == "major-race" || "$FAILURE" == "create-race" ]]; then
     "$REAL_GIT" --git-dir="$REMOTE_PATH" update-ref "refs/tags/$MAJOR_TAG" "$RACE_SHA"
   fi
@@ -676,6 +686,7 @@ exec "$REAL_GIT" "$@"
     }
     return {
       error,
+      initialMajorDirectOid,
       initialMajorSha,
       majorDirectOid: remoteOid("refs/tags/v1"),
       majorSha: remoteOid("refs/tags/v1^{}") ?? remoteOid("refs/tags/v1"),
@@ -1170,6 +1181,26 @@ describe("release workflow", () => {
         /changed while its update was being prepared/u,
       );
       expect(result.majorSha).toBe(result.initialMajorSha);
+    },
+  );
+
+  it.each([
+    ["update", true],
+    ["create", false],
+  ] as const)(
+    "restores the moving tag when the release tag moves during a %s push",
+    (action, annotated) => {
+      const result = runReleaseUpdate(
+        action,
+        "release-tag-move-at-push",
+        annotated,
+      );
+
+      expect(result.error?.message).toMatch(
+        /changed while its update was being prepared/u,
+      );
+      expect(result.majorSha).toBe(result.initialMajorSha);
+      expect(result.majorDirectOid).toBe(result.initialMajorDirectOid);
     },
   );
 
