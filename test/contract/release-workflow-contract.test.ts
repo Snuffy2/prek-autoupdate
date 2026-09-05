@@ -1,10 +1,12 @@
 import { execFileSync } from "node:child_process";
 import {
+  cpSync,
   chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -95,6 +97,9 @@ function runCandidateConstruction(
   try {
     mkdirSync(join(directory, ".github", "scripts"), { recursive: true });
     mkdirSync(join(directory, "dist"), { recursive: true });
+    cpSync("src", join(directory, "src"), { recursive: true });
+    cpSync("rollup.config.mjs", join(directory, "rollup.config.mjs"));
+    symlinkSync(resolve("node_modules"), join(directory, "node_modules"));
     writeFileSync(
       join(directory, "package.json"),
       JSON.stringify({ name: "candidate-fixture", version: currentVersion }),
@@ -123,10 +128,8 @@ function runCandidateConstruction(
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         'if [[ "$*" == "ci --ignore-scripts" ]]; then exit 0; fi',
-        'if [[ "$*" != "run build" && "$*" != "run check:dist" ]]; then exit 64; fi',
-        'version="$(node -p \'JSON.parse(require("fs").readFileSync("package.json", "utf8")).version\')"',
-        'printf \'var version = "%s";\\n\' "$version" > dist/index.js',
-        'if [[ "$*" == "run check:dist" ]]; then git diff --exit-code -- dist/index.js; fi',
+        'if [[ "$*" != "run build" ]]; then exit 64; fi',
+        "exec node_modules/.bin/rollup --config",
         "",
       ].join("\n"),
     );
