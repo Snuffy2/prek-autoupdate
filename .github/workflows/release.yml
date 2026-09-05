@@ -48,6 +48,7 @@ jobs:
           npm run build
           changed_paths="$(git diff --name-only)"
           while IFS= read -r changed_path; do
+            [[ -z "$changed_path" ]] && continue
             case "$changed_path" in
               dist/index.js | package-lock.json | package.json) ;;
               *)

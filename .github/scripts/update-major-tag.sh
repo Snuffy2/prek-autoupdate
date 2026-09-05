@@ -6,7 +6,6 @@ if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]
   exit 1
 fi
 major_tag="v${BASH_REMATCH[1]}"
-readonly MAX_TAG_PEEL_DEPTH=16
 if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Verified release SHA is invalid" >&2
   exit 1
@@ -17,60 +16,41 @@ tags_file="$(mktemp)"
 releases_file="$(mktemp)"
 trap 'rm -f "$tags_file" "$releases_file"' EXIT
 
-read_git_object() {
-  local description="$1" endpoint="$2" response
-  if ! response="$(gh api "$endpoint" --jq '.object | [.sha, .type] | @tsv')"; then
-    echo "Unable to read $description from GitHub" >&2
+read_remote_tag() {
+  local tag="$1" description="$2" refs direct_oid peeled_oid
+  if ! refs="$(
+    git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}"
+  )"; then
+    echo "Unable to read $description from origin" >&2
     return 1
   fi
-  if [[ ! "$response" =~ ^([0-9a-f]{40})$'\t'(tag|commit)$ ]]; then
-    echo "GitHub returned an invalid $description; expected a 40-character object ID and tag or commit type" >&2
+  direct_oid="$(awk -v ref="refs/tags/$tag" '$2 == ref { print $1 }' <<< "$refs")"
+  peeled_oid="$(awk -v ref="refs/tags/$tag^{}" '$2 == ref { print $1 }' <<< "$refs")"
+  if [[ ! "$direct_oid" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "Origin returned an invalid $description" >&2
     return 1
   fi
-  printf '%s\n' "$response"
+  if [[ -z "$peeled_oid" ]]; then
+    peeled_oid="$direct_oid"
+  elif [[ ! "$peeled_oid" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "Origin returned an invalid peeled $description" >&2
+    return 1
+  fi
+  printf '%s\t%s\n' "$direct_oid" "$peeled_oid"
 }
 
 verify_point_tag() {
-  local attempt depth direct_ref direct_oid direct_type object_oid object_type
-  for attempt in 1 2 3 4 5; do
-    if direct_ref="$(
-      gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
-        --jq '.object | [.sha, .type] | @tsv' 2>/dev/null
-    )"; then
-      IFS=$'\t' read -r object_oid object_type <<< "$direct_ref"
-      direct_oid="$object_oid"
-      direct_type="$object_type"
-      depth=0
-      while [[ "$object_type" == "tag" && "$depth" -lt "$MAX_TAG_PEEL_DEPTH" ]]; do
-        if ! direct_ref="$(
-          gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_oid" \
-            --jq '.object | [.sha, .type] | @tsv' 2>/dev/null
-        )"; then
-          object_type=""
-          break
-        fi
-        IFS=$'\t' read -r object_oid object_type <<< "$direct_ref"
-        ((depth += 1))
-      done
-      if [[ "$object_type" == "tag" ]]; then
-        echo "Annotated release tag exceeds maximum peel depth of $MAX_TAG_PEEL_DEPTH" >&2
-        exit 1
-      fi
-      if [[ "$object_type" == "commit" && "$object_oid" == "$TARGET_SHA" ]]; then
-        printf '%s\t%s\n' "$direct_oid" "$direct_type"
-        return
-      fi
-    fi
-    if (( attempt < 5 )); then
-      sleep "$attempt"
-    fi
-  done
-  echo "Verified release SHA does not match its exact finalized tag ref" >&2
-  exit 1
+  local point_ref direct_oid peeled_oid
+  point_ref="$(read_remote_tag "$RELEASE_TAG" "release tag $RELEASE_TAG")" || exit 1
+  IFS=$'\t' read -r direct_oid peeled_oid <<< "$point_ref"
+  if [[ "$peeled_oid" != "$TARGET_SHA" ]]; then
+    echo "Verified release SHA does not match its exact finalized tag ref" >&2
+    exit 1
+  fi
+  printf '%s\t%s\n' "$direct_oid" "$peeled_oid"
 }
 
 release_direct_ref="$(verify_point_tag)"
-IFS=$'\t' read -r release_direct_oid _release_direct_type <<< "$release_direct_ref"
 
 verify_release_ref_unchanged() {
   local observed_release_ref
@@ -93,50 +73,26 @@ decision="$(
 
 IFS=$'\t' read -r action update_sha before_oid <<< "$decision"
 
-atomic_move_major_tag() {
-  local major_before_oid="$1" repository_id
+move_major_tag() {
+  local major_before_oid="$1" restore_ref
   verify_release_ref_unchanged || return 1
-
-  repository_id="$(gh api "repos/$GITHUB_REPOSITORY" --jq .node_id)"
-  gh api graphql \
-    -f query='
-      mutation MoveMajorTag(
-        $repositoryId: ID!
-        $pointName: GitRefname!
-        $pointOid: GitObjectID!
-        $majorName: GitRefname!
-        $majorBeforeOid: GitObjectID!
-        $majorAfterOid: GitObjectID!
-      ) {
-        updateRefs(
-          input: {
-            repositoryId: $repositoryId
-            refUpdates: [
-              {
-                name: $pointName
-                beforeOid: $pointOid
-                afterOid: $pointOid
-                force: false
-              }
-              {
-                name: $majorName
-                beforeOid: $majorBeforeOid
-                afterOid: $majorAfterOid
-                force: true
-              }
-            ]
-          }
-        ) {
-          clientMutationId
-        }
-      }
-    ' \
-    -F repositoryId="$repository_id" \
-    -f pointName="refs/tags/$RELEASE_TAG" \
-    -f pointOid="$release_direct_oid" \
-    -f majorName="refs/tags/$major_tag" \
-    -f majorBeforeOid="$major_before_oid" \
-    -f majorAfterOid="$update_sha"
+  git cat-file -e "$update_sha^{commit}"
+  git push \
+    --force-with-lease="refs/tags/$major_tag:$major_before_oid" \
+    origin "${update_sha}:refs/tags/$major_tag"
+  if ! verify_release_ref_unchanged; then
+    if [[ -n "$major_before_oid" ]]; then
+      restore_ref="${major_before_oid}:refs/tags/$major_tag"
+    else
+      restore_ref=":refs/tags/$major_tag"
+    fi
+    if ! git push \
+      --force-with-lease="refs/tags/$major_tag:$update_sha" \
+      origin "$restore_ref"; then
+      echo "Unable to restore $major_tag after $RELEASE_TAG changed" >&2
+    fi
+    return 1
+  fi
 }
 
 case "$action" in
@@ -149,32 +105,19 @@ noop)
   echo "$major_tag already points to $RELEASE_TAG"
   ;;
 update)
-  major_ref="$(read_git_object \
-    "major tag ref $major_tag" \
-    "repos/$GITHUB_REPOSITORY/git/ref/tags/$major_tag")" || exit 1
-  IFS=$'\t' read -r direct_before_oid direct_type <<< "$major_ref"
-  peeled_oid="$direct_before_oid"
-  peeled_type="$direct_type"
-  depth=0
-  while [[ "$peeled_type" == "tag" && "$depth" -lt "$MAX_TAG_PEEL_DEPTH" ]]; do
-    peeled_object="$(read_git_object \
-      "annotated major tag object $peeled_oid" \
-      "repos/$GITHUB_REPOSITORY/git/tags/$peeled_oid")" || exit 1
-    IFS=$'\t' read -r peeled_oid peeled_type <<< "$peeled_object"
-    ((depth += 1))
-  done
-  if [[ "$peeled_type" == "tag" ]]; then
-    echo "Annotated major tag exceeds maximum peel depth of $MAX_TAG_PEEL_DEPTH" >&2
-    exit 1
-  fi
-  if [[ "$peeled_type" != "commit" || "$peeled_oid" != "$before_oid" ]]; then
+  major_ref="$(read_remote_tag "$major_tag" "major tag $major_tag")" || exit 1
+  IFS=$'\t' read -r direct_before_oid peeled_before_oid <<< "$major_ref"
+  if [[ "$peeled_before_oid" != "$before_oid" ]]; then
     echo "$major_tag changed while its update was being prepared" >&2
     exit 1
   fi
-  atomic_move_major_tag "$direct_before_oid"
+  git cat-file -e "$direct_before_oid" 2>/dev/null || \
+    git fetch --no-tags origin "refs/tags/$major_tag"
+  git cat-file -e "$direct_before_oid"
+  move_major_tag "$direct_before_oid"
   ;;
 create)
-  atomic_move_major_tag "0000000000000000000000000000000000000000"
+  move_major_tag ""
   ;;
 *)
   echo "Unable to determine a safe moving-tag update" >&2
