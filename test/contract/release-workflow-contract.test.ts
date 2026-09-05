@@ -50,6 +50,13 @@ interface CandidateStagingResult {
   readonly hasStagedChanges: boolean;
 }
 
+interface CandidateConstructionResult {
+  readonly bundle: string;
+  readonly error: Error | undefined;
+  readonly lockVersion: string;
+  readonly packageVersion: string;
+}
+
 const RELEASE_DECISION_SCRIPT = resolve(".github/scripts/decide-major-tag.mjs");
 
 function workflow(): Workflow {
@@ -68,6 +75,116 @@ function requiredStep(
     throw new Error(`Release workflow is missing the ${description} step`);
   }
   return step;
+}
+
+function runCandidateConstruction(
+  releaseTag: string,
+  currentVersion: string,
+): CandidateConstructionResult {
+  const candidateRun = requiredStep(
+    workflow().jobs.candidate.steps,
+    (step) => step.name === "Build and validate the release candidate",
+    "release candidate construction",
+  ).run!;
+  const directory = mkdtempSync(join(tmpdir(), "prek-release-construction-"));
+  const binDirectory = mkdtempSync(join(tmpdir(), "prek-release-bin-"));
+  const outputPath = join(binDirectory, "github-output");
+  const npmPath = join(binDirectory, "npm");
+  try {
+    mkdirSync(join(directory, ".github", "scripts"), { recursive: true });
+    mkdirSync(join(directory, "dist"), { recursive: true });
+    writeFileSync(
+      join(directory, "package.json"),
+      JSON.stringify({ name: "candidate-fixture", version: currentVersion }),
+    );
+    writeFileSync(
+      join(directory, "package-lock.json"),
+      JSON.stringify({
+        name: "candidate-fixture",
+        packages: {
+          "": { name: "candidate-fixture", version: currentVersion },
+        },
+        version: currentVersion,
+      }),
+    );
+    writeFileSync(
+      join(directory, "dist", "index.js"),
+      `var version = "${currentVersion}";\n`,
+    );
+    writeFileSync(
+      join(directory, ".github", "scripts", "prepare-release.mjs"),
+      readFileSync(".github/scripts/prepare-release.mjs"),
+    );
+    writeFileSync(
+      npmPath,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        'if [[ "$*" == "ci --ignore-scripts" ]]; then exit 0; fi',
+        'if [[ "$*" != "run build" && "$*" != "run check:dist" ]]; then exit 64; fi',
+        'version="$(node -p \'JSON.parse(require("fs").readFileSync("package.json", "utf8")).version\')"',
+        'printf \'var version = "%s";\\n\' "$version" > dist/index.js',
+        'if [[ "$*" == "run check:dist" ]]; then git diff --exit-code -- dist/index.js; fi',
+        "",
+      ].join("\n"),
+    );
+    chmodSync(npmPath, 0o755);
+    execFileSync("git", ["init", "--initial-branch=main"], { cwd: directory });
+    execFileSync("git", ["add", "."], { cwd: directory });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "user.name=Release test",
+        "commit",
+        "-m",
+        "base",
+      ],
+      { cwd: directory },
+    );
+
+    let error: Error | undefined;
+    try {
+      execFileSync("bash", ["-c", candidateRun], {
+        cwd: directory,
+        env: {
+          ...process.env,
+          GITHUB_OUTPUT: outputPath,
+          PATH: `${binDirectory}:${process.env.PATH ?? ""}`,
+          RELEASE_TAG: releaseTag,
+        },
+        stdio: "pipe",
+      });
+    } catch (caught) {
+      const output = caught as {
+        stderr?: Buffer | string;
+        stdout?: Buffer | string;
+      };
+      error = new Error(
+        output.stderr?.toString().trim() ||
+          output.stdout?.toString().trim() ||
+          "candidate construction failed",
+        { cause: caught },
+      );
+    }
+    const packageJson = JSON.parse(
+      readFileSync(join(directory, "package.json"), "utf8"),
+    ) as { version: string };
+    const packageLock = JSON.parse(
+      readFileSync(join(directory, "package-lock.json"), "utf8"),
+    ) as { version: string };
+    return {
+      bundle: readFileSync(join(directory, "dist", "index.js"), "utf8"),
+      error,
+      lockVersion: packageLock.version,
+      packageVersion: packageJson.version,
+    };
+  } finally {
+    rmSync(directory, { recursive: true });
+    rmSync(binDirectory, { recursive: true });
+  }
 }
 
 function runCandidateStaging(
@@ -607,6 +724,15 @@ describe("release workflow", () => {
     expect(runPrereleaseValidation("v2.1.0-beta.rc-1")).toBeUndefined();
   });
 
+  it("builds a candidate after updating release metadata", () => {
+    const result = runCandidateConstruction("v2.0.7", "2.0.4");
+
+    expect(result.error).toBeUndefined();
+    expect(result.packageVersion).toBe("2.0.7");
+    expect(result.lockVersion).toBe("2.0.7");
+    expect(result.bundle).toContain('var version = "2.0.7";');
+  });
+
   it("isolates candidate construction from privileged release mutation", () => {
     const releaseWorkflow = workflow();
     const candidate = releaseWorkflow.jobs.candidate;
@@ -669,9 +795,6 @@ describe("release workflow", () => {
     expect(candidateCheckout.with?.ref).toBe(
       "${{ github.event.release.tag_name }}",
     );
-    expect(
-      candidate.steps.some((step) => step.run?.includes("npm run check:dist")),
-    ).toBe(true);
     expect(
       String(candidateArtifact.with?.path).trim().split("\n").sort(),
     ).toEqual(["dist/index.js", "package-lock.json", "package.json"]);

@@ -45,7 +45,7 @@ jobs:
           set -euo pipefail
           npm ci --ignore-scripts
           node .github/scripts/prepare-release.mjs
-          npm run check:dist
+          npm run build
           changed_paths="$(git diff --name-only)"
           while IFS= read -r changed_path; do
             case "$changed_path" in
