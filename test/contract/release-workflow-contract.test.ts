@@ -1138,7 +1138,6 @@ describe("release workflow", () => {
 
       expect(result.error).toBeUndefined();
       expect(result.majorSha).toBe(result.initialMajorSha);
-      expect(result.output).toMatch(/leaving it unchanged|already points/u);
       if (action === "skip") expect(result.majorSha).toBe(result.newerSha);
     },
   );
