@@ -83,7 +83,9 @@ function runCandidateConstruction(
 ): CandidateConstructionResult {
   const candidateRun = requiredStep(
     workflow().jobs.candidate.steps,
-    (step) => step.name === "Build and validate the release candidate",
+    (step) =>
+      step.env?.RELEASE_TAG === "${{ github.event.release.tag_name }}" &&
+      (step.run?.includes(".github/scripts/prepare-release.mjs") ?? false),
     "release candidate construction",
   ).run!;
   const directory = mkdtempSync(join(tmpdir(), "prek-release-construction-"));
@@ -725,12 +727,17 @@ describe("release workflow", () => {
   });
 
   it("builds a candidate after updating release metadata", () => {
-    const result = runCandidateConstruction("v2.0.7", "2.0.4");
+    const currentVersion = "1.2.3";
+    const releaseVersion = "1.2.4";
+    const result = runCandidateConstruction(
+      `v${releaseVersion}`,
+      currentVersion,
+    );
 
     expect(result.error).toBeUndefined();
-    expect(result.packageVersion).toBe("2.0.7");
-    expect(result.lockVersion).toBe("2.0.7");
-    expect(result.bundle).toContain('var version = "2.0.7";');
+    expect(result.packageVersion).toBe(releaseVersion);
+    expect(result.lockVersion).toBe(releaseVersion);
+    expect(result.bundle).toContain(`var version = "${releaseVersion}";`);
   });
 
   it("isolates candidate construction from privileged release mutation", () => {
