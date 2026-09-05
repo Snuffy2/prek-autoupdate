@@ -482,159 +482,207 @@ function runPrereleaseValidation(releaseTag: string): Error | undefined {
   }
 }
 
+type ReleaseUpdateAction = "create" | "noop" | "skip" | "update";
+type ReleaseUpdateFailure =
+  "create-race" | "major-race" | "none" | "point-mismatch" | "release-tag-move";
+
+interface ReleaseUpdateResult {
+  readonly error: Error | undefined;
+  readonly initialMajorSha: string | undefined;
+  readonly majorDirectOid: string | undefined;
+  readonly majorSha: string | undefined;
+  readonly newerSha: string;
+  readonly output: string;
+  readonly targetSha: string;
+}
+
 function runReleaseUpdate(
-  releaseTag: string,
-  targetSha: string,
-  tags: Array<{ name: string; commit: { sha: string } }>,
-  releases: Array<{
-    tag_name: string;
-    draft: boolean;
-    prerelease: boolean;
-    published_at: string | null;
-  }>,
-  failure:
-    | "none"
-    | "release-tag-move"
-    | "point-ref-race"
-    | "create-race"
-    | "major-ref-read"
-    | "major-ref-malformed"
-    | "major-peel-read"
-    | "major-peel-malformed" = "none",
-  directRefOid?: string,
-  pointRefOid = targetSha,
-  pointTagDepth = 0,
-  movingTagDepth = directRefOid === undefined ? 0 : 1,
-): string {
+  action: ReleaseUpdateAction,
+  failure: ReleaseUpdateFailure = "none",
+  annotatedMajor = false,
+  staleListedPointSha = false,
+): ReleaseUpdateResult {
   const directory = mkdtempSync(
     join(tmpdir(), "prek-autoupdate-release-write-"),
   );
-  const ghPath = join(directory, "gh");
-  const sleepPath = join(directory, "sleep");
-  const callsPath = join(directory, "calls");
+  const remote = join(directory, "remote.git");
+  const workspace = join(directory, "workspace");
+  const binDirectory = join(directory, "bin");
+  const ghPath = join(binDirectory, "gh");
+  const gitPath = join(binDirectory, "git");
   const pointReadsPath = join(directory, "point-reads");
-  const releaseMatch =
-    /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.exec(releaseTag);
-  if (!releaseMatch) {
-    throw new Error("release update fixture requires a valid release tag");
-  }
-  const majorTag = `v${releaseMatch[1]}`;
-  const movingTagCommitSha =
-    tags.find((tag) => tag.name === majorTag)?.commit.sha ?? "";
-  const tagChain = (
-    firstOid: string,
-    depth: number,
-    finalOid: string,
-    namespace: string,
-  ) => {
-    const tagOids = Array.from({ length: depth }, (_, index) =>
-      index === 0
-        ? firstOid
-        : `${namespace}${(index + 1).toString(16).padStart(39, "0")}`,
-    );
-    return tagOids.map((oid, index) => ({
-      oid,
-      nextOid: tagOids[index + 1] ?? finalOid,
-      nextType: index + 1 < tagOids.length ? "tag" : "commit",
-    }));
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const runGit = (arguments_: string[]): string =>
+    execFileSync(realGit, arguments_, {
+      cwd: workspace,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  const remoteOid = (ref: string): string | undefined => {
+    try {
+      return runGit(["--git-dir", remote, "rev-parse", "--verify", ref]);
+    } catch {
+      return undefined;
+    }
   };
-  const pointTagOid = "e".repeat(40);
-  const observedDirectRefOid = directRefOid ?? movingTagCommitSha;
-  const pointChain = tagChain(pointTagOid, pointTagDepth, pointRefOid, "1");
-  const movingChain = tagChain(
-    observedDirectRefOid,
-    movingTagDepth,
-    movingTagCommitSha,
-    "2",
-  );
-  const pointTagResponses = pointChain
-    .map(
-      ({ oid, nextOid, nextType }) =>
-        `elif [[ "$*" == "api repos/$GITHUB_REPOSITORY/git/tags/${oid} --jq .object | [.sha, .type] | @tsv" ]]; then\n  printf '%s\\t%s\\n' '${nextOid}' '${nextType}'`,
-    )
-    .join("\n");
-  const movingTagResponses = movingChain
-    .map(
-      ({ oid, nextOid, nextType }) =>
-        `elif [[ "$*" == "api repos/$GITHUB_REPOSITORY/git/tags/${oid} --jq .object | [.sha, .type] | @tsv" ]]; then\n  [[ "$FAILURE" != "major-peel-read" ]] || exit 32\n  if [[ "$FAILURE" == "major-peel-malformed" ]]; then printf '%s\\n' 'incomplete'; exit 0; fi\n  printf '%s\\t%s\\n' '${nextOid}' '${nextType}'`,
-    )
-    .join("\n");
-  writeFileSync(
-    ghPath,
-    `#!/usr/bin/env bash
+  try {
+    mkdirSync(binDirectory);
+    execFileSync(realGit, ["init", "--bare", remote], { stdio: "ignore" });
+    execFileSync(realGit, ["init", "--initial-branch=main", workspace], {
+      stdio: "ignore",
+    });
+    runGit(["config", "user.name", "Release test"]);
+    runGit(["config", "user.email", "test@example.invalid"]);
+    runGit(["remote", "add", "origin", remote]);
+    const commit = (message: string): string => {
+      writeFileSync(join(workspace, "version"), `${message}\n`);
+      runGit(["add", "version"]);
+      runGit(["commit", "-m", message]);
+      return runGit(["rev-parse", "HEAD"]);
+    };
+    const oldSha = commit("old release");
+    const targetSha = commit("target release");
+    const newerSha = commit("newer release");
+    const raceSha = commit("racing update");
+    const pointSha = failure === "point-mismatch" ? raceSha : targetSha;
+
+    runGit(["tag", "v1.9.9", oldSha]);
+    runGit(["tag", "-a", "v1.10.0", "-m", "Release v1.10.0", pointSha]);
+    if (action === "skip") {
+      runGit(["tag", "-a", "v1.11.0", "-m", "Release v1.11.0", newerSha]);
+    }
+    if (action !== "create") {
+      const majorSha =
+        action === "skip" ? newerSha : action === "noop" ? targetSha : oldSha;
+      runGit(
+        annotatedMajor
+          ? ["tag", "-a", "v1", "-m", "Moving v1", majorSha]
+          : ["tag", "v1", majorSha],
+      );
+    }
+    runGit(["push", "origin", "HEAD:refs/heads/main"]);
+    runGit(["push", "origin", "refs/tags/v1.9.9", "refs/tags/v1.10.0"]);
+    if (action === "skip") runGit(["push", "origin", "refs/tags/v1.11.0"]);
+    if (action !== "create") runGit(["push", "origin", "refs/tags/v1"]);
+
+    const initialMajorSha =
+      remoteOid("refs/tags/v1^{}") ?? remoteOid("refs/tags/v1");
+    const listedPointSha = staleListedPointSha ? oldSha : targetSha;
+    const tags = [
+      ...(action === "create"
+        ? []
+        : [
+            {
+              name: "v1",
+              commit: {
+                sha:
+                  action === "skip"
+                    ? newerSha
+                    : action === "noop"
+                      ? targetSha
+                      : oldSha,
+              },
+            },
+          ]),
+      { name: "v1.9.9", commit: { sha: oldSha } },
+      { name: "v1.10.0", commit: { sha: listedPointSha } },
+      ...(action === "skip"
+        ? [{ name: "v1.11.0", commit: { sha: newerSha } }]
+        : []),
+    ];
+    const releases = tags
+      .filter((tag) => tag.name !== "v1")
+      .map((tag) => ({
+        tag_name: tag.name,
+        draft: false,
+        prerelease: false,
+        published_at: "2026-01-01T00:00:00Z",
+      }));
+    writeFileSync(
+      ghPath,
+      `#!/usr/bin/env bash
 set -euo pipefail
-printf '%s\\n' "$*" >> "$CALLS_PATH"
 if [[ "$*" == *"tags?per_page=100"* ]]; then
   printf '%s' "$TAGS_JSON"
 elif [[ "$*" == *"releases?per_page=100"* ]]; then
   printf '%s' "$RELEASES_JSON"
-elif [[ "$*" == "api repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG --jq .object | [.sha, .type] | @tsv" ]]; then
-  if [[ "$FAILURE" == "release-tag-move" && -s "$POINT_READS_PATH" ]]; then
-    printf '%s\t%s\n' "$MOVED_POINT_REF_OID" 'tag'
-  else
-    printf '%s\t%s\n' "$POINT_DIRECT_REF_OID" "$POINT_DIRECT_REF_TYPE"
-  fi
-  printf '%s\n' read >> "$POINT_READS_PATH"
-elif [[ "$*" == "api repos/$GITHUB_REPOSITORY/git/tags/$MOVED_POINT_REF_OID --jq .object | [.sha, .type] | @tsv" ]]; then
-  printf '%s\t%s\n' "$TARGET_SHA" 'commit'
-elif [[ "$*" == "api repos/$GITHUB_REPOSITORY/git/ref/tags/$MAJOR_TAG --jq .object | [.sha, .type] | @tsv" ]]; then
-  [[ "$FAILURE" != "major-ref-read" ]] || exit 31
-  if [[ "$FAILURE" == "major-ref-malformed" ]]; then printf '%s\n' 'not-an-object'; exit 0; fi
-  printf '%s\t%s\n' "$DIRECT_REF_OID" "$DIRECT_REF_TYPE"
-${pointTagResponses}
-${movingTagResponses}
-elif [[ "$*" == "api repos/$GITHUB_REPOSITORY --jq .node_id" ]]; then
-  printf '%s\n' 'R_repo_node'
-elif [[ "$*" == api\\ graphql* ]]; then
-  [[ "$FAILURE" != "create-race" ]] || exit 1
-  if [[ "$FAILURE" == "point-ref-race" && "$*" == *'name: $pointName'* && "$*" == *'beforeOid: $pointOid'* && "$*" == *'afterOid: $pointOid'* && "$*" == *"-f pointName=refs/tags/$RELEASE_TAG"* && "$*" == *"-f pointOid=$POINT_DIRECT_REF_OID"* ]]; then
-    exit 1
-  fi
-  printf '%s\n' '{"data":{"updateRefs":{"clientMutationId":null}}}'
 else
-  printf 'unexpected gh call: %s\n' "$*" >&2
+  printf 'unexpected gh call: %s\\n' "$*" >&2
   exit 2
 fi
 `,
-  );
-  chmodSync(ghPath, 0o755);
-  writeFileSync(sleepPath, "#!/usr/bin/env bash\nexit 0\n");
-  chmodSync(sleepPath, 0o755);
-  try {
+    );
+    chmodSync(ghPath, 0o755);
+    writeFileSync(
+      gitPath,
+      `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "ls-remote" && "$*" == *"refs/tags/$RELEASE_TAG"* ]]; then
+  count=0
+  [[ ! -f "$POINT_READS_PATH" ]] || read -r count < "$POINT_READS_PATH"
+  ((count += 1))
+  printf '%s\\n' "$count" > "$POINT_READS_PATH"
+  if [[ "$FAILURE" == "release-tag-move" && "$count" -ge 2 ]]; then
+    "$REAL_GIT" --git-dir="$REMOTE_PATH" update-ref "refs/tags/$RELEASE_TAG" "$RACE_SHA"
+  fi
+elif [[ "$1" == "push" ]]; then
+  if [[ "$FAILURE" == "major-race" || "$FAILURE" == "create-race" ]]; then
+    "$REAL_GIT" --git-dir="$REMOTE_PATH" update-ref "refs/tags/$MAJOR_TAG" "$RACE_SHA"
+  fi
+fi
+exec "$REAL_GIT" "$@"
+`,
+    );
+    chmodSync(gitPath, 0o755);
+
+    let output = "";
+    let error: Error | undefined;
     try {
-      execFileSync("bash", [resolve(".github/scripts/update-major-tag.sh")], {
-        cwd: resolve("."),
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          PATH: `${directory}:${process.env.PATH}`,
-          CALLS_PATH: callsPath,
-          POINT_READS_PATH: pointReadsPath,
-          TAGS_JSON: JSON.stringify([tags]),
-          RELEASES_JSON: JSON.stringify([releases]),
-          DIRECT_REF_OID: observedDirectRefOid,
-          DIRECT_REF_TYPE: directRefOid === undefined ? "commit" : "tag",
-          MOVING_TAG_COMMIT_SHA: movingTagCommitSha,
-          MAJOR_TAG: majorTag,
-          POINT_DIRECT_REF_OID: pointTagDepth === 0 ? pointRefOid : pointTagOid,
-          POINT_DIRECT_REF_TYPE: pointTagDepth === 0 ? "commit" : "tag",
-          POINT_REF_OID: pointRefOid,
-          MOVED_POINT_REF_OID: "d".repeat(40),
-          FAILURE: failure,
-          GITHUB_REPOSITORY: "owner/repository",
-          GITHUB_WORKSPACE: resolve("."),
-          RELEASE_TAG: releaseTag,
-          TARGET_SHA: targetSha,
+      output = execFileSync(
+        "bash",
+        [resolve(".github/scripts/update-major-tag.sh")],
+        {
+          cwd: workspace,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            FAILURE: failure,
+            GITHUB_REPOSITORY: "owner/repository",
+            MAJOR_TAG: "v1",
+            PATH: `${binDirectory}:${process.env.PATH}`,
+            POINT_READS_PATH: pointReadsPath,
+            RACE_SHA: raceSha,
+            REAL_GIT: realGit,
+            RELEASES_JSON: JSON.stringify([releases]),
+            RELEASE_TAG: "v1.10.0",
+            REMOTE_PATH: remote,
+            TAGS_JSON: JSON.stringify([tags]),
+            TARGET_SHA: targetSha,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
         },
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-    } catch (error) {
-      const stderr = (error as { stderr?: Buffer | string }).stderr;
-      throw new Error(stderr?.toString().trim() || "release update failed", {
-        cause: error,
-      });
+      );
+    } catch (caught) {
+      const failureOutput = caught as {
+        stderr?: Buffer | string;
+        stdout?: Buffer | string;
+      };
+      error = new Error(
+        failureOutput.stderr?.toString().trim() ||
+          failureOutput.stdout?.toString().trim() ||
+          "release update failed",
+        { cause: caught },
+      );
     }
-    return readFileSync(callsPath, "utf8");
+    return {
+      error,
+      initialMajorSha,
+      majorDirectOid: remoteOid("refs/tags/v1"),
+      majorSha: remoteOid("refs/tags/v1^{}") ?? remoteOid("refs/tags/v1"),
+      newerSha,
+      output,
+      targetSha,
+    };
   } finally {
     rmSync(directory, { recursive: true });
   }
@@ -1045,356 +1093,81 @@ describe("release workflow", () => {
     ).toBe(`update\t${survivingPendingSha}\t${runningSha}`);
   });
 
-  it("uses an annotated moving tag's direct ref OID in the major-tag CAS", () => {
-    const oldSha = "1".repeat(40);
-    const targetSha = "2".repeat(40);
-    const annotatedTagOid = "a".repeat(40);
-    const releases = ["v1.9.9", "v1.10.0"].map((tagName) => ({
-      tag_name: tagName,
-      draft: false,
-      prerelease: false,
-      published_at: "2026-01-01T00:00:00Z",
-    }));
-    const calls = runReleaseUpdate(
-      "v1.10.0",
-      targetSha,
-      [
-        { name: "v1", commit: { sha: oldSha } },
-        { name: "v1.9.9", commit: { sha: oldSha } },
-        { name: "v1.10.0", commit: { sha: targetSha } },
-      ],
-      releases,
-      "none",
-      annotatedTagOid,
-    );
-
-    expect(calls).toContain(
-      "api repos/owner/repository/git/ref/tags/v1.10.0 " +
-        "--jq .object | [.sha, .type] | @tsv",
-    );
-    expect(calls).toContain(
-      "api repos/owner/repository/git/ref/tags/v1 " +
-        "--jq .object | [.sha, .type] | @tsv",
-    );
-    expect(calls).toContain(
-      `api repos/owner/repository/git/tags/${annotatedTagOid} ` +
-        "--jq .object | [.sha, .type] | @tsv",
-    );
-    expect(calls).toContain("api repos/owner/repository --jq .node_id");
-    expect(calls).toContain("api graphql");
-    expect(calls).toContain("-F repositoryId=R_repo_node");
-    expect(calls).toContain(`-f pointOid=${targetSha}`);
-    expect(calls).toContain(`-f majorBeforeOid=${annotatedTagOid}`);
-    expect(calls).not.toContain(`-f majorBeforeOid=${oldSha}`);
-    expect(calls).toContain(`-f majorAfterOid=${targetSha}`);
-  });
-
-  it("keeps multi-level point and moving tag peel chains distinct", () => {
-    const oldSha = "1".repeat(40);
-    const targetSha = "2".repeat(40);
-    const releases = ["v1.9.9", "v1.10.0"].map((tagName) => ({
-      tag_name: tagName,
-      draft: false,
-      prerelease: false,
-      published_at: "2026-01-01T00:00:00Z",
-    }));
-    const calls = runReleaseUpdate(
-      "v1.10.0",
-      targetSha,
-      [
-        { name: "v1", commit: { sha: oldSha } },
-        { name: "v1.9.9", commit: { sha: oldSha } },
-        { name: "v1.10.0", commit: { sha: targetSha } },
-      ],
-      releases,
-      "none",
-      "a".repeat(40),
-      targetSha,
-      2,
-      2,
-    );
-
-    const pointChainOid = `1${"2".padStart(39, "0")}`;
-    const movingChainOid = `2${"2".padStart(39, "0")}`;
-    expect(calls).toContain(`git/tags/${pointChainOid}`);
-    expect(calls).toContain(`git/tags/${movingChainOid}`);
-    expect(calls).toContain("api graphql");
-    expect(calls).toContain(`-f pointOid=${"e".repeat(40)}`);
-  });
-
   it.each([
-    ["update", 0],
-    ["update", 1],
-    ["create", 0],
-    ["create", 1],
+    ["lightweight", false],
+    ["annotated", true],
   ] as const)(
-    "atomically rejects %s movement with point-tag depth %s",
-    (action, pointTagDepth) => {
-      const oldSha = "1".repeat(40);
-      const targetSha = "2".repeat(40);
-      const tags = [
-        ...(action === "update"
-          ? [
-              { name: "v1", commit: { sha: oldSha } },
-              { name: "v1.9.9", commit: { sha: oldSha } },
-            ]
-          : []),
-        { name: "v1.10.0", commit: { sha: targetSha } },
-      ];
-      const releases = [
-        ...(action === "update"
-          ? [
-              {
-                tag_name: "v1.9.9",
-                draft: false,
-                prerelease: false,
-                published_at: "2026-01-01T00:00:00Z",
-              },
-            ]
-          : []),
-        {
-          tag_name: "v1.10.0",
-          draft: false,
-          prerelease: false,
-          published_at: "2026-01-01T00:00:00Z",
-        },
-      ];
+    "updates an existing %s moving tag through a real Git remote",
+    (_kind, annotated) => {
+      const result = runReleaseUpdate("update", "none", annotated);
 
-      expect(() =>
-        runReleaseUpdate(
-          "v1.10.0",
-          targetSha,
-          tags,
-          releases,
-          "point-ref-race",
-          undefined,
-          targetSha,
-          pointTagDepth,
-        ),
-      ).toThrow();
+      expect(result.error).toBeUndefined();
+      expect(result.initialMajorSha).not.toBe(result.targetSha);
+      expect(result.majorSha).toBe(result.targetSha);
+      expect(result.majorDirectOid).toBe(result.targetSha);
     },
   );
 
-  it("accepts a stale paginated SHA after verifying the exact release ref", () => {
-    const staleSha = "1".repeat(40);
-    const targetSha = "2".repeat(40);
-    const calls = runReleaseUpdate(
-      "v1.10.0",
-      targetSha,
-      [{ name: "v1.10.0", commit: { sha: staleSha } }],
-      [
-        {
-          tag_name: "v1.10.0",
-          draft: false,
-          prerelease: false,
-          published_at: "2026-01-01T00:00:00Z",
-        },
-      ],
-    );
+  it("creates a missing moving tag through a real Git remote", () => {
+    const result = runReleaseUpdate("create");
 
-    const exactRefCall = "git/ref/tags/v1.10.0";
-    const tagListCall = "tags?per_page=100";
-    expect(calls).toContain(exactRefCall);
-    expect(calls).toContain(tagListCall);
-    expect(calls.indexOf(exactRefCall)).toBeLessThan(
-      calls.indexOf(tagListCall),
-    );
-    expect(calls).toContain(`-f majorAfterOid=${targetSha}`);
+    expect(result.error).toBeUndefined();
+    expect(result.initialMajorSha).toBeUndefined();
+    expect(result.majorSha).toBe(result.targetSha);
+  });
+
+  it.each(["noop", "skip"] as const)(
+    "leaves the moving tag unchanged for a %s decision",
+    (action) => {
+      const result = runReleaseUpdate(action);
+
+      expect(result.error).toBeUndefined();
+      expect(result.majorSha).toBe(result.initialMajorSha);
+      expect(result.output).toMatch(/leaving it unchanged|already points/u);
+      if (action === "skip") expect(result.majorSha).toBe(result.newerSha);
+    },
+  );
+
+  it("accepts a stale paginated SHA after verifying the exact remote tag", () => {
+    const result = runReleaseUpdate("create", "none", false, true);
+
+    expect(result.error).toBeUndefined();
+    expect(result.majorSha).toBe(result.targetSha);
   });
 
   it("fails closed when the exact finalized release ref does not match", () => {
-    const targetSha = "2".repeat(40);
+    const result = runReleaseUpdate("update", "point-mismatch");
 
-    expect(() =>
-      runReleaseUpdate(
-        "v1.10.0",
-        targetSha,
-        [{ name: "v1.10.0", commit: { sha: targetSha } }],
-        [],
-        "none",
-        undefined,
-        "3".repeat(40),
-      ),
-    ).toThrow(/does not match its exact finalized tag ref/u);
-  });
-
-  it("fails closed when finalized release tag peeling exceeds the safe limit", () => {
-    const targetSha = "2".repeat(40);
-
-    expect(() =>
-      runReleaseUpdate(
-        "v1.10.0",
-        targetSha,
-        [{ name: "v1.10.0", commit: { sha: targetSha } }],
-        [],
-        "none",
-        undefined,
-        targetSha,
-        17,
-      ),
-    ).toThrow(/Annotated release tag exceeds maximum peel depth of 16/u);
+    expect(result.error?.message).toMatch(
+      /does not match its exact finalized tag ref/u,
+    );
+    expect(result.majorSha).toBe(result.initialMajorSha);
   });
 
   it.each([
-    ["major-ref-read", /Unable to read major tag ref v1 from GitHub/u],
-    ["major-ref-malformed", /GitHub returned an invalid major tag ref v1/u],
-    ["major-peel-read", /Unable to read annotated major tag object/u],
-    [
-      "major-peel-malformed",
-      /GitHub returned an invalid annotated major tag object/u,
-    ],
-  ] as const)("fails closed with diagnostics for %s", (failure, message) => {
-    const oldSha = "1".repeat(40);
-    const targetSha = "2".repeat(40);
-    const releases = ["v1.9.9", "v1.10.0"].map((tagName) => ({
-      tag_name: tagName,
-      draft: false,
-      prerelease: false,
-      published_at: "2026-01-01T00:00:00Z",
-    }));
+    ["update", "major-race"],
+    ["create", "create-race"],
+  ] as const)(
+    "rejects a competing %s through the real Git lease",
+    (action, failure) => {
+      const result = runReleaseUpdate(action, failure, action === "update");
 
-    expect(() =>
-      runReleaseUpdate(
-        "v1.10.0",
-        targetSha,
-        [
-          { name: "v1", commit: { sha: oldSha } },
-          { name: "v1.9.9", commit: { sha: oldSha } },
-          { name: "v1.10.0", commit: { sha: targetSha } },
-        ],
-        releases,
-        failure,
-        "a".repeat(40),
-      ),
-    ).toThrow(message);
-  });
-
-  it("fails closed when moving major tag peeling exceeds the safe limit", () => {
-    const oldSha = "1".repeat(40);
-    const targetSha = "2".repeat(40);
-    const releases = ["v1.9.9", "v1.10.0"].map((tagName) => ({
-      tag_name: tagName,
-      draft: false,
-      prerelease: false,
-      published_at: "2026-01-01T00:00:00Z",
-    }));
-
-    expect(() =>
-      runReleaseUpdate(
-        "v1.10.0",
-        targetSha,
-        [
-          { name: "v1", commit: { sha: oldSha } },
-          { name: "v1.9.9", commit: { sha: oldSha } },
-          { name: "v1.10.0", commit: { sha: targetSha } },
-        ],
-        releases,
-        "none",
-        "a".repeat(40),
-        targetSha,
-        0,
-        17,
-      ),
-    ).toThrow(/Annotated major tag exceeds maximum peel depth of 16/u);
-  });
-
-  it("rejects release-tag movement before updating the major tag", () => {
-    const oldSha = "1".repeat(40);
-    const targetSha = "2".repeat(40);
-    const releases = ["v1.9.9", "v1.10.0"].map((tagName) => ({
-      tag_name: tagName,
-      draft: false,
-      prerelease: false,
-      published_at: "2026-01-01T00:00:00Z",
-    }));
-
-    expect(() =>
-      runReleaseUpdate(
-        "v1.10.0",
-        targetSha,
-        [
-          { name: "v1", commit: { sha: oldSha } },
-          { name: "v1.9.9", commit: { sha: oldSha } },
-          { name: "v1.10.0", commit: { sha: targetSha } },
-        ],
-        releases,
-        "release-tag-move",
-      ),
-    ).toThrow(/changed while its update was being prepared/u);
-  });
-
-  it.each(["skip", "noop"] as const)(
-    "rejects release-tag movement before completing a %s decision",
-    (action) => {
-      const targetSha = "2".repeat(40);
-      const newerSha = "3".repeat(40);
-      const tags =
-        action === "skip"
-          ? [
-              { name: "v1", commit: { sha: newerSha } },
-              { name: "v1.10.0", commit: { sha: targetSha } },
-              { name: "v1.11.0", commit: { sha: newerSha } },
-            ]
-          : [
-              { name: "v1", commit: { sha: targetSha } },
-              { name: "v1.10.0", commit: { sha: targetSha } },
-            ];
-      const releases = tags
-        .filter((tag) => tag.name !== "v1")
-        .map((tag) => ({
-          tag_name: tag.name,
-          draft: false,
-          prerelease: false,
-          published_at: "2026-01-01T00:00:00Z",
-        }));
-
-      expect(() =>
-        runReleaseUpdate(
-          "v1.10.0",
-          targetSha,
-          tags,
-          releases,
-          "release-tag-move",
-        ),
-      ).toThrow(/changed while its update was being prepared/u);
+      expect(result.error).toBeDefined();
+      expect(result.majorSha).not.toBe(result.targetSha);
     },
   );
 
-  it("uses absence CAS and rejects a competing major-tag creation", () => {
-    const targetSha = "2".repeat(40);
-    const releases = [
-      {
-        tag_name: "v1.10.0",
-        draft: false,
-        prerelease: false,
-        published_at: "2026-01-01T00:00:00Z",
-      },
-    ];
+  it.each(["update", "create", "noop", "skip"] as const)(
+    "rejects release-tag movement before completing a %s decision",
+    (action) => {
+      const result = runReleaseUpdate(action, "release-tag-move");
 
-    const calls = runReleaseUpdate(
-      "v1.10.0",
-      targetSha,
-      [{ name: "v1.10.0", commit: { sha: targetSha } }],
-      releases,
-      "none",
-      undefined,
-      targetSha,
-      1,
-    );
-    expect(calls).toContain(
-      "-f majorBeforeOid=0000000000000000000000000000000000000000",
-    );
-
-    expect(() =>
-      runReleaseUpdate(
-        "v1.10.0",
-        targetSha,
-        [{ name: "v1.10.0", commit: { sha: targetSha } }],
-        releases,
-        "create-race",
-      ),
-    ).toThrow();
-  });
+      expect(result.error?.message).toMatch(
+        /changed while its update was being prepared/u,
+      );
+      expect(result.majorSha).toBe(result.initialMajorSha);
+    },
+  );
 
   it("fails closed when moving-tag monotonicity cannot be proven", () => {
     const targetSha = "2".repeat(40);
