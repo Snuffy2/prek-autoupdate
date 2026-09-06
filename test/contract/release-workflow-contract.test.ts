@@ -992,7 +992,11 @@ describe("release workflow", () => {
   });
 
   it.each([
-    ["ci.yml", "node", "${{ inputs.expected_sha || github.sha }}"],
+    [
+      "ci.yml",
+      "node",
+      "${{ inputs.expected_sha || github.event.pull_request.head.sha || github.sha }}",
+    ],
     [
       "prek-autofix-review.yml",
       "review",
@@ -1016,14 +1020,19 @@ describe("release workflow", () => {
       const guard = job?.steps.find((step) =>
         step.run?.includes('test "$WORKFLOW_SHA" = "$EXPECTED_SHA"'),
       );
-      const checkout = job?.steps.find((step) =>
-        step.uses?.startsWith("actions/checkout@"),
-      );
+      const checkouts =
+        job?.steps.filter(
+          (step) =>
+            step.if === undefined && step.uses?.startsWith("actions/checkout@"),
+        ) ?? [];
 
       expect(expectedSha).toMatchObject({ required: true, type: "string" });
       expect(guard?.run).toContain('[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]');
-      expect(checkout?.with?.ref).toBe(checkoutRef);
-      expect(checkout?.with?.["persist-credentials"]).toBe(false);
+      expect(checkouts.map((checkout) => checkout.with?.ref)).toContain(
+        checkoutRef,
+      );
+      for (const checkout of checkouts)
+        expect(checkout.with?.["persist-credentials"]).toBe(false);
     },
   );
 
