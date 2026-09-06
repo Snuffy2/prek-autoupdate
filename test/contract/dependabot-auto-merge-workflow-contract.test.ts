@@ -44,6 +44,7 @@ function dependabotCommit(sha = headSha) {
   return {
     author: { login: "dependabot[bot]" },
     commit: { verification: { verified: true } },
+    committer: { login: "web-flow" },
     parents: [],
     sha,
   };
@@ -126,6 +127,7 @@ afterEach(() => {
 });
 
 interface WorkflowStep {
+  env?: Record<string, string>;
   if?: string;
   run?: string;
   uses?: string;
@@ -244,7 +246,12 @@ function trustedCheckoutPrecedesAuthorization(
 }
 
 function assertsAncestryDataflow(job: WorkflowJob) {
-  const run = authorizationStep(job).run;
+  const authorization = authorizationStep(job);
+  const run = authorization.run;
+  expect(authorization.env?.BASE_SHA).toBe(
+    "${{ github.event.pull_request.base.sha }}",
+  );
+  expect(run).toContain('base_sha="${BASE_SHA}"');
   expect(run).toContain("pulls/${PR_NUMBER}/files");
   expect(run).toContain("pulls/${PR_NUMBER}/commits");
   expect(run).toContain("compare/${second_parent}...${base_sha}");
@@ -278,6 +285,14 @@ describe("Dependabot auto-merge authorization", () => {
       };
       expect(authorizeDependabotUpdate(input)).toBe("npm");
     }
+  });
+
+  it("rejects missing or maintainer committers for a direct Dependabot root", () => {
+    for (const root of [
+      { ...dependabotCommit(), committer: undefined },
+      { ...dependabotCommit(), committer: { login: "maintainer" } },
+    ])
+      expect(() => authorize({ commits: [root] })).toThrow();
   });
 
   it("authorizes npm lock-only updates from an npm base", () => {
@@ -407,6 +422,22 @@ describe("Dependabot auto-merge authorization", () => {
         ),
       }),
     ).toBe("npm");
+  });
+
+  it("rejects missing or maintainer committers for an Update branch root", () => {
+    for (const root of [
+      { ...dependabotCommit(dependabotSha), committer: undefined },
+      {
+        ...dependabotCommit(dependabotSha),
+        committer: { login: "maintainer" },
+      },
+    ]) {
+      const commits: object[] = updateChain();
+      commits[0] = root;
+      expect(() =>
+        authorize({ ancestryProofs: updateChainProofs(), commits }),
+      ).toThrow();
+    }
   });
 
   it("rejects absent, arbitrary, diverged, and mismatched ancestry evidence", () => {
