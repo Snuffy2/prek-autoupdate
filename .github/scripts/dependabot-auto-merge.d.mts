@@ -17,7 +17,7 @@ export interface DependabotPullRequestEvent {
 }
 
 export interface DependabotAuthorizationInput {
-  actor?: string;
+  ancestryProofs?: unknown[];
   changedFiles: string[];
   commits: unknown[];
   event: DependabotPullRequestEvent;
