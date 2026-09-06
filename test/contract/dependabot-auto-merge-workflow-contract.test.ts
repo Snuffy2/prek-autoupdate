@@ -1,222 +1,181 @@
-import { spawnSync } from "node:child_process";
-import {
-  chmodSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { parse } from "yaml";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
-interface Step {
-  run?: string;
-  uses?: string;
+import { authorizeDependabotUpdate } from "../../.github/scripts/dependabot-auto-merge.mjs";
+
+const dependabotSha = "1".repeat(40);
+const firstBaseSha = "2".repeat(40);
+const firstUpdateSha = "3".repeat(40);
+const currentBaseSha = "4".repeat(40);
+const headSha = "5".repeat(40);
+const temporaryDirectories: string[] = [];
+
+function pullRequestEvent(action = "synchronize") {
+  return {
+    action,
+    repository: {
+      default_branch: "main",
+      fork: false,
+      full_name: "Snuffy2/prek-autoupdate",
+    },
+    pull_request: {
+      base: { ref: "main", sha: currentBaseSha },
+      head: {
+        ref: "dependabot/npm_and_yarn/vitest-4.0.0",
+        repo: { full_name: "Snuffy2/prek-autoupdate" },
+        sha: headSha,
+      },
+      user: { login: "dependabot[bot]" },
+    },
+  };
 }
 
-interface Job {
-  if?: string;
-  needs?: string | string[];
-  permissions: Record<string, string>;
-  steps: Step[];
+function dependabotCommit(sha = headSha) {
+  return {
+    author: { login: "dependabot[bot]" },
+    commit: { verification: { verified: true } },
+    parents: [],
+    sha,
+  };
 }
 
-interface Workflow {
-  jobs: Record<string, Job>;
+function updateCommit(sha: string, previous: string, base: string) {
+  return {
+    author: { login: "Snuffy2" },
+    commit: { verification: { verified: true } },
+    committer: { login: "web-flow" },
+    parents: [{ sha: previous }, { sha: base }],
+    sha,
+  };
 }
 
-function workflow(filename = "dependabot-auto-merge.yml"): Workflow {
-  return parse(
-    readFileSync(`.github/workflows/${filename}`, "utf8"),
-  ) as Workflow;
+function trustedBaseWith(path: string) {
+  const directory = mkdtempSync(join(tmpdir(), "dependabot-authorizer-"));
+  temporaryDirectories.push(directory);
+  const file = join(directory, path);
+  mkdirSync(join(file, ".."), { recursive: true });
+  writeFileSync(file, "fixture\n");
+  return directory;
 }
 
-function normalizedCondition(job: Job): string {
-  return (job.if ?? "").replaceAll(/\s+/gu, " ").trim();
-}
+afterEach(() => {
+  for (const directory of temporaryDirectories.splice(0))
+    rmSync(directory, { force: true, recursive: true });
+});
 
-function requiredJobWithCommand(
-  parsedWorkflow: Workflow,
-  command: string,
-): Job {
-  const job = Object.values(parsedWorkflow.jobs).find((candidate) =>
-    candidate.steps.some((step) => step.run?.includes(command)),
-  );
-  if (job === undefined) {
-    throw new Error(`Workflow has no job that runs ${command}`);
-  }
-  return job;
-}
-
-function requiredStepWithCommand(job: Job, command: string): Step {
-  const step = job.steps.find((candidate) => candidate.run?.includes(command));
-  if (step === undefined) {
-    throw new Error(`Job has no step that runs ${command}`);
-  }
-  return step;
-}
-
-function requiredNeeds(job: Job): string[] {
-  if (job.needs === undefined) {
-    throw new Error("Write-capable job has no verification dependency");
-  }
-  return typeof job.needs === "string" ? [job.needs] : job.needs;
-}
-
-function verifyChangedFiles(script: string, changedFiles: string[]): number {
-  const directory = mkdtempSync(join(tmpdir(), "dependabot-file-check-"));
-  const ghPath = join(directory, "gh");
-  writeFileSync(
-    ghPath,
-    "#!/usr/bin/env bash\nprintf '%s\\n' \"${CHANGED_FILES}\"\n",
-  );
-  chmodSync(ghPath, 0o755);
-
-  try {
-    return (
-      spawnSync("bash", ["-euo", "pipefail", "-c", script], {
-        env: {
-          ...process.env,
-          CHANGED_FILES: changedFiles.join("\n"),
-          GH_TOKEN: "test-token",
-          PATH: `${directory}:${process.env.PATH ?? ""}`,
-          PR_NUMBER: "1",
-          REPOSITORY: "owner/repository",
-        },
-        encoding: "utf8",
-      }).status ?? 1
-    );
-  } finally {
-    rmSync(directory, { recursive: true });
-  }
-}
-
-describe("Dependabot auto-merge workflow", () => {
-  it("keeps Node CI eligible for Dependabot pull requests", () => {
-    const nodeCi = workflow("ci.yml").jobs.node;
-
-    expect(normalizedCondition(nodeCi)).toContain(
-      "github.event.pull_request.user.login == 'dependabot[bot]'",
-    );
-    expect(nodeCi.permissions).toEqual({
-      "contents": "read",
-      "pull-requests": "read",
-    });
-    expect(requiredStepWithCommand(nodeCi, "gh api --paginate")).toBeDefined();
-  });
-
-  it("gates auto-merge behind read-only ownership and content checks", () => {
-    const dependabotWorkflow = workflow();
-    const enable = requiredJobWithCommand(
-      dependabotWorkflow,
-      "gh pr merge --auto",
-    );
-    const verificationNames = requiredNeeds(enable);
-    const verificationJobs = verificationNames.map(
-      (name) => dependabotWorkflow.jobs[name],
-    );
-    const verificationSteps = verificationJobs.flatMap((job) => job.steps);
-
-    expect(verificationJobs).not.toHaveLength(0);
-    for (const verification of verificationJobs) {
-      const condition = normalizedCondition(verification);
-      expect(condition).toContain(
-        "github.event.pull_request.user.login == 'dependabot[bot]'",
-      );
-      expect(condition).toContain(
-        "github.event.pull_request.head.repo.full_name == github.repository",
-      );
-      expect(condition).toContain(
-        "github.event.pull_request.base.ref == github.event.repository.default_branch",
-      );
-      expect(verification.permissions).toEqual({
-        "contents": "read",
-        "pull-requests": "read",
-      });
-    }
+describe("Dependabot auto-merge authorization", () => {
+  it("authorizes a verified direct npm update with its lockfile", () => {
     expect(
-      verificationSteps.some((step) =>
-        step.uses?.startsWith("dependabot/fetch-metadata@"),
-      ),
-    ).toBe(true);
-    expect(
-      verificationSteps.some((step) => step.run?.includes("gh api --paginate")),
-    ).toBe(true);
+      authorizeDependabotUpdate({
+        actor: "dependabot[bot]",
+        changedFiles: ["package.json", "package-lock.json"],
+        commits: [dependabotCommit()],
+        event: pullRequestEvent("opened"),
+      }),
+    ).toBe("npm");
   });
 
   it.each([
-    [["package-lock.json"], true],
-    [["package.json", "package-lock.json"], true],
-    [[".github/workflows/ci.yml"], true],
-    [[], false],
-    [["package.json"], false],
-    [["package-lock.json", "src/index.ts"], false],
-    [[".github/workflows/nested/ci.yml"], false],
-    [["action.yml"], false],
-  ])(
-    "accepts only supported dependency files: %j",
-    (changedFiles, accepted) => {
-      const scripts = [
-        requiredStepWithCommand(
-          requiredJobWithCommand(workflow(), "gh api --paginate"),
-          "gh api --paginate",
-        ).run,
-        requiredStepWithCommand(
-          workflow("ci.yml").jobs.node,
-          "gh api --paginate",
-        ).run,
-      ];
+    ["omits the manifest", ["package-lock.json"]],
+    ["omits the lockfile", ["package.json"]],
+    [
+      "includes a bundle",
+      ["package.json", "package-lock.json", "dist/index.js"],
+    ],
+  ])("rejects an npm update that %s", (_reason, changedFiles) => {
+    expect(() =>
+      authorizeDependabotUpdate({
+        actor: "dependabot[bot]",
+        changedFiles,
+        commits: [dependabotCommit()],
+        event: pullRequestEvent("opened"),
+      }),
+    ).toThrow();
+  });
 
-      for (const script of scripts) {
-        expect(script).toBeDefined();
-        const status = verifyChangedFiles(script ?? "", changedFiles);
-        if (accepted) {
-          expect(status).toBe(0);
-        } else {
-          expect(status).not.toBe(0);
-        }
-      }
-    },
-  );
+  it("authorizes an existing top-level workflow update", () => {
+    const event = pullRequestEvent("opened");
+    event.pull_request.head.ref =
+      "dependabot/github_actions/actions/checkout-7";
+    expect(
+      authorizeDependabotUpdate({
+        actor: "dependabot[bot]",
+        changedFiles: [".github/workflows/ci.yml"],
+        commits: [dependabotCommit()],
+        event,
+        trustedBaseDirectory: trustedBaseWith(".github/workflows/ci.yml"),
+      }),
+    ).toBe("github-actions");
+  });
 
-  it("revokes failed eligibility without mutating a cancelled run", () => {
-    const dependabotWorkflow = workflow();
-    const enable = requiredJobWithCommand(
-      dependabotWorkflow,
-      "gh pr merge --auto",
-    );
-    const cleanup = requiredJobWithCommand(
-      dependabotWorkflow,
-      "gh pr merge --disable-auto",
-    );
-    const verificationNames = requiredNeeds(enable);
-    const cleanupCondition = normalizedCondition(cleanup);
+  it("authorizes the existing root action manifest", () => {
+    const event = pullRequestEvent("opened");
+    event.pull_request.head.ref =
+      "dependabot/github_actions/actions/checkout-7";
+    expect(
+      authorizeDependabotUpdate({
+        actor: "dependabot[bot]",
+        changedFiles: ["action.yml"],
+        commits: [dependabotCommit()],
+        event,
+        trustedBaseDirectory: trustedBaseWith("action.yml"),
+      }),
+    ).toBe("github-actions");
+  });
 
-    expect(requiredNeeds(cleanup).toSorted()).toEqual(
-      verificationNames.toSorted(),
-    );
-    expect(cleanupCondition).toContain("failure() && !cancelled()");
-    for (const verificationName of verificationNames) {
-      expect(cleanupCondition).toContain(
-        `needs.${verificationName}.result == 'failure'`,
-      );
-    }
-    expect(cleanupCondition).toContain(
-      "github.event.pull_request.user.login == 'dependabot[bot]'",
-    );
-    expect(cleanupCondition).toContain("github.event.repository.fork == false");
-    expect(cleanupCondition).toContain(
-      "github.event.pull_request.head.repo.full_name == github.repository",
-    );
-    expect(cleanupCondition).toContain(
-      "github.event.pull_request.base.ref == github.event.repository.default_branch",
-    );
-    expect(cleanup.permissions).toEqual({
-      "contents": "write",
-      "pull-requests": "write",
-    });
+  it.each([
+    [".github/workflows/nested/ci.yml", ".github/workflows/ci.yml"],
+    ["action.yml", ".github/workflows/ci.yml"],
+  ])("rejects an untrusted GitHub Actions path", (changedFile, trustedFile) => {
+    const event = pullRequestEvent("opened");
+    event.pull_request.head.ref =
+      "dependabot/github_actions/actions/checkout-7";
+    expect(() =>
+      authorizeDependabotUpdate({
+        actor: "dependabot[bot]",
+        changedFiles: [changedFile],
+        commits: [dependabotCommit()],
+        event,
+        trustedBaseDirectory: trustedBaseWith(trustedFile),
+      }),
+    ).toThrow();
+  });
+
+  it("authorizes a verified GitHub Update branch chain", () => {
+    expect(
+      authorizeDependabotUpdate({
+        actor: "Snuffy2",
+        changedFiles: ["package.json", "package-lock.json"],
+        commits: [
+          dependabotCommit(dependabotSha),
+          updateCommit(firstUpdateSha, dependabotSha, firstBaseSha),
+          updateCommit(headSha, firstUpdateSha, currentBaseSha),
+        ],
+        event: pullRequestEvent(),
+      }),
+    ).toBe("npm");
+  });
+
+  it("rejects a direct maintainer edit before an Update branch merge", () => {
+    const maintainerSha = "6".repeat(40);
+    expect(() =>
+      authorizeDependabotUpdate({
+        actor: "Snuffy2",
+        changedFiles: ["package.json", "package-lock.json"],
+        commits: [
+          dependabotCommit(dependabotSha),
+          {
+            author: { login: "Snuffy2" },
+            parents: [{ sha: dependabotSha }],
+            sha: maintainerSha,
+          },
+          updateCommit(headSha, maintainerSha, currentBaseSha),
+        ],
+        event: pullRequestEvent(),
+      }),
+    ).toThrow();
   });
 });
