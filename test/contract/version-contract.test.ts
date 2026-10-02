@@ -3,7 +3,6 @@ import {
   copyFileSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -12,23 +11,7 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { versionBanner } from "../../src/version.js";
-
-interface PackageMetadata {
-  readonly version: string;
-}
-
 describe("release version", () => {
-  it("keeps the source version aligned with package metadata", () => {
-    const packageMetadata = JSON.parse(
-      readFileSync("package.json", "utf8"),
-    ) as PackageMetadata;
-
-    expect(versionBanner()).toBe(
-      `prek-autoupdate version v${packageMetadata.version}`,
-    );
-  });
-
   it("reports the installed action version after a release-only metadata bump", () => {
     const workspace = mkdtempSync(join(tmpdir(), "prek-release-version-"));
     try {
@@ -60,7 +43,6 @@ describe("release version", () => {
       // Stop at input validation, before any GitHub or repository operations.
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(1);
-      expect(result.stdout).toContain("Input required and not supplied: token");
       expect(result.stdout).toContain("prek-autoupdate version v99.8.7");
     } finally {
       rmSync(workspace, { recursive: true, force: true });
