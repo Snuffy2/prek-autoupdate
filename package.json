@@ -1,6 +1,6 @@
 {
   "name": "prek-autoupdate",
-  "version": "2.0.8",
+  "version": "2.1.0",
   "private": true,
   "description": "GitHub Action that opens and maintains prek auto-update pull requests",
   "type": "module",
