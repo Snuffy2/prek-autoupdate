@@ -96,19 +96,42 @@ immediately before each is run.
 You can usually use the defaults. Only add a `with:` value when the default does
 not match your repository.
 
-| Input            | Default                    | What it controls                                                                                                                                 |
-| ---------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `token`          | `${{ github.token }}`      | Credential used to push the update branch and manage pull requests. See [Authentication and permissions](#authentication-and-permissions).       |
-| `auto-merge`     | `false`                    | With a PAT, requests squash auto-merge for the exact pull-request revision published by the action. See [Automatic merging](#automatic-merging). |
-| `author-login`   | `github-actions[bot]`      | Fallback PR-author login used only when GitHub cannot identify the token's user. See [When to set `author-login`](#when-to-set-author-login).    |
-| `cooldown-days`  | `"7"`                      | Passed to `prek autoupdate --cooldown-days`.                                                                                                     |
-| `update-day`     | `"1"`                      | UTC day for scheduled updates: `0` is Sunday and `6` is Saturday.                                                                                |
-| `update-branch`  | `chore/prek-updates`       | The branch for the update pull request.                                                                                                          |
-| `branch-prefix`  | `chore/prek-updates`       | The branch prefix that cleanup treats as action-owned.                                                                                           |
-| `label`          | `dependencies`             | An existing repository label applied to the update PR and used to prove ownership during cleanup.                                                |
-| `commit-message` | `chore: update prek hooks` | The update commit message.                                                                                                                       |
-| `pr-title`       | `Bump prek Hooks`          | The update pull-request title.                                                                                                                   |
-| `add-paths`      | auto-detect                | Newline-separated repository-relative paths to commit. When blank, the action requires exactly one of `prek.toml` or `.pre-commit-config.yaml`.  |
+| Input            | Default               | What it controls                                                                                                                                 |
+| ---------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `token`          | `${{ github.token }}` | Credential used to push the update branch and manage pull requests. See [Authentication and permissions](#authentication-and-permissions).       |
+| `auto-merge`     | `false`               | With a PAT, requests squash auto-merge for the exact pull-request revision published by the action. See [Automatic merging](#automatic-merging). |
+| `author-login`   | `github-actions[bot]` | Fallback PR-author login used only when GitHub cannot identify the token's user. See [When to set `author-login`](#when-to-set-author-login).    |
+| `cooldown-days`  | `"7"`                 | Passed to `prek autoupdate --cooldown-days`.                                                                                                     |
+| `update-day`     | `"1"`                 | UTC day for scheduled updates: `0` is Sunday and `6` is Saturday.                                                                                |
+| `update-branch`  | `chore/prek-updates`  | The branch for the update pull request.                                                                                                          |
+| `branch-prefix`  | `chore/prek-updates`  | The branch prefix that cleanup treats as action-owned.                                                                                           |
+| `label`          | `dependencies`        | An existing repository label applied to the update PR and used to prove ownership during cleanup.                                                |
+| `commit-message` | `prefix: chore`       | YAML mapping that formats both the update commit message and pull-request title.                                                                 |
+| `add-paths`      | auto-detect           | Newline-separated repository-relative paths to commit. When blank, the action requires exactly one of `prek.toml` or `.pre-commit-config.yaml`.  |
+
+### Commit messages and pull-request titles
+
+Configure both with a `commit-message` YAML block using
+[Dependabot's commit-message options](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference#commit-message--):
+
+```yaml
+with:
+  commit-message: |
+    prefix: chore
+```
+
+This produces `chore: update prek hooks` for both the commit and PR title, which
+is also the default when no configuration is supplied.
+
+`prefix` accepts a string of up to 50 characters and defaults to `chore`. Use
+`prefix: ""` for no prefix. A colon is added when the prefix ends in a letter,
+number, `)`, or `]`. A quoted trailing space, such as `prefix: "Update "`,
+prevents the colon. Only `prefix` is supported; hook updates do not need
+separate production/development prefixes or dependency scopes.
+
+The action uses the fixed subject `update prek hooks`; it does not infer a style
+from repository history. Explicit YAML settings take precedence over legacy
+title settings.
 
 ## Output
 

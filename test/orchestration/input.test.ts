@@ -29,8 +29,8 @@ const DEFAULT_INPUTS: Readonly<Record<string, string>> = {
   "update-branch": "chore/prek-updates",
   "branch-prefix": "chore/prek-updates",
   "label": "dependencies",
-  "commit-message": "chore: update prek hooks",
-  "pr-title": "Bump prek Hooks",
+  "commit-message": "",
+  "pr-title": "",
   "add-paths": "",
 };
 const execFileAsync = promisify(execFile);
@@ -83,11 +83,93 @@ describe("parseInputs", () => {
       branchPrefix: "chore/prek-updates",
       label: "dependencies",
       commitMessage: "chore: update prek hooks",
-      prTitle: "Bump prek Hooks",
+      prTitle: "chore: update prek hooks",
       addPaths: [],
     });
     expect(core.setSecret).toHaveBeenCalledWith("token");
     expect(process.env.INPUT_TOKEN).toBeUndefined();
+  });
+
+  it.each([
+    ["prefix: fix", "fix: update prek hooks"],
+    ['"prefix": fix', "fix: update prek hooks"],
+    ["# Commit format\nprefix: ci\n", "ci: update prek hooks"],
+    ['prefix: "Update "', "Update update prek hooks"],
+    ['prefix: "chore:"', "chore: update prek hooks"],
+    ['prefix: "[hooks]"', "[hooks]: update prek hooks"],
+    ['prefix: "🔧"', "🔧 update prek hooks"],
+    ['prefix: ""', "update prek hooks"],
+    ["{}", "chore: update prek hooks"],
+    ['{"prefix":"ci"}', "ci: update prek hooks"],
+    ["prefix: " + "a".repeat(50), "a".repeat(50) + ": update prek hooks"],
+  ])("uses %j for both the commit and PR title", (input, subject) => {
+    vi.mocked(core.getInput).mockImplementation((name) =>
+      name === "commit-message" ? input : (DEFAULT_INPUTS[name] ?? ""),
+    );
+
+    expect(parseInputs()).toMatchObject({
+      commitMessage: subject,
+      prTitle: subject,
+    });
+  });
+
+  it.each([
+    ["Custom message", "", "Custom message", "Bump prek Hooks"],
+    [
+      "chore: update custom hooks",
+      "Custom title",
+      "chore: update custom hooks",
+      "Custom title",
+    ],
+    ["", "Custom title", "chore: update prek hooks", "Custom title"],
+    ["Update [hooks]", "", "Update [hooks]", "Bump prek Hooks"],
+    [
+      "chore: update hooks\n\nDetails about the update",
+      "",
+      "chore: update hooks\n\nDetails about the update",
+      "Bump prek Hooks",
+    ],
+  ])(
+    "preserves legacy string settings %j and %j",
+    (input, title, commitMessage, prTitle) => {
+      vi.mocked(core.getInput).mockImplementation((name) => {
+        if (name === "commit-message") return input;
+        if (name === "pr-title") return title;
+        return DEFAULT_INPUTS[name] ?? "";
+      });
+
+      expect(parseInputs()).toMatchObject({ commitMessage, prTitle });
+    },
+  );
+
+  it("gives explicit YAML settings priority over a legacy PR title", () => {
+    vi.mocked(core.getInput).mockImplementation((name) => {
+      if (name === "commit-message") return "prefix: fix";
+      if (name === "pr-title") return "Conflicting title";
+      return DEFAULT_INPUTS[name] ?? "";
+    });
+
+    expect(parseInputs()).toMatchObject({
+      commitMessage: "fix: update prek hooks",
+      prTitle: "fix: update prek hooks",
+    });
+  });
+
+  it.each([
+    ["prefix: [", "valid YAML mapping"],
+    ["{ }\n[]", "YAML mapping"],
+    ["prefix: fix\nprefix: ci", "valid YAML mapping"],
+    ["prefix: fix\nunknown: value", "Unknown commit-message option"],
+    ["prefix: 123", "prefix must be a single-line string"],
+    ["prefix: null", "prefix must be a single-line string"],
+    ["prefix: " + "a".repeat(51), "prefix must be a single-line string"],
+    ['prefix: "first\\nsecond"', "prefix must be a single-line string"],
+  ])("rejects invalid YAML configuration %j", (input, error) => {
+    vi.mocked(core.getInput).mockImplementation((name) =>
+      name === "commit-message" ? input : (DEFAULT_INPUTS[name] ?? ""),
+    );
+
+    expect(() => parseInputs()).toThrow(error);
   });
 
   it("deletes INPUT_TOKEN even though other action inputs remain available", () => {

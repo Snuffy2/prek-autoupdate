@@ -41,13 +41,15 @@ inputs:
     required: false
     default: dependencies
   commit-message:
-    description: Commit message for hook update commits.
+    description:
+      YAML mapping with a Dependabot-style prefix, used for both update commits
+      and pull-request titles.
     required: false
-    default: "chore: update prek hooks"
+    default: ""
   pr-title:
-    description: Title for hook update pull requests.
+    description: Deprecated compatibility input for existing workflows.
     required: false
-    default: Bump prek Hooks
+    default: ""
   add-paths:
     description:
       Newline-separated git pathspecs to commit; empty auto-detects the prek

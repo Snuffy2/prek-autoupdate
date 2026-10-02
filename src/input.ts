@@ -2,6 +2,7 @@ import * as core from "@actions/core";
 import * as github from "@actions/github";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { parseDocument } from "yaml";
 
 import type {
   ActionContext,
@@ -38,6 +39,8 @@ export function parseInputs(): ActionInputs {
   }
   const cooldownDays = core.getInput("cooldown-days", { required: true });
 
+  const messages = updateMessages();
+
   return {
     token,
     autoMerge: booleanInput("auto-merge"),
@@ -47,14 +50,73 @@ export function parseInputs(): ActionInputs {
     updateBranch: nonEmptyInput("update-branch"),
     branchPrefix: nonEmptyInput("branch-prefix"),
     label: nonEmptyInput("label"),
-    commitMessage: nonEmptyInput("commit-message"),
-    prTitle: nonEmptyInput("pr-title"),
+    ...messages,
     addPaths: core
       .getInput("add-paths")
       .split(/\r?\n/u)
       .map((path) => path.trim())
       .filter((path) => path !== ""),
   };
+}
+
+/** Resolve the shared subject, retaining legacy string inputs for existing callers. */
+function updateMessages(): Pick<ActionInputs, "commitMessage" | "prTitle"> {
+  const input = core.getInput("commit-message").trim();
+  const legacyTitle = core.getInput("pr-title").trim();
+  const defaultMessage = "chore: update prek hooks";
+  const structured =
+    input.startsWith("{") || /^(?:prefix|"prefix"|'prefix')\s*:/mu.test(input);
+
+  if (!structured) {
+    if (input !== "" || legacyTitle !== "") {
+      return {
+        commitMessage: input || defaultMessage,
+        prTitle: legacyTitle || "Bump prek Hooks",
+      };
+    }
+    return { commitMessage: defaultMessage, prTitle: defaultMessage };
+  }
+
+  const document = parseDocument(input);
+  if (document.errors.length > 0) {
+    throw new Error("commit-message must be a valid YAML mapping");
+  }
+  const options: unknown = document.toJS();
+  if (
+    typeof options !== "object" ||
+    options === null ||
+    Array.isArray(options)
+  ) {
+    throw new Error("commit-message must be a YAML mapping");
+  }
+  const settings = options as Record<string, unknown>;
+  for (const key of Object.keys(settings)) {
+    if (key !== "prefix") {
+      throw new Error(`Unknown commit-message option: ${key}`);
+    }
+  }
+  if (
+    "prefix" in settings &&
+    (typeof settings.prefix !== "string" ||
+      Array.from(settings.prefix).length > 50 ||
+      /[\r\n]/u.test(settings.prefix))
+  ) {
+    throw new Error(
+      "commit-message prefix must be a single-line string of at most 50 characters",
+    );
+  }
+
+  let prefix = (settings.prefix ?? "chore") as string;
+  if (prefix !== "") {
+    if (/[A-Za-z0-9)\]]$/u.test(prefix)) {
+      prefix += ":";
+    }
+    if (!prefix.endsWith(" ")) {
+      prefix += " ";
+    }
+  }
+  const message = `${prefix}update prek hooks`;
+  return { commitMessage: message, prTitle: message };
 }
 
 export function shouldUpdate(

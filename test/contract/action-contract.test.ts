@@ -45,10 +45,8 @@ describe("action metadata", () => {
       "chore/prek-updates",
     );
     expect(metadata.inputs.label?.default).toBe("dependencies");
-    expect(metadata.inputs["commit-message"]?.default).toBe(
-      "chore: update prek hooks",
-    );
-    expect(metadata.inputs["pr-title"]?.default).toBe("Bump prek Hooks");
+    expect(metadata.inputs["commit-message"]?.default).toBe("");
+    expect(metadata.inputs["pr-title"]?.default).toBe("");
     expect(metadata.inputs["add-paths"]?.default).toBe("");
   });
 
