@@ -40,14 +40,22 @@ inputs:
       Label applied to generated pull requests and used for ownership checks.
     required: false
     default: dependencies
+  commit-message-prefix:
+    description: Prefix applied to both update commit messages and PR titles.
+    required: false
+    default: deps
+  commit-message-title:
+    description: Shared subject for update commit messages and PR titles.
+    required: false
+    default: update prek hooks
   commit-message:
-    description: Commit message for hook update commits.
+    description: Deprecated compatibility input for existing workflows.
     required: false
-    default: "chore: update prek hooks"
+    default: ""
   pr-title:
-    description: Title for hook update pull requests.
+    description: Deprecated compatibility input for existing workflows.
     required: false
-    default: Bump prek Hooks
+    default: ""
   add-paths:
     description:
       Newline-separated git pathspecs to commit; empty auto-detects the prek

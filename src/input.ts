@@ -38,6 +38,8 @@ export function parseInputs(): ActionInputs {
   }
   const cooldownDays = core.getInput("cooldown-days", { required: true });
 
+  const messages = updateMessages();
+
   return {
     token,
     autoMerge: booleanInput("auto-merge"),
@@ -47,14 +49,44 @@ export function parseInputs(): ActionInputs {
     updateBranch: nonEmptyInput("update-branch"),
     branchPrefix: nonEmptyInput("branch-prefix"),
     label: nonEmptyInput("label"),
-    commitMessage: nonEmptyInput("commit-message"),
-    prTitle: nonEmptyInput("pr-title"),
+    ...messages,
     addPaths: core
       .getInput("add-paths")
       .split(/\r?\n/u)
       .map((path) => path.trim())
       .filter((path) => path !== ""),
   };
+}
+
+/** Resolve the shared subject, retaining legacy string inputs for existing callers. */
+function updateMessages(): Pick<ActionInputs, "commitMessage" | "prTitle"> {
+  const input = core.getInput("commit-message").trim();
+  const legacyTitle = core.getInput("pr-title").trim();
+  if (input !== "" || legacyTitle !== "") {
+    return {
+      commitMessage: input || "chore: update prek hooks",
+      prTitle: legacyTitle || "Bump prek Hooks",
+    };
+  }
+
+  let prefix = core.getInput("commit-message-prefix", {
+    trimWhitespace: false,
+  });
+  const title = nonEmptyInput("commit-message-title");
+  if (Array.from(prefix).length > 50 || /[\r\n]/u.test(prefix)) {
+    throw new Error(
+      "commit-message-prefix must be a single-line string of at most 50 characters",
+    );
+  }
+  if (/[\r\n]/u.test(title)) {
+    throw new Error("commit-message-title must be a single-line string");
+  }
+  if (prefix !== "") {
+    if (/[A-Za-z0-9)\]]$/u.test(prefix)) prefix += ":";
+    if (!prefix.endsWith(" ")) prefix += " ";
+  }
+  const message = `${prefix}${title}`;
+  return { commitMessage: message, prTitle: message };
 }
 
 export function shouldUpdate(

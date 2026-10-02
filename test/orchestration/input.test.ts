@@ -29,8 +29,10 @@ const DEFAULT_INPUTS: Readonly<Record<string, string>> = {
   "update-branch": "chore/prek-updates",
   "branch-prefix": "chore/prek-updates",
   "label": "dependencies",
-  "commit-message": "chore: update prek hooks",
-  "pr-title": "Bump prek Hooks",
+  "commit-message-prefix": "deps",
+  "commit-message-title": "update prek hooks",
+  "commit-message": "",
+  "pr-title": "",
   "add-paths": "",
 };
 const execFileAsync = promisify(execFile);
@@ -82,12 +84,132 @@ describe("parseInputs", () => {
       updateBranch: "chore/prek-updates",
       branchPrefix: "chore/prek-updates",
       label: "dependencies",
-      commitMessage: "chore: update prek hooks",
-      prTitle: "Bump prek Hooks",
+      commitMessage: "deps: update prek hooks",
+      prTitle: "deps: update prek hooks",
       addPaths: [],
     });
     expect(core.setSecret).toHaveBeenCalledWith("token");
     expect(process.env.INPUT_TOKEN).toBeUndefined();
+  });
+
+  it.each([
+    ["deps", "update prek hooks", "deps: update prek hooks"],
+    ["deps", "refresh hook versions", "deps: refresh hook versions"],
+    ["", "Update hook versions", "Update hook versions"],
+    ["fix", "update prek hooks", "fix: update prek hooks"],
+    ["Update ", "hook versions", "Update hook versions"],
+    ["chore:", "update prek hooks", "chore: update prek hooks"],
+    ["[hooks]", "update prek hooks", "[hooks]: update prek hooks"],
+    ["🔧", "update prek hooks", "🔧 update prek hooks"],
+    [
+      "a".repeat(50),
+      "update prek hooks",
+      "a".repeat(50) + ": update prek hooks",
+    ],
+  ])(
+    "uses prefix %j and title %j for both subjects",
+    (prefix, title, subject) => {
+      vi.mocked(core.getInput).mockImplementation((name) => {
+        if (name === "commit-message-prefix") return prefix;
+        if (name === "commit-message-title") return title;
+        return DEFAULT_INPUTS[name] ?? "";
+      });
+      expect(parseInputs()).toMatchObject({
+        commitMessage: subject,
+        prTitle: subject,
+      });
+      expect(core.getInput).toHaveBeenCalledWith("commit-message-prefix", {
+        trimWhitespace: false,
+      });
+    },
+  );
+
+  it("preserves a trailing prefix space through the Actions input reader", async () => {
+    const actualCore = await vi.importActual<typeof core>("@actions/core");
+    const previous = process.env["INPUT_COMMIT-MESSAGE-PREFIX"];
+    process.env["INPUT_COMMIT-MESSAGE-PREFIX"] = "Update ";
+    try {
+      vi.mocked(core.getInput).mockImplementation((name, options) =>
+        name === "commit-message-prefix"
+          ? actualCore.getInput(name, options)
+          : (DEFAULT_INPUTS[name] ?? ""),
+      );
+      expect(parseInputs()).toMatchObject({
+        commitMessage: "Update update prek hooks",
+        prTitle: "Update update prek hooks",
+      });
+    } finally {
+      if (previous === undefined)
+        delete process.env["INPUT_COMMIT-MESSAGE-PREFIX"];
+      else process.env["INPUT_COMMIT-MESSAGE-PREFIX"] = previous;
+    }
+  });
+
+  it.each([
+    ["Custom message", "", "Custom message", "Bump prek Hooks"],
+    [
+      "chore: update custom hooks",
+      "Custom title",
+      "chore: update custom hooks",
+      "Custom title",
+    ],
+    ["", "Custom title", "chore: update prek hooks", "Custom title"],
+    ["Update [hooks]", "", "Update [hooks]", "Bump prek Hooks"],
+    [
+      "chore: update hooks\n\nDetails about the update",
+      "",
+      "chore: update hooks\n\nDetails about the update",
+      "Bump prek Hooks",
+    ],
+  ])(
+    "preserves legacy string settings %j and %j",
+    (input, title, commitMessage, prTitle) => {
+      vi.mocked(core.getInput).mockImplementation((name) => {
+        if (name === "commit-message") return input;
+        if (name === "pr-title") return title;
+        return DEFAULT_INPUTS[name] ?? "";
+      });
+
+      expect(parseInputs()).toMatchObject({ commitMessage, prTitle });
+    },
+  );
+
+  it("preserves a legacy commit body containing a prefix field", () => {
+    const message = "Update hooks\n\nprefix: ci";
+    vi.mocked(core.getInput).mockImplementation((name) => {
+      if (name === "commit-message") return message;
+      if (name === "pr-title") return "Existing title";
+      return DEFAULT_INPUTS[name] ?? "";
+    });
+
+    expect(parseInputs()).toMatchObject({
+      commitMessage: message,
+      prTitle: "Existing title",
+    });
+  });
+
+  it("preserves a legacy message that looks like the abandoned nested settings", () => {
+    const message = "prefix: fix\ntitle: custom subject";
+    vi.mocked(core.getInput).mockImplementation((name) =>
+      name === "commit-message" ? message : (DEFAULT_INPUTS[name] ?? ""),
+    );
+    expect(parseInputs()).toMatchObject({
+      commitMessage: message,
+      prTitle: "Bump prek Hooks",
+    });
+  });
+
+  it.each([
+    ["commit-message-prefix", "a".repeat(51), "at most 50 characters"],
+    ["commit-message-prefix", "first\nsecond", "single-line string"],
+    ["commit-message-title", "", "must not be empty"],
+    ["commit-message-title", "  ", "must not be empty"],
+    ["commit-message-title", "first\nsecond", "single-line string"],
+  ])("rejects invalid %s %j", (input, value, error) => {
+    vi.mocked(core.getInput).mockImplementation((name) =>
+      name === input ? value : (DEFAULT_INPUTS[name] ?? ""),
+    );
+    expect(() => parseInputs()).toThrow(error);
   });
 
   it("deletes INPUT_TOKEN even though other action inputs remain available", () => {
