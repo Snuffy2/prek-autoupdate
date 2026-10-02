@@ -1,0 +1,84 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description:
+          Existing stable release tag whose moving major tag should be updated
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    if: github.event.repository.fork == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create or update the release pull request
+        if: github.event_name == 'push'
+        id: release
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Checkout the released tag
+        if: >-
+          github.event_name == 'workflow_dispatch' ||
+          steps.release.outputs.release_created == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.release.outputs.tag_name || inputs.release_tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        if: >-
+          github.event_name == 'workflow_dispatch' ||
+          steps.release.outputs.release_created == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Verify the release
+        if: >-
+          github.event_name == 'workflow_dispatch' ||
+          steps.release.outputs.release_created == 'true'
+        env:
+          RELEASE_TAG:
+            ${{ steps.release.outputs.tag_name || inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tag must use the vMAJOR.MINOR.PATCH format." >&2
+            exit 1
+          fi
+          test "v$(node -p 'JSON.parse(require("fs").readFileSync("package.json", "utf8")).version')" = "$RELEASE_TAG"
+          npm ci --ignore-scripts
+          npm run check:dist
+
+      - name: Update the moving major tag
+        if: >-
+          github.event_name == 'workflow_dispatch' ||
+          steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          RELEASE_TAG:
+            ${{ steps.release.outputs.tag_name || inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          TARGET_SHA="$(git rev-parse HEAD)"
+          export TARGET_SHA
+          gh auth setup-git --hostname github.com
+          bash .github/scripts/update-major-tag.sh
