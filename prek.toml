@@ -41,6 +41,14 @@ additional_dependencies = [
 repo = "local"
 
 [[repos.hooks]]
+id = "build-action"
+name = "Rebuild bundled action"
+entry = "npm run build"
+language = "system"
+files = "^(src/.*\\.ts|package(-lock)?\\.json|rollup\\.config\\.mjs|dist/index\\.js)$"
+pass_filenames = false
+
+[[repos.hooks]]
 id = "prettier"
 name = "prettier"
 entry = "npm exec -- prettier --write"
