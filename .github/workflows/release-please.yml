@@ -13,8 +13,7 @@ on:
         type: string
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: release-please
@@ -52,12 +51,11 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Verify the release and update its moving major tag
+      - name: Verify the release
         if: >-
           github.event_name == 'workflow_dispatch' ||
           steps.release.outputs.release_created == 'true'
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           RELEASE_TAG:
             ${{ steps.release.outputs.tag_name || inputs.release_tag }}
         run: |
@@ -69,6 +67,17 @@ jobs:
           test "v$(node -p 'JSON.parse(require("fs").readFileSync("package.json", "utf8")).version')" = "$RELEASE_TAG"
           npm ci --ignore-scripts
           npm run check:dist
+
+      - name: Update the moving major tag
+        if: >-
+          github.event_name == 'workflow_dispatch' ||
+          steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          RELEASE_TAG:
+            ${{ steps.release.outputs.tag_name || inputs.release_tag }}
+        run: |
+          set -euo pipefail
           TARGET_SHA="$(git rev-parse HEAD)"
           export TARGET_SHA
           gh auth setup-git --hostname github.com
