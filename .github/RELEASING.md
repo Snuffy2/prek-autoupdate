@@ -14,11 +14,11 @@ Use conventional commit titles when squash-merging pull requests, for example
 checks the supported types copied from places. Use `!` or a `BREAKING CHANGE:`
 footer for breaking changes.
 
-Before merging a release pull request, check out its branch, run `npm ci` and
-`npm run build`, and commit the updated `dist/index.js` to that branch. The
-action embeds the package version in its bundle, so its existing CI bundle check
-must pass on the final release commit. Review the release notes and version
-before merging.
+Before merging a release pull request, review the release notes and version and
+require CI to pass. The action reads its version from its own `package.json` at
+runtime, so Release Please's package and lockfile version bumps do not require a
+bundle rebuild. Source or runtime dependency changes still require rebuilding
+and committing `dist/index.js`; CI verifies that the bundle is current.
 
 After publication, the workflow verifies the checked-in bundle and promotes the
 stable `vMAJOR` tag using the existing guarded, monotonic tag updater. It does
