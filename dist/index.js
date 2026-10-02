@@ -42,6 +42,7 @@ import { tmpdir } from 'node:os';
 import path$1, { join } from 'node:path';
 import * as stream from 'stream';
 import { createHash } from 'node:crypto';
+import { readFileSync as readFileSync$1 } from 'node:fs';
 
 // We use any as a valid input type
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -41152,12 +41153,11 @@ async function gitExit(workspace, arguments_) {
     }
 }
 
-var version = "2.0.8";
-var packageMetadata = {
-	version: version};
-
 /** Return the version banner shown at the start of each action run. */
 function versionBanner() {
+    // Resolve the action's metadata, independent of the caller's working directory.
+    // Reading at runtime keeps release-only version bumps out of the bundle.
+    const packageMetadata = JSON.parse(readFileSync$1(new URL("../package.json", import.meta.url), "utf8"));
     return `prek-autoupdate version v${packageMetadata.version}`;
 }
 
