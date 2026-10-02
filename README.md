@@ -302,19 +302,6 @@ allowed, the token lacks permission, or no merge requirement is holding the PR,
 GitHub can reject the request and the action run fails without closing the
 otherwise valid update pull request.
 
-## Dependency maintenance
-
-The `build-action` prek hook rebuilds `dist/index.js` when source, npm
-dependencies, or bundle configuration changes. The existing prek-autofix
-workflows apply that bundle to Dependabot PRs, including lockfile-only updates,
-and CI verifies the committed bundle matches a fresh build. Both autofix
-workflows must be on the default branch; `PREK_AUTOFIX_TOKEN` must have
-permission to update PR branches and trigger CI for the resulting commit.
-
-Dependabot PRs with an autofix commit require manual merging: the auto-merge
-authorization intentionally accepts only verified Dependabot commits and GitHub
-Update branch merges.
-
 ## Releases
 
 Use the moving major tag for stable updates. Each manually dispatched stable
