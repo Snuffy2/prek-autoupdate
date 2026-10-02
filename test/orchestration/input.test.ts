@@ -82,8 +82,8 @@ describe("parseInputs", () => {
       updateBranch: "chore/prek-updates",
       branchPrefix: "chore/prek-updates",
       label: "dependencies",
-      commitMessage: "chore: update prek hooks",
-      prTitle: "chore: update prek hooks",
+      commitMessage: "deps: update prek hooks",
+      prTitle: "deps: update prek hooks",
       addPaths: [],
     });
     expect(core.setSecret).toHaveBeenCalledWith("token");
@@ -91,6 +91,10 @@ describe("parseInputs", () => {
   });
 
   it.each([
+    ["prefix: deps\ntitle: update prek hooks", "deps: update prek hooks"],
+    ["title: refresh hook versions", "deps: refresh hook versions"],
+    ["title: update prek hooks\nprefix: deps", "deps: update prek hooks"],
+    ['title: "Update hook versions"\nprefix: ""', "Update hook versions"],
     ["prefix: fix", "fix: update prek hooks"],
     ['"prefix": fix', "fix: update prek hooks"],
     ["# Commit format\nprefix: ci\n", "ci: update prek hooks"],
@@ -99,7 +103,7 @@ describe("parseInputs", () => {
     ['prefix: "[hooks]"', "[hooks]: update prek hooks"],
     ['prefix: "🔧"', "🔧 update prek hooks"],
     ['prefix: ""', "update prek hooks"],
-    ["{}", "chore: update prek hooks"],
+    ["{}", "deps: update prek hooks"],
     ['{"prefix":"ci"}', "ci: update prek hooks"],
     ["prefix: " + "a".repeat(50), "a".repeat(50) + ": update prek hooks"],
   ])("uses %j for both the commit and PR title", (input, subject) => {
@@ -176,6 +180,10 @@ describe("parseInputs", () => {
     ["prefix: fix\nunknown: value", "Unknown commit-message option"],
     ["prefix: 123", "prefix must be a single-line string"],
     ["prefix: null", "prefix must be a single-line string"],
+    ["title: 123", "title must be a nonempty single-line string"],
+    ['title: ""', "title must be a nonempty single-line string"],
+    ['title: "  "', "title must be a nonempty single-line string"],
+    ['title: "first\\nsecond"', "title must be a nonempty single-line string"],
     ["prefix: " + "a".repeat(51), "prefix must be a single-line string"],
     ['prefix: "first\\nsecond"', "prefix must be a single-line string"],
   ])("rejects invalid YAML configuration %j", (input, error) => {

@@ -42,8 +42,8 @@ inputs:
     default: dependencies
   commit-message:
     description:
-      YAML mapping with a Dependabot-style prefix, used for both update commits
-      and pull-request titles.
+      YAML mapping with optional prefix (default deps) and title (default update
+      prek hooks), used for both update commits and pull-request titles.
     required: false
     default: ""
   pr-title:

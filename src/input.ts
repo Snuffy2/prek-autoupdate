@@ -63,7 +63,9 @@ export function parseInputs(): ActionInputs {
 function updateMessages(): Pick<ActionInputs, "commitMessage" | "prTitle"> {
   const input = core.getInput("commit-message").trim();
   const legacyTitle = core.getInput("pr-title").trim();
-  const defaultMessage = "chore: update prek hooks";
+  const defaultTitle = "update prek hooks";
+  const defaultPrefix = "deps";
+  const defaultMessage = `${defaultPrefix}: ${defaultTitle}`;
   const firstContentLine =
     input
       .split(/\r?\n/u)
@@ -71,12 +73,14 @@ function updateMessages(): Pick<ActionInputs, "commitMessage" | "prTitle"> {
       .find((line) => line !== "" && !line.startsWith("#")) ?? "";
   const structured =
     firstContentLine.startsWith("{") ||
-    /^(?:prefix|"prefix"|'prefix')\s*:/u.test(firstContentLine);
+    /^(?:prefix|title|"prefix"|"title"|'prefix'|'title')\s*:/u.test(
+      firstContentLine,
+    );
 
   if (!structured) {
     if (input !== "" || legacyTitle !== "") {
       return {
-        commitMessage: input || defaultMessage,
+        commitMessage: input || "chore: update prek hooks",
         prTitle: legacyTitle || "Bump prek Hooks",
       };
     }
@@ -97,7 +101,7 @@ function updateMessages(): Pick<ActionInputs, "commitMessage" | "prTitle"> {
   }
   const settings = options as Record<string, unknown>;
   for (const key of Object.keys(settings)) {
-    if (key !== "prefix") {
+    if (key !== "prefix" && key !== "title") {
       throw new Error(`Unknown commit-message option: ${key}`);
     }
   }
@@ -112,7 +116,19 @@ function updateMessages(): Pick<ActionInputs, "commitMessage" | "prTitle"> {
     );
   }
 
-  let prefix = (settings.prefix ?? "chore") as string;
+  if (
+    "title" in settings &&
+    (typeof settings.title !== "string" ||
+      settings.title.trim() === "" ||
+      /[\r\n]/u.test(settings.title))
+  ) {
+    throw new Error(
+      "commit-message title must be a nonempty single-line string",
+    );
+  }
+  const title =
+    typeof settings.title === "string" ? settings.title.trim() : defaultTitle;
+  let prefix = (settings.prefix ?? defaultPrefix) as string;
   if (prefix !== "") {
     if (/[A-Za-z0-9)\]]$/u.test(prefix)) {
       prefix += ":";
@@ -121,7 +137,7 @@ function updateMessages(): Pick<ActionInputs, "commitMessage" | "prTitle"> {
       prefix += " ";
     }
   }
-  const message = `${prefix}update prek hooks`;
+  const message = `${prefix}${title}`;
   return { commitMessage: message, prTitle: message };
 }
 
