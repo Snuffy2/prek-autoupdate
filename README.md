@@ -110,30 +110,6 @@ not match your repository.
 | `commit-message-title`  | `update prek hooks`   | Shared subject for the update commit message and PR title.                                                                                       |
 | `add-paths`             | auto-detect           | Newline-separated repository-relative paths to commit. When blank, the action requires exactly one of `prek.toml` or `.pre-commit-config.yaml`.  |
 
-### Commit messages and pull-request titles
-
-Configure both with the optional inputs:
-
-```yaml
-with:
-  commit-message-prefix: deps
-  commit-message-title: update prek hooks
-```
-
-These defaults produce `deps: update prek hooks` for both the commit and PR
-title.
-
-`commit-message-prefix` follows
-[Dependabot's prefix formatting rules](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference#commit-message--).
-It accepts a single-line string of up to 50 characters. A colon is added when it
-ends in a letter, number, `)`, or `]`. A quoted trailing space, such as
-`commit-message-prefix: "Update "`, prevents the colon. Set it to `""` to omit
-the prefix.
-
-`commit-message-title` accepts a nonempty single-line string. Both inputs can be
-changed independently; the action does not infer a style from repository
-history.
-
 ## Output
 
 `pull-request-number` is set only when this run creates or updates an update PR.
