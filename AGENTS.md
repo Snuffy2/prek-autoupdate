@@ -29,6 +29,12 @@ permissions.
 - Support Linux x64 and arm64 runners. The action uses the Node 24 runtime.
 - Do not request `actions: write`; no active path needs it.
 
+## Pull Requests
+
+- Every pull request created must have a title with a Conventional Commit
+  prefix, such as `fix:`, `feat:`, `ci:`, or `chore:`. Use
+  `type(optional-scope): description` so squash merges support release automation.
+
 ## GitHub Tokens
 
 - The normal path must work with the repository `GITHUB_TOKEN`.

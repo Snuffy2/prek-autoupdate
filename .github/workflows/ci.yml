@@ -5,12 +5,6 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:
-    inputs:
-      expected_sha:
-        description: Exact candidate SHA required by the release workflow
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -30,22 +24,10 @@ jobs:
       github.event.pull_request.user.type == 'Bot')
     runs-on: ubuntu-latest
     steps:
-      - name: Require the dispatched release candidate SHA
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          EXPECTED_SHA: ${{ inputs.expected_sha }}
-          WORKFLOW_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
-          test "$WORKFLOW_SHA" = "$EXPECTED_SHA"
-
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
-          ref:
-            ${{ inputs.expected_sha || github.event.pull_request.head.sha ||
-            github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Set up Node.js
