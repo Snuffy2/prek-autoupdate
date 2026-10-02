@@ -2,7 +2,6 @@ import * as core from "@actions/core";
 import * as github from "@actions/github";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { parseDocument } from "yaml";
 
 import type {
   ActionContext,
@@ -63,79 +62,28 @@ export function parseInputs(): ActionInputs {
 function updateMessages(): Pick<ActionInputs, "commitMessage" | "prTitle"> {
   const input = core.getInput("commit-message").trim();
   const legacyTitle = core.getInput("pr-title").trim();
-  const defaultTitle = "update prek hooks";
-  const defaultPrefix = "deps";
-  const defaultMessage = `${defaultPrefix}: ${defaultTitle}`;
-  const firstContentLine =
-    input
-      .split(/\r?\n/u)
-      .map((line) => line.trim())
-      .find((line) => line !== "" && !line.startsWith("#")) ?? "";
-  const structured =
-    firstContentLine.startsWith("{") ||
-    /^(?:prefix|title|"prefix"|"title"|'prefix'|'title')\s*:/u.test(
-      firstContentLine,
-    );
-
-  if (!structured) {
-    if (input !== "" || legacyTitle !== "") {
-      return {
-        commitMessage: input || "chore: update prek hooks",
-        prTitle: legacyTitle || "Bump prek Hooks",
-      };
-    }
-    return { commitMessage: defaultMessage, prTitle: defaultMessage };
+  if (input !== "" || legacyTitle !== "") {
+    return {
+      commitMessage: input || "chore: update prek hooks",
+      prTitle: legacyTitle || "Bump prek Hooks",
+    };
   }
 
-  const document = parseDocument(input);
-  if (document.errors.length > 0) {
-    throw new Error("commit-message must be a valid YAML mapping");
-  }
-  const options: unknown = document.toJS();
-  if (
-    typeof options !== "object" ||
-    options === null ||
-    Array.isArray(options)
-  ) {
-    throw new Error("commit-message must be a YAML mapping");
-  }
-  const settings = options as Record<string, unknown>;
-  for (const key of Object.keys(settings)) {
-    if (key !== "prefix" && key !== "title") {
-      throw new Error(`Unknown commit-message option: ${key}`);
-    }
-  }
-  if (
-    "prefix" in settings &&
-    (typeof settings.prefix !== "string" ||
-      Array.from(settings.prefix).length > 50 ||
-      /[\r\n]/u.test(settings.prefix))
-  ) {
+  let prefix = core.getInput("commit-message-prefix", {
+    trimWhitespace: false,
+  });
+  const title = nonEmptyInput("commit-message-title");
+  if (Array.from(prefix).length > 50 || /[\r\n]/u.test(prefix)) {
     throw new Error(
-      "commit-message prefix must be a single-line string of at most 50 characters",
+      "commit-message-prefix must be a single-line string of at most 50 characters",
     );
   }
-
-  if (
-    "title" in settings &&
-    (typeof settings.title !== "string" ||
-      settings.title.trim() === "" ||
-      /[\r\n]/u.test(settings.title))
-  ) {
-    throw new Error(
-      "commit-message title must be a nonempty single-line string",
-    );
+  if (/[\r\n]/u.test(title)) {
+    throw new Error("commit-message-title must be a single-line string");
   }
-  const title =
-    typeof settings.title === "string" ? settings.title.trim() : defaultTitle;
-  let prefix = (settings.prefix ?? defaultPrefix) as string;
   if (prefix !== "") {
-    if (/[A-Za-z0-9)\]]$/u.test(prefix)) {
-      prefix += ":";
-    }
-    if (!prefix.endsWith(" ")) {
-      prefix += " ";
-    }
+    if (/[A-Za-z0-9)\]]$/u.test(prefix)) prefix += ":";
+    if (!prefix.endsWith(" ")) prefix += " ";
   }
   const message = `${prefix}${title}`;
   return { commitMessage: message, prTitle: message };

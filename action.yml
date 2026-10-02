@@ -40,10 +40,16 @@ inputs:
       Label applied to generated pull requests and used for ownership checks.
     required: false
     default: dependencies
+  commit-message-prefix:
+    description: Prefix applied to both update commit messages and PR titles.
+    required: false
+    default: deps
+  commit-message-title:
+    description: Shared subject for update commit messages and PR titles.
+    required: false
+    default: update prek hooks
   commit-message:
-    description:
-      YAML mapping with optional prefix (default deps) and title (default update
-      prek hooks), used for both update commits and pull-request titles.
+    description: Deprecated compatibility input for existing workflows.
     required: false
     default: ""
   pr-title:

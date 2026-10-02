@@ -26,6 +26,8 @@ describe("action metadata", () => {
         "update-branch",
         "branch-prefix",
         "label",
+        "commit-message-prefix",
+        "commit-message-title",
         "commit-message",
         "pr-title",
         "add-paths",
@@ -45,6 +47,10 @@ describe("action metadata", () => {
       "chore/prek-updates",
     );
     expect(metadata.inputs.label?.default).toBe("dependencies");
+    expect(metadata.inputs["commit-message-prefix"]?.default).toBe("deps");
+    expect(metadata.inputs["commit-message-title"]?.default).toBe(
+      "update prek hooks",
+    );
     expect(metadata.inputs["commit-message"]?.default).toBe("");
     expect(metadata.inputs["pr-title"]?.default).toBe("");
     expect(metadata.inputs["add-paths"]?.default).toBe("");

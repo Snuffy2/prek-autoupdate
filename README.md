@@ -96,45 +96,43 @@ immediately before each is run.
 You can usually use the defaults. Only add a `with:` value when the default does
 not match your repository.
 
-| Input            | Default                   | What it controls                                                                                                                                 |
-| ---------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `token`          | `${{ github.token }}`     | Credential used to push the update branch and manage pull requests. See [Authentication and permissions](#authentication-and-permissions).       |
-| `auto-merge`     | `false`                   | With a PAT, requests squash auto-merge for the exact pull-request revision published by the action. See [Automatic merging](#automatic-merging). |
-| `author-login`   | `github-actions[bot]`     | Fallback PR-author login used only when GitHub cannot identify the token's user. See [When to set `author-login`](#when-to-set-author-login).    |
-| `cooldown-days`  | `"7"`                     | Passed to `prek autoupdate --cooldown-days`.                                                                                                     |
-| `update-day`     | `"1"`                     | UTC day for scheduled updates: `0` is Sunday and `6` is Saturday.                                                                                |
-| `update-branch`  | `chore/prek-updates`      | The branch for the update pull request.                                                                                                          |
-| `branch-prefix`  | `chore/prek-updates`      | The branch prefix that cleanup treats as action-owned.                                                                                           |
-| `label`          | `dependencies`            | An existing repository label applied to the update PR and used to prove ownership during cleanup.                                                |
-| `commit-message` | `deps: update prek hooks` | YAML mapping that formats both the update commit message and pull-request title.                                                                 |
-| `add-paths`      | auto-detect               | Newline-separated repository-relative paths to commit. When blank, the action requires exactly one of `prek.toml` or `.pre-commit-config.yaml`.  |
+| Input                   | Default               | What it controls                                                                                                                                 |
+| ----------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `token`                 | `${{ github.token }}` | Credential used to push the update branch and manage pull requests. See [Authentication and permissions](#authentication-and-permissions).       |
+| `auto-merge`            | `false`               | With a PAT, requests squash auto-merge for the exact pull-request revision published by the action. See [Automatic merging](#automatic-merging). |
+| `author-login`          | `github-actions[bot]` | Fallback PR-author login used only when GitHub cannot identify the token's user. See [When to set `author-login`](#when-to-set-author-login).    |
+| `cooldown-days`         | `"7"`                 | Passed to `prek autoupdate --cooldown-days`.                                                                                                     |
+| `update-day`            | `"1"`                 | UTC day for scheduled updates: `0` is Sunday and `6` is Saturday.                                                                                |
+| `update-branch`         | `chore/prek-updates`  | The branch for the update pull request.                                                                                                          |
+| `branch-prefix`         | `chore/prek-updates`  | The branch prefix that cleanup treats as action-owned.                                                                                           |
+| `label`                 | `dependencies`        | An existing repository label applied to the update PR and used to prove ownership during cleanup.                                                |
+| `commit-message-prefix` | `deps`                | Prefix applied to both the update commit message and PR title.                                                                                   |
+| `commit-message-title`  | `update prek hooks`   | Shared subject for the update commit message and PR title.                                                                                       |
+| `add-paths`             | auto-detect           | Newline-separated repository-relative paths to commit. When blank, the action requires exactly one of `prek.toml` or `.pre-commit-config.yaml`.  |
 
 ### Commit messages and pull-request titles
 
-Configure both with a `commit-message` YAML block. The optional `prefix` uses
-[Dependabot's formatting rules](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference#commit-message--),
-and the optional `title` sets the shared subject:
+Configure both with the optional inputs:
 
 ```yaml
 with:
-  commit-message: |
-    prefix: deps
-    title: update prek hooks
+  commit-message-prefix: deps
+  commit-message-title: update prek hooks
 ```
 
-This produces `deps: update prek hooks` for both the commit and PR title.
-Without configuration, both use `deps: update prek hooks`.
+These defaults produce `deps: update prek hooks` for both the commit and PR
+title.
 
-- `prefix` defaults to `deps` and accepts a string of up to 50 characters. A
-  colon is added when it ends in a letter, number, `)`, or `]`. A quoted
-  trailing space, such as `prefix: "Update "`, prevents the colon. Set
-  `prefix: ""` to omit the prefix.
-- `title` defaults to `update prek hooks` and accepts a nonempty single-line
-  string. Set it alone to customize the subject while keeping the default
-  prefix.
+`commit-message-prefix` follows
+[Dependabot's prefix formatting rules](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference#commit-message--).
+It accepts a single-line string of up to 50 characters. A colon is added when it
+ends in a letter, number, `)`, or `]`. A quoted trailing space, such as
+`commit-message-prefix: "Update "`, prevents the colon. Set it to `""` to omit
+the prefix.
 
-Explicit YAML settings take precedence over legacy title settings. The action
-uses these defaults rather than inferring a style from repository history.
+`commit-message-title` accepts a nonempty single-line string. Both inputs can be
+changed independently; the action does not infer a style from repository
+history.
 
 ## Output
 
