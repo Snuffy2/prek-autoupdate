@@ -175,11 +175,6 @@ function requiresDependabotAuthor(condition: string | undefined) {
   );
 }
 
-function requiresNormalCiDependabotPullRequest(condition: string | undefined) {
-  expect(condition).toContain("github.event_name == 'pull_request'");
-  requiresDependabotAuthor(condition);
-}
-
 function requiresCleanupEligibility(condition: string | undefined) {
   requiresDependabotAuthor(condition);
   for (const term of [
@@ -483,34 +478,20 @@ describe("Dependabot auto-merge authorization", () => {
 });
 
 describe("Dependabot workflow trust contracts", () => {
-  it("authorizes eligible Dependabot PRs from trusted base data in both gates", () => {
+  it("authorizes eligible Dependabot PRs from trusted base data", () => {
     const autoMerge = workflow("dependabot-auto-merge.yml");
-    const ci = workflow("ci.yml");
     const autoMergeAuthorization = authorizationJob(autoMerge);
-    const ciAuthorization = authorizationJob(ci);
 
     expect(autoMergeAuthorization.job.permissions).toMatchObject({
       "contents": "read",
       "pull-requests": "read",
     });
-    expect(ciAuthorization.job.permissions).toMatchObject({
-      "contents": "read",
-      "pull-requests": "read",
-    });
     requiresDependabotAuthor(autoMergeAuthorization.job.if);
-    requiresNormalCiDependabotPullRequest(
-      authorizationStep(ciAuthorization.job).if,
-    );
     trustedCheckoutPrecedesAuthorization(
       autoMergeAuthorization.job,
       requiresDependabotAuthor,
     );
-    trustedCheckoutPrecedesAuthorization(
-      ciAuthorization.job,
-      requiresNormalCiDependabotPullRequest,
-    );
     assertsAncestryDataflow(autoMergeAuthorization.job);
-    assertsAncestryDataflow(ciAuthorization.job);
   });
 
   it("keeps write-capable auto-merge operations dependent on authorization", () => {
@@ -559,20 +540,11 @@ describe("Dependabot workflow trust contracts", () => {
     requiresCleanupEligibility(cleanup.job.if);
   });
 
-  it("authorizes Dependabot before CI checks out the pull-request revision", () => {
-    const ciAuthorization = authorizationJob(workflow("ci.yml"));
-    const steps = requiredSteps(ciAuthorization.job);
-    const authorizationIndex = steps.indexOf(
-      authorizationStep(ciAuthorization.job),
-    );
-    const headCheckoutIndex = steps.findIndex(
-      (step) =>
-        step.uses?.startsWith("actions/checkout@") &&
-        step.with?.ref
-          ?.toString()
-          .includes("github.event.pull_request.head.sha"),
-    );
-
-    expect(headCheckoutIndex).toBeGreaterThan(authorizationIndex);
+  it("does not gate CI on Dependabot auto-merge eligibility", () => {
+    const ci = workflow("ci.yml");
+    for (const { job } of namedJobs(ci)) {
+      for (const step of requiredSteps(job))
+        expect(step.run ?? "").not.toContain("dependabot-auto-merge.mjs");
+    }
   });
 });
