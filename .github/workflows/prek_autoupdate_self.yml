@@ -29,5 +29,7 @@ jobs:
         with:
           token: ${{ secrets.PREK_AUTOUPDATE_TOKEN }}
           auto-merge: true
+          commit-message: "deps: update prek hooks"
+          pr-title: "deps: update prek hooks"
           author-login: prek-autoupdate-bot
           update-day: "0"
