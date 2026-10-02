@@ -43415,7 +43415,12 @@ function updateMessages() {
     const input = getInput("commit-message").trim();
     const legacyTitle = getInput("pr-title").trim();
     const defaultMessage = "chore: update prek hooks";
-    const structured = input.startsWith("{") || /^(?:prefix|"prefix"|'prefix')\s*:/mu.test(input);
+    const firstContentLine = input
+        .split(/\r?\n/u)
+        .map((line) => line.trim())
+        .find((line) => line !== "" && !line.startsWith("#")) ?? "";
+    const structured = firstContentLine.startsWith("{") ||
+        /^(?:prefix|"prefix"|'prefix')\s*:/u.test(firstContentLine);
     if (!structured) {
         if (input !== "" || legacyTitle !== "") {
             return {

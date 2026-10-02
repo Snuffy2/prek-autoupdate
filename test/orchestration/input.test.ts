@@ -142,6 +142,20 @@ describe("parseInputs", () => {
     },
   );
 
+  it("preserves a legacy commit body containing a prefix field", () => {
+    const message = "Update hooks\n\nprefix: ci";
+    vi.mocked(core.getInput).mockImplementation((name) => {
+      if (name === "commit-message") return message;
+      if (name === "pr-title") return "Existing title";
+      return DEFAULT_INPUTS[name] ?? "";
+    });
+
+    expect(parseInputs()).toMatchObject({
+      commitMessage: message,
+      prTitle: "Existing title",
+    });
+  });
+
   it("gives explicit YAML settings priority over a legacy PR title", () => {
     vi.mocked(core.getInput).mockImplementation((name) => {
       if (name === "commit-message") return "prefix: fix";

@@ -64,8 +64,14 @@ function updateMessages(): Pick<ActionInputs, "commitMessage" | "prTitle"> {
   const input = core.getInput("commit-message").trim();
   const legacyTitle = core.getInput("pr-title").trim();
   const defaultMessage = "chore: update prek hooks";
+  const firstContentLine =
+    input
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .find((line) => line !== "" && !line.startsWith("#")) ?? "";
   const structured =
-    input.startsWith("{") || /^(?:prefix|"prefix"|'prefix')\s*:/mu.test(input);
+    firstContentLine.startsWith("{") ||
+    /^(?:prefix|"prefix"|'prefix')\s*:/u.test(firstContentLine);
 
   if (!structured) {
     if (input !== "" || legacyTitle !== "") {
