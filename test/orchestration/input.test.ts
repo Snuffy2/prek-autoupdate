@@ -146,20 +146,20 @@ describe("parseInputs", () => {
   });
 
   it.each([
-    ["Custom message", "", "Custom message", "Bump prek Hooks"],
+    ["Custom message", "", "Custom message", "deps: update prek hooks"],
     [
       "chore: update custom hooks",
       "Custom title",
       "chore: update custom hooks",
       "Custom title",
     ],
-    ["", "Custom title", "chore: update prek hooks", "Custom title"],
-    ["Update [hooks]", "", "Update [hooks]", "Bump prek Hooks"],
+    ["", "Custom title", "deps: update prek hooks", "Custom title"],
+    ["Update [hooks]", "", "Update [hooks]", "deps: update prek hooks"],
     [
       "chore: update hooks\n\nDetails about the update",
       "",
       "chore: update hooks\n\nDetails about the update",
-      "Bump prek Hooks",
+      "deps: update prek hooks",
     ],
   ])(
     "preserves legacy string settings %j and %j",
@@ -171,6 +171,26 @@ describe("parseInputs", () => {
       });
 
       expect(parseInputs()).toMatchObject({ commitMessage, prTitle });
+    },
+  );
+
+  it.each([
+    ["commit-message", "commitMessage", "prTitle"],
+    ["pr-title", "prTitle", "commitMessage"],
+  ])(
+    "uses the shared subject for the field omitted alongside %s",
+    (input, override, fallback) => {
+      vi.mocked(core.getInput).mockImplementation((name) => {
+        if (name === input) return "Custom legacy subject";
+        if (name === "commit-message-prefix") return "fix";
+        if (name === "commit-message-title") return "refresh hooks";
+        return DEFAULT_INPUTS[name] ?? "";
+      });
+
+      expect(parseInputs()).toMatchObject({
+        [override]: "Custom legacy subject",
+        [fallback]: "fix: refresh hooks",
+      });
     },
   );
 
@@ -195,7 +215,7 @@ describe("parseInputs", () => {
     );
     expect(parseInputs()).toMatchObject({
       commitMessage: message,
-      prTitle: "Bump prek Hooks",
+      prTitle: "deps: update prek hooks",
     });
   });
 
