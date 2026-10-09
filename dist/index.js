@@ -36521,10 +36521,10 @@ function parseInputs() {
 function updateMessages() {
     const input = getInput("commit-message").trim();
     const legacyTitle = getInput("pr-title").trim();
-    if (input !== "" || legacyTitle !== "") {
+    if (input !== "" && legacyTitle !== "") {
         return {
-            commitMessage: input || "chore: update prek hooks",
-            prTitle: legacyTitle || "Bump prek Hooks",
+            commitMessage: input,
+            prTitle: legacyTitle,
         };
     }
     let prefix = getInput("commit-message-prefix", {
@@ -36544,7 +36544,10 @@ function updateMessages() {
             prefix += " ";
     }
     const message = `${prefix}${title}`;
-    return { commitMessage: message, prTitle: message };
+    return {
+        commitMessage: input || message,
+        prTitle: legacyTitle || message,
+    };
 }
 function shouldUpdate(eventName, updateDay, now) {
     if (eventName === "workflow_dispatch") {

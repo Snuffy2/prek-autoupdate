@@ -110,6 +110,11 @@ not match your repository.
 | `commit-message-title`  | `update prek hooks`   | Shared subject for the update commit message and PR title.                                                                                       |
 | `add-paths`             | auto-detect           | Newline-separated repository-relative paths to commit. When blank, the action requires exactly one of `prek.toml` or `.pre-commit-config.yaml`.  |
 
+The deprecated `commit-message` and `pr-title` inputs still override their
+respective fields. Any omitted field uses the shared subject from
+`commit-message-prefix` and `commit-message-title`, defaulting to
+`deps: update prek hooks`.
+
 ## Output
 
 `pull-request-number` is set only when this run creates or updates an update PR.

@@ -62,10 +62,10 @@ export function parseInputs(): ActionInputs {
 function updateMessages(): Pick<ActionInputs, "commitMessage" | "prTitle"> {
   const input = core.getInput("commit-message").trim();
   const legacyTitle = core.getInput("pr-title").trim();
-  if (input !== "" || legacyTitle !== "") {
+  if (input !== "" && legacyTitle !== "") {
     return {
-      commitMessage: input || "chore: update prek hooks",
-      prTitle: legacyTitle || "Bump prek Hooks",
+      commitMessage: input,
+      prTitle: legacyTitle,
     };
   }
 
@@ -86,7 +86,10 @@ function updateMessages(): Pick<ActionInputs, "commitMessage" | "prTitle"> {
     if (!prefix.endsWith(" ")) prefix += " ";
   }
   const message = `${prefix}${title}`;
-  return { commitMessage: message, prTitle: message };
+  return {
+    commitMessage: input || message,
+    prTitle: legacyTitle || message,
+  };
 }
 
 export function shouldUpdate(
