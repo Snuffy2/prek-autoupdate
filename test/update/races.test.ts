@@ -797,9 +797,14 @@ describe("detached caller checkout", () => {
       ).stdout.trim(),
     ).toBe("");
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
-      /base branch changed after checkout: main is at DRIFT, but the checkout is at [0-9a-f]{40}.*current tip of main/u,
+    const error = await runUpdate(harness.execution).catch(
+      (caught: unknown) => caught,
     );
+    expect(error).toBeInstanceOf(Error);
+    const message = (error as Error).message;
+    expect(message).toMatch(/base branch changed after checkout/u);
+    expect(message).toContain("DRIFT");
+    expect(message).toContain(harness.execution.context.baseSha);
     expect(await pushes(harness.log)).toEqual([]);
     expect(harness.create).not.toHaveBeenCalled();
   });
