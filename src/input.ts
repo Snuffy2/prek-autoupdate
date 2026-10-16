@@ -117,12 +117,31 @@ export async function resolveContext(
   const { owner, repo: repository } = github.context.repo;
   const repositoryFullName = `${owner}/${repository}`;
   const serverUrl = normalizeServerUrl(github.context.serverUrl);
-  const baseBranch = await git(workspace, [
+  let baseBranch = await gitOptional(workspace, [
     "symbolic-ref",
     "--quiet",
     "--short",
     "HEAD",
   ]);
+  if (baseBranch === "") {
+    const ref = github.context.ref;
+    const branch = ref.startsWith("refs/heads/")
+      ? ref.slice("refs/heads/".length)
+      : "";
+    if (
+      branch === "" ||
+      (await gitOptional(workspace, [
+        "check-ref-format",
+        "--normalize",
+        ref,
+      ])) !== ref
+    ) {
+      throw new Error(
+        `A detached checkout requires a workflow ref of the form refs/heads/<branch>; received ${ref === "" ? "an empty ref" : `"${ref}"`}`,
+      );
+    }
+    baseBranch = branch;
+  }
   const baseSha = await git(workspace, ["rev-parse", "HEAD"]);
   const identity = await resolveAuthenticatedIdentity(
     client,
