@@ -1239,8 +1239,11 @@ async function proveBase(execution: ActionExecution): Promise<void> {
     repo: execution.context.repository,
     ref: `heads/${execution.context.baseBranch}`,
   });
-  if (response.data.object.sha !== execution.context.baseSha) {
-    throw new Error("The base branch changed after checkout");
+  const current = response.data.object.sha;
+  if (current !== execution.context.baseSha) {
+    throw new Error(
+      `The base branch changed after checkout: ${execution.context.baseBranch} is at ${current}, but the checkout is at ${execution.context.baseSha}. For a detached or older checkout, check out the current tip of ${execution.context.baseBranch}.`,
+    );
   }
 }
 

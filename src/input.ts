@@ -137,7 +137,7 @@ export async function resolveContext(
       ])) !== ref
     ) {
       throw new Error(
-        "A detached checkout requires a valid workflow branch ref (refs/heads/...); tag runs are not supported",
+        `A detached checkout requires a workflow ref of the form refs/heads/<branch>; received ${ref === "" ? "an empty ref" : `"${ref}"`}`,
       );
     }
     baseBranch = branch;

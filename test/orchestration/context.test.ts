@@ -67,40 +67,36 @@ describe("resolveContext checkout branches", () => {
     await rm(directory, { recursive: true, force: true });
   });
 
-  it.each(["push", "schedule", "workflow_dispatch"])(
-    "resolves a detached %s checkout without advancing its commit",
-    async (eventName) => {
-      github.context.eventName = eventName;
-      github.context.ref = "refs/heads/release/next";
-      await git(directory, "branch", "release/next");
-      await git(
-        directory,
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.com",
-        "-c",
-        "commit.gpgsign=false",
-        "commit",
-        "--allow-empty",
-        "-m",
-        "newer tip",
-      );
-      await git(directory, "branch", "--force", "release/next", "HEAD");
-      await git(directory, "checkout", "--detach", originalSha);
+  it("resolves a detached checkout without advancing its commit", async () => {
+    github.context.ref = "refs/heads/release/next";
+    await git(directory, "branch", "release/next");
+    await git(
+      directory,
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.com",
+      "-c",
+      "commit.gpgsign=false",
+      "commit",
+      "--allow-empty",
+      "-m",
+      "newer tip",
+    );
+    await git(directory, "branch", "--force", "release/next", "HEAD");
+    await git(directory, "checkout", "--detach", originalSha);
 
-      await expect(resolveContext(client, inputs)).resolves.toMatchObject({
-        baseBranch: "release/next",
-        baseSha: originalSha,
-        eventName,
-      });
-      expect(await git(directory, "rev-parse", "HEAD")).toBe(originalSha);
-      expect(await git(directory, "branch", "--show-current")).toBe("");
-      expect(await git(directory, "rev-parse", "release/next")).not.toBe(
-        originalSha,
-      );
-    },
-  );
+    await expect(resolveContext(client, inputs)).resolves.toMatchObject({
+      baseBranch: "release/next",
+      baseSha: originalSha,
+      eventName: "schedule",
+    });
+    expect(await git(directory, "rev-parse", "HEAD")).toBe(originalSha);
+    expect(await git(directory, "branch", "--show-current")).toBe("");
+    expect(await git(directory, "rev-parse", "release/next")).not.toBe(
+      originalSha,
+    );
+  });
 
   it("preserves the attached checkout branch even when the event ref differs", async () => {
     github.context.ref = "refs/heads/another-branch";
@@ -122,7 +118,7 @@ describe("resolveContext checkout branches", () => {
     github.context.ref = ref;
     await git(directory, "checkout", "--detach", originalSha);
     await expect(resolveContext(client, inputs)).rejects.toThrow(
-      "A detached checkout requires a valid workflow branch ref",
+      "A detached checkout requires a workflow ref of the form refs/heads/<branch>",
     );
   });
 

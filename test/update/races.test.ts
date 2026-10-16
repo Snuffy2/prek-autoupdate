@@ -783,6 +783,39 @@ describe("update publication races", () => {
   );
 });
 
+describe("detached caller checkout", () => {
+  it("refuses a stale detached checkout with an actionable message and no mutation", async () => {
+    const harness = await makeHarness({ detached: true, baseDriftAt: 1 });
+    expect(
+      (
+        await exec("git", [
+          "-C",
+          harness.execution.context.workspace,
+          "branch",
+          "--show-current",
+        ])
+      ).stdout.trim(),
+    ).toBe("");
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /base branch changed after checkout: main is at DRIFT, but the checkout is at [0-9a-f]{40}.*current tip of main/u,
+    );
+    expect(await pushes(harness.log)).toEqual([]);
+    expect(harness.create).not.toHaveBeenCalled();
+  });
+
+  it("proceeds from a detached checkout at the branch tip", async () => {
+    const harness = await makeHarness({
+      detached: true,
+      existing: true,
+      noChange: true,
+    });
+    await expect(runUpdate(harness.execution)).resolves.toMatchObject({
+      operation: "closed",
+    });
+  });
+});
+
 describe("no-change close compensation", () => {
   it("returns the closed pull and deleted branch for reporting", async () => {
     const harness = await makeHarness({ existing: true, noChange: true });
@@ -863,6 +896,7 @@ interface HarnessOptions {
   noChange?: boolean;
   loseAfterPush?: boolean;
   baseDriftAt?: number;
+  detached?: boolean;
   refLossAt?: number;
 }
 
@@ -891,6 +925,9 @@ async function makeHarness(options: HarnessOptions = {}) {
   ).stdout.trim();
   await exec("git", ["init", "--bare", remote]);
   await exec("git", ["-C", workspace, "push", remote, "main"]);
+  if (options.detached) {
+    await exec("git", ["-C", workspace, "checkout", "--detach", baseSha]);
+  }
   let oldSha = "";
   if (options.existing) {
     await exec("git", [
