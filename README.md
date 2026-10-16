@@ -76,6 +76,13 @@ Enterprise Server, including self-hosted Linux runners with system Git in
 `/usr/local/bin` or the standard Nix/NixOS system profiles. Windows and macOS
 runners are not supported.
 
+The caller may check out a branch or an exact commit SHA. For detached checkouts
+(including `ref: ${{ github.sha }}`), the action uses the workflow's
+`refs/heads/...` ref as the base branch and keeps the checked-out SHA as the
+base commit. Detached tag runs and missing or invalid branch refs are rejected.
+If the base branch advances after checkout, the update fails rather than
+silently switching to a newer commit; rerun the workflow with a fresh checkout.
+
 Each run resolves the latest stable `prek` release from the official GitHub
 release URL. The lookup uses bounded retries and the run fails if it cannot
 resolve a release: because the runner tool cache is keyed by the resolved

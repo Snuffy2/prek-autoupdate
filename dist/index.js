@@ -36565,12 +36565,27 @@ async function resolveContext(client, inputs) {
     const { owner, repo: repository } = context.repo;
     const repositoryFullName = `${owner}/${repository}`;
     const serverUrl = normalizeServerUrl(context.serverUrl);
-    const baseBranch = await git$1(workspace, [
+    let baseBranch = await gitOptional(workspace, [
         "symbolic-ref",
         "--quiet",
         "--short",
         "HEAD",
     ]);
+    if (baseBranch === "") {
+        const ref = context.ref;
+        const branch = ref.startsWith("refs/heads/")
+            ? ref.slice("refs/heads/".length)
+            : "";
+        if (branch === "" ||
+            (await gitOptional(workspace, [
+                "check-ref-format",
+                "--normalize",
+                ref,
+            ])) !== ref) {
+            throw new Error("A detached checkout requires a valid workflow branch ref (refs/heads/...); tag runs are not supported");
+        }
+        baseBranch = branch;
+    }
     const baseSha = await git$1(workspace, ["rev-parse", "HEAD"]);
     const identity = await resolveAuthenticatedIdentity(client, inputs.token, inputs.authorLogin);
     return {

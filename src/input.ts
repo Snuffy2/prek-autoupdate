@@ -117,12 +117,31 @@ export async function resolveContext(
   const { owner, repo: repository } = github.context.repo;
   const repositoryFullName = `${owner}/${repository}`;
   const serverUrl = normalizeServerUrl(github.context.serverUrl);
-  const baseBranch = await git(workspace, [
+  let baseBranch = await gitOptional(workspace, [
     "symbolic-ref",
     "--quiet",
     "--short",
     "HEAD",
   ]);
+  if (baseBranch === "") {
+    const ref = github.context.ref;
+    const branch = ref.startsWith("refs/heads/")
+      ? ref.slice("refs/heads/".length)
+      : "";
+    if (
+      branch === "" ||
+      (await gitOptional(workspace, [
+        "check-ref-format",
+        "--normalize",
+        ref,
+      ])) !== ref
+    ) {
+      throw new Error(
+        "A detached checkout requires a valid workflow branch ref (refs/heads/...); tag runs are not supported",
+      );
+    }
+    baseBranch = branch;
+  }
   const baseSha = await git(workspace, ["rev-parse", "HEAD"]);
   const identity = await resolveAuthenticatedIdentity(
     client,
