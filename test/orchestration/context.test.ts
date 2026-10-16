@@ -117,13 +117,34 @@ describe("resolveContext checkout branches", () => {
   ])("rejects detached checkout with workflow ref %j", async (ref) => {
     github.context.ref = ref;
     await git(directory, "checkout", "--detach", originalSha);
-    await expect(resolveContext(client, inputs)).rejects.toThrow(
-      "A detached checkout requires a workflow ref of the form refs/heads/<branch>",
+    const error = await resolveContext(client, inputs).catch(
+      (caught: unknown) => caught,
     );
+    expect(error).toBeInstanceOf(Error);
+    const message = (error as Error).message;
+    expect(message).toContain("A detached checkout requires a workflow ref");
+    expect(message).toContain(ref === "" ? "empty ref" : `"${ref}"`);
+    expect(await git(directory, "rev-parse", "HEAD")).toBe(originalSha);
   });
 
-  it("propagates Git failures rather than treating them as detached HEAD", async () => {
+  it("propagates Git failures for a missing workspace rather than treating them as detached HEAD", async () => {
     vi.stubEnv("GITHUB_WORKSPACE", path.join(directory, "missing"));
     await expect(resolveContext(client, inputs)).rejects.toThrow();
+  });
+
+  it("propagates Git failures for a non-repository workspace rather than treating them as detached HEAD", async () => {
+    const plain = await mkdtemp(path.join(tmpdir(), "prek-context-plain-"));
+    try {
+      vi.stubEnv("GITHUB_WORKSPACE", plain);
+      const error = await resolveContext(client, inputs).catch(
+        (caught: unknown) => caught,
+      );
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).not.toContain(
+        "A detached checkout requires",
+      );
+    } finally {
+      await rm(plain, { recursive: true, force: true });
+    }
   });
 });
