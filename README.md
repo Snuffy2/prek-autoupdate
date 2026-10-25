@@ -105,7 +105,7 @@ not match your repository.
 | `update-day`            | `"1"`                 | UTC day for scheduled updates: `0` is Sunday and `6` is Saturday.                                                                                |
 | `update-branch`         | `chore/prek-updates`  | The branch for the update pull request.                                                                                                          |
 | `branch-prefix`         | `chore/prek-updates`  | The branch prefix that cleanup treats as action-owned.                                                                                           |
-| `label`                 | `dependencies`        | An existing repository label applied to the update PR and used to prove ownership during cleanup.                                                |
+| `label`                 | `dependencies`        | Repository label applied to the update PR and used to prove ownership during cleanup. Created automatically if missing during an update.         |
 | `commit-message-prefix` | `deps`                | Prefix applied to both the update commit message and PR title.                                                                                   |
 | `commit-message-title`  | `update prek hooks`   | Shared subject for the update commit message and PR title.                                                                                       |
 | `add-paths`             | auto-detect           | Newline-separated repository-relative paths to commit. When blank, the action requires exactly one of `prek.toml` or `.pre-commit-config.yaml`.  |

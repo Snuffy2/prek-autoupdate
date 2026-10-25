@@ -40210,7 +40210,6 @@ async function validateUpdateConfiguration(execution) {
         validateAddPath(addPath);
     }
     await assertBaseCommit(execution);
-    await assertOwnershipLabel(execution);
 }
 /** Validate the ownership namespace before cleanup is allowed to mutate. */
 function validateCleanupConfiguration(execution) {
@@ -40222,6 +40221,7 @@ async function runUpdate(execution) {
     const addPaths = await resolveAddPaths(execution);
     await proveBase(execution);
     const remote = await observeRemoteState(execution);
+    await ensureOwnershipLabel(execution);
     const temporaryRoot = await createTemporaryRoot();
     const worktree = path$1.join(temporaryRoot, "worktree");
     let added = false;
@@ -40831,16 +40831,42 @@ async function assertBaseCommit(execution) {
         execution.context.baseSha,
     ]);
 }
-async function assertOwnershipLabel(execution) {
+async function ensureOwnershipLabel(execution) {
+    const label = {
+        owner: execution.context.owner,
+        repo: execution.context.repository,
+        name: execution.inputs.label,
+    };
     try {
-        await execution.client.rest.issues.getLabel({
-            owner: execution.context.owner,
-            repo: execution.context.repository,
-            name: execution.inputs.label,
+        await execution.client.rest.issues.getLabel(label);
+        return;
+    }
+    catch (error) {
+        if (!isNotFound(error)) {
+            throw error;
+        }
+    }
+    try {
+        await execution.client.rest.issues.createLabel({
+            ...label,
+            color: "0366d6",
         });
     }
     catch (error) {
-        throw new Error(`Configured ownership label ${JSON.stringify(execution.inputs.label)} does not exist or is not accessible`, { cause: error });
+        if (typeof error === "object" &&
+            error !== null &&
+            "status" in error &&
+            error.status === 422) {
+            // A concurrent run may have created the label after our lookup.
+            try {
+                await execution.client.rest.issues.getLabel(label);
+                return;
+            }
+            catch {
+                // Preserve the creation failure unless the label now exists.
+            }
+        }
+        throw error;
     }
 }
 async function observeRemoteState(execution) {
