@@ -512,16 +512,73 @@ describe("non-mutating update preflight", () => {
     },
   );
 
-  it("fails preflight clearly when the ownership label is unavailable", async () => {
-    const execution = await makeExecution([]);
+  it("creates a missing ownership label and completes the update", async () => {
+    const execution = await makeExecution(["prek.toml"]);
     vi.mocked(execution.client.rest.issues.getLabel).mockRejectedValueOnce(
       Object.assign(new Error("missing"), { status: 404 }),
     );
 
-    await expect(validateUpdateConfiguration(execution)).rejects.toThrow(
-      /ownership label "dependencies" does not exist or is not accessible/u,
-    );
+    await expect(runUpdate(execution)).resolves.toEqual({ operation: "none" });
+    expect(execution.client.rest.issues.createLabel).toHaveBeenCalledWith({
+      owner: "owner",
+      repo: "repo",
+      name: "dependencies",
+      color: expect.any(String),
+    });
   });
+
+  it("does not create labels during configuration validation", async () => {
+    const execution = await makeExecution([]);
+    vi.mocked(execution.client.rest.issues.getLabel).mockRejectedValueOnce(
+      Object.assign(new Error("missing"), { status: 404 }),
+    );
+    await validateUpdateConfiguration(execution);
+    expect(execution.client.rest.issues.createLabel).not.toHaveBeenCalled();
+  });
+
+  it("uses an existing label without changing it", async () => {
+    const execution = await makeExecution(["prek.toml"]);
+    await expect(runUpdate(execution)).resolves.toEqual({ operation: "none" });
+    expect(execution.client.rest.issues.createLabel).not.toHaveBeenCalled();
+  });
+
+  it("accepts a label created concurrently by another run", async () => {
+    const execution = await makeExecution(["prek.toml"]);
+    vi.mocked(execution.client.rest.issues.getLabel).mockRejectedValueOnce(
+      Object.assign(new Error("missing"), { status: 404 }),
+    );
+    vi.mocked(execution.client.rest.issues.createLabel).mockRejectedValueOnce(
+      Object.assign(new Error("already exists"), { status: 422 }),
+    );
+    await expect(runUpdate(execution)).resolves.toEqual({ operation: "none" });
+  });
+
+  it.each([403, 500])("propagates label lookup failure %s", async (status) => {
+    const execution = await makeExecution(["prek.toml"]);
+    const error = Object.assign(new Error("lookup failed"), { status });
+    vi.mocked(execution.client.rest.issues.getLabel).mockRejectedValueOnce(
+      error,
+    );
+    await expect(runUpdate(execution)).rejects.toBe(error);
+    expect(execution.client.rest.issues.createLabel).not.toHaveBeenCalled();
+    expect(prekMocks.install).not.toHaveBeenCalled();
+  });
+
+  it.each([403, 422, 500])(
+    "propagates label creation failure %s",
+    async (status) => {
+      const execution = await makeExecution(["prek.toml"]);
+      vi.mocked(execution.client.rest.issues.getLabel).mockRejectedValue(
+        Object.assign(new Error("missing"), { status: 404 }),
+      );
+      const error = Object.assign(new Error("creation failed"), { status });
+      vi.mocked(execution.client.rest.issues.createLabel).mockRejectedValueOnce(
+        error,
+      );
+      await expect(runUpdate(execution)).rejects.toBe(error);
+      expect(prekMocks.install).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(["github-actions[bot]", "pat-owner"])(
     "uses authenticated login %s for ownership",
@@ -697,6 +754,7 @@ async function makeExecution(
       git: { getRef },
       issues: {
         getLabel: vi.fn(async () => ({ data: { name: "dependencies" } })),
+        createLabel: vi.fn(async () => ({ data: { name: "dependencies" } })),
       },
       pulls: {
         get: async () => ({ data: effectivePulls[0] }),
