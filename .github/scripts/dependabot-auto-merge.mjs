@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const DEPENDABOT = "dependabot[bot]";
 const WEB_FLOW = "web-flow";
+const AUTOFIX_BOT = "prek-autofix-bot";
 
 function refuse(message) {
   throw new Error(`Refusing auto-merge; ${message}`);
@@ -47,18 +48,18 @@ function assertAllowedFiles(ecosystem, changedFiles, trustedBaseDirectory) {
       !isTrustedBaseFile(trustedBaseDirectory, "package-lock.json")
     )
       refuse("the trusted base does not use npm.");
-    const isPackageFile = (path) =>
-      path === "package.json" || path === "package-lock.json";
-    const isLockfileOnly =
-      changedFiles.length === 1 && changedFiles[0] === "package-lock.json";
-    const isManifestAndLockfile =
-      changedFiles.length === 2 &&
-      changedFiles.includes("package.json") &&
-      changedFiles.includes("package-lock.json") &&
-      changedFiles.every(isPackageFile);
-    if (!isLockfileOnly && !isManifestAndLockfile)
+    const allowedFiles = new Set([
+      "package.json",
+      "package-lock.json",
+      "dist/index.js",
+    ]);
+    if (
+      !changedFiles.includes("package-lock.json") ||
+      new Set(changedFiles).size !== changedFiles.length ||
+      !changedFiles.every((path) => allowedFiles.has(path))
+    )
       refuse(
-        "npm updates must change only package.json and package-lock.json.",
+        "npm updates must include package-lock.json and change only the npm manifest, lockfile, or action bundles.",
       );
     return;
   }
@@ -90,7 +91,9 @@ function assertDirectDependabotHistory(event, commits) {
 }
 
 function assertMergeParentAncestry(event, commits, ancestryProofs) {
-  const mergeCommits = commits.slice(1);
+  const mergeCommits = commits
+    .slice(1)
+    .filter((commit) => commit?.parents?.length === 2);
   const currentBase = event.pull_request.base.sha;
   if (
     !Array.isArray(ancestryProofs) ||
@@ -117,35 +120,48 @@ function assertMergeParentAncestry(event, commits, ancestryProofs) {
   }
 }
 
-function assertUpdateBranchHistory(event, commits, ancestryProofs) {
+function assertFollowupHistory(event, commits, ancestryProofs) {
   if (commits.length < 2)
-    refuse("the pull request is not a GitHub Update branch merge.");
+    refuse("the pull request has no supported follow-up history.");
   if (!isVerifiedDependabotCommit(commits[0]))
     refuse("the pull request history does not begin with Dependabot.");
 
   for (let index = 1; index < commits.length; index += 1) {
     const commit = commits[index];
     const previous = commits[index - 1];
+    // Autofix uses the Git data API, whose commits are not web-flow signed.
+    // This exception is limited to same-repository Dependabot branches and the
+    // file allowlist below. Branch write access remains the trust boundary;
+    // GitHub account attribution is not a cryptographic signature.
+    const isAutofix =
+      commit?.author?.login === AUTOFIX_BOT &&
+      commit?.committer?.login === AUTOFIX_BOT &&
+      commit?.parents?.length === 1;
+    const isBaseMerge =
+      commit?.committer?.login === WEB_FLOW &&
+      commit?.commit?.verification?.verified === true &&
+      commit?.parents?.length === 2;
     if (
-      commit?.committer?.login !== WEB_FLOW ||
-      commit?.commit?.verification?.verified !== true ||
-      commit?.parents?.length !== 2 ||
+      (!isAutofix && !isBaseMerge) ||
       commit.parents[0]?.sha !== previous?.sha
     )
-      refuse("the pull request contains a non-Dependabot edit.");
+      refuse("the pull request contains an unsupported follow-up edit.");
   }
 
   assertMergeParentAncestry(event, commits, ancestryProofs);
   const latest = commits.at(-1);
   if (
     latest?.sha !== event.pull_request.head.sha ||
-    latest.parents[1]?.sha !== event.pull_request.base.sha
+    (latest.parents.length === 2 &&
+      latest.parents[1]?.sha !== event.pull_request.base.sha)
   )
-    refuse("the latest commit is not an update from the current base branch.");
+    refuse(
+      "the latest commit does not match the event head or current base merge.",
+    );
 }
 
 /**
- * Authorize a Dependabot update or a chain containing only GitHub Update branch merges.
+ * Authorize a Dependabot update with autofix commits and GitHub base merges.
  *
  * @param {object} input Validation inputs from the pull-request event and API.
  */
@@ -169,7 +185,7 @@ export function authorizeDependabotUpdate({
 
   const ecosystem = dependencyEcosystem(pullRequest.head.ref);
   if (commits.length === 1) assertDirectDependabotHistory(event, commits);
-  else assertUpdateBranchHistory(event, commits, ancestryProofs);
+  else assertFollowupHistory(event, commits, ancestryProofs);
   assertAllowedFiles(ecosystem, changedFiles, trustedBaseDirectory);
   return ecosystem;
 }
