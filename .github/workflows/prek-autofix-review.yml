@@ -35,3 +35,6 @@ jobs:
       - name: Review with prek
         id: review
         uses: Snuffy2/prek-autofix/review@v1
+        with:
+          # Dependabot dependency updates need the checked-in bundle rebuilt.
+          ignore-authors: "renovate[bot]"

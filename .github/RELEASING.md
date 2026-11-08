@@ -20,6 +20,12 @@ runtime, so Release Please's package and lockfile version bumps do not require a
 bundle rebuild. Source or runtime dependency changes still require rebuilding
 and committing `dist/index.js`; CI verifies that the bundle is current.
 
+The prek review workflow allows autofix for Dependabot so dependency updates
+receive the required bundle rebuild through the existing fix workflow. Keep
+`PREK_AUTOFIX_TOKEN` configured so fix commits trigger fresh CI. The separate
+Dependabot auto-merge policy rejects these additional commits; review and merge
+such pull requests manually after the checks pass.
+
 After publication, the workflow verifies the checked-in bundle and promotes the
 stable `vMAJOR` tag using the existing guarded, monotonic tag updater. It does
 not rewrite the version tag or `main`. Prereleases are not promoted to stable
