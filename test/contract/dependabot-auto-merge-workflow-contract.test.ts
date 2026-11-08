@@ -50,6 +50,19 @@ function dependabotCommit(sha = headSha) {
   };
 }
 
+function autofixCommit(
+  sha = headSha,
+  parent = dependabotSha,
+): ReturnType<typeof updateCommit> {
+  return {
+    author: { login: "prek-autofix-bot" },
+    commit: { verification: { verified: false } },
+    committer: { login: "prek-autofix-bot" },
+    parents: [{ sha: parent }],
+    sha,
+  };
+}
+
 function updateCommit(sha: string, previous: string, base: string) {
   return {
     author: { login: "Snuffy2" },
@@ -312,6 +325,119 @@ describe("Dependabot auto-merge authorization", () => {
         ),
       }),
     ).toBe("npm");
+  });
+
+  it("authorizes unsigned autofix bundle regeneration after Dependabot", () => {
+    for (const changedFiles of [
+      ["package-lock.json", "dist/index.js"],
+      ["package.json", "package-lock.json", "dist/index.js"],
+    ])
+      expect(
+        authorize({
+          changedFiles,
+          commits: [dependabotCommit(dependabotSha), autofixCommit()],
+        }),
+      ).toBe("npm");
+  });
+
+  it("authorizes autofixes before, between, and after verified base merges", () => {
+    const firstFixSha = "6".repeat(40);
+    const secondFixSha = "7".repeat(40);
+    const lastMergeSha = "8".repeat(40);
+    const commits = [
+      dependabotCommit(dependabotSha),
+      autofixCommit(firstFixSha),
+      updateCommit(firstUpdateSha, firstFixSha, firstBaseSha),
+      autofixCommit(secondFixSha, firstUpdateSha),
+      updateCommit(lastMergeSha, secondFixSha, currentBaseSha),
+      autofixCommit(headSha, lastMergeSha),
+    ];
+    expect(
+      authorize({
+        ancestryProofs: updateChainProofs(),
+        changedFiles: ["package-lock.json", "dist/index.js"],
+        commits,
+      }),
+    ).toBe("npm");
+    expect(
+      authorize({
+        ancestryProofs: updateChainProofs(),
+        commits: [
+          ...commits.slice(0, -2),
+          updateCommit(headSha, secondFixSha, currentBaseSha),
+        ],
+      }),
+    ).toBe("npm");
+    expect(() =>
+      authorize({
+        ancestryProofs: [ancestryProof(firstBaseSha)],
+        commits,
+      }),
+    ).toThrow();
+  });
+
+  it("rejects unknown, disconnected, or stale autofix follow-ups", () => {
+    const valid = autofixCommit();
+    for (const followup of [
+      { ...valid, author: { login: "maintainer" } },
+      { ...valid, committer: { login: "maintainer" } },
+      { ...valid, author: undefined },
+      { ...valid, committer: undefined },
+      { ...valid, parents: [] },
+      { ...valid, parents: [{ sha: "9".repeat(40) }] },
+      { ...valid, parents: [{ sha: dependabotSha }, { sha: currentBaseSha }] },
+      { ...valid, sha: "9".repeat(40) },
+    ])
+      expect(() =>
+        authorize({
+          changedFiles: ["package-lock.json", "dist/index.js"],
+          commits: [dependabotCommit(dependabotSha), followup],
+        }),
+      ).toThrow();
+  });
+
+  it("rejects autofixes without a verified Dependabot root", () => {
+    expect(() => authorize({ commits: [autofixCommit()] })).toThrow();
+    expect(() =>
+      authorize({
+        commits: [
+          {
+            ...dependabotCommit(dependabotSha),
+            commit: { verification: { verified: false } },
+          },
+          autofixCommit(),
+        ],
+      }),
+    ).toThrow();
+  });
+
+  it("rejects a final base merge that differs from the event base", () => {
+    expect(() =>
+      authorize({
+        ancestryProofs: [ancestryProof(firstBaseSha)],
+        commits: [
+          dependabotCommit(dependabotSha),
+          autofixCommit(firstUpdateSha),
+          updateCommit(headSha, firstUpdateSha, firstBaseSha),
+        ],
+      }),
+    ).toThrow();
+  });
+
+  it("rejects autofix changes outside the exact npm bundle scope", () => {
+    for (const changedFiles of [
+      ["package-lock.json", "dist/other/index.js"],
+      ["package-lock.json", "src/index.ts"],
+      ["package-lock.json", "dist/index.js", "dist/index.js"],
+      ["dist/index.js"],
+      ["package.json", "dist/index.js"],
+    ])
+      expect(() =>
+        authorize({
+          changedFiles,
+          commits: [dependabotCommit(dependabotSha), autofixCommit()],
+        }),
+      ).toThrow();
   });
 
   it("rejects manifest-only npm updates", () => {
