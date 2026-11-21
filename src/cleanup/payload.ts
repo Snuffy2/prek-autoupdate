@@ -1,7 +1,11 @@
+import {
+  isOwnedPull,
+  isSameRepository,
+  type OwnershipPolicy,
+} from "../ownership.js";
 import type {
   ClosedPullCandidate,
   CompensatablePull,
-  OwnershipPolicy,
   Payload,
 } from "./model.js";
 
@@ -34,11 +38,7 @@ function nestedString(
   key: "base" | "head",
   field: "ref" | "sha",
 ): string | undefined {
-  const nested = pull[key];
-  if (nested === null || typeof nested !== "object" || Array.isArray(nested))
-    return undefined;
-  const value = (nested as Payload)[field];
-  return typeof value === "string" ? value : undefined;
+  return stringValue(objectField(pull[key], field));
 }
 
 export const pullHeadSha = (pull: Payload): string | undefined =>
@@ -59,52 +59,44 @@ export function sameRepoHeadRef(
   pull: Payload,
   repository: string,
 ): string | undefined {
-  const head = pull.head;
-  if (head === null || typeof head !== "object" || Array.isArray(head))
-    return undefined;
-  const headPayload = head as Payload;
-  const repo = headPayload.repo;
-  if (repo === null || typeof repo !== "object" || Array.isArray(repo))
-    return undefined;
-  const fullName = (repo as Payload).full_name;
-  return typeof fullName === "string" &&
-    fullName.toLowerCase() === repository.toLowerCase() &&
-    typeof headPayload.ref === "string"
-    ? headPayload.ref
+  return isSameRepository(pullHeadRepository(pull), repository)
+    ? pullHeadRef(pull)
     : undefined;
+}
+
+function objectField(value: unknown, key: string): unknown {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Payload)[key]
+    : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function pullHeadRepository(pull: Payload): string | undefined {
+  return stringValue(objectField(objectField(pull.head, "repo"), "full_name"));
 }
 
 export function isWorkflowPull(
   pull: Payload,
   policy: OwnershipPolicy,
 ): boolean {
-  const labels = pull.labels;
-  if (
-    !Array.isArray(labels) ||
-    !labels.some(
-      (label) =>
-        label !== null &&
-        typeof label === "object" &&
-        !Array.isArray(label) &&
-        (label as Payload).name === policy.labelName,
-    )
-  )
-    return false;
-  const user = pull.user;
-  if (
-    user === null ||
-    typeof user !== "object" ||
-    Array.isArray(user) ||
-    (user as Payload).login !== policy.authorLogin
-  )
-    return false;
-  if (typeof pull.body !== "string" || !pull.body.includes(policy.bodyMarker))
-    return false;
-  const ref = sameRepoHeadRef(pull, policy.repository);
-  return (
-    pullBaseRef(pull) === policy.baseBranch &&
-    ref !== undefined &&
-    (ref === policy.branch || ref.startsWith(policy.branchPrefix))
+  return isOwnedPull(
+    {
+      author: stringValue(objectField(pull.user, "login")),
+      body: stringValue(pull.body),
+      headRef: pullHeadRef(pull),
+      headRepository: pullHeadRepository(pull),
+      baseRef: pullBaseRef(pull),
+      labels: Array.isArray(pull.labels)
+        ? pull.labels
+            .map((label) => objectField(label, "name"))
+            .filter((name) => typeof name === "string")
+        : [],
+    },
+    policy,
+    "update-branch-or-prefix",
   );
 }
 

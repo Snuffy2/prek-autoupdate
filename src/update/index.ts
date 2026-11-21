@@ -14,10 +14,15 @@ import {
   hardenedGitArguments,
   sanitizedChildEnvironment,
 } from "../environment.js";
+import {
+  BODY_MARKER,
+  isOwnedPull,
+  isSameRepository,
+  ownershipPolicy,
+} from "../ownership.js";
 import { installPrek, type PrekInstallation } from "../prek/index.js";
 
 const execFileAsync = promisify(execFile);
-export const BODY_MARKER = "Automated update of `prek` hooks.";
 const MAX_OUTPUT = 32_000;
 
 interface RemoteState {
@@ -710,20 +715,22 @@ function isOwnedAutoMergePull(
   pullNumber: number,
   expectedHeadOid: string,
 ): boolean {
-  const labels = pull.labels?.nodes;
   return (
-    pull.author?.login === execution.context.authenticatedLogin &&
-    pull.baseRefName === execution.context.baseBranch &&
-    typeof pull.body === "string" &&
-    pull.body.includes(BODY_MARKER) &&
-    pull.headRefName === execution.inputs.updateBranch &&
-    pull.headRefOid === expectedHeadOid &&
-    pull.headRepository?.nameWithOwner?.toLowerCase() ===
-      execution.context.repositoryFullName.toLowerCase() &&
-    Array.isArray(labels) &&
-    labels.some((label) => label.name === execution.inputs.label) &&
     pull.number === pullNumber &&
-    pull.state === "OPEN"
+    pull.state === "OPEN" &&
+    pull.headRefOid === expectedHeadOid &&
+    isOwnedPull(
+      {
+        author: pull.author?.login,
+        body: pull.body,
+        headRef: pull.headRefName,
+        headRepository: pull.headRepository?.nameWithOwner,
+        baseRef: pull.baseRefName,
+        labels: pull.labels.nodes.map((label) => label.name),
+      },
+      ownershipPolicy(execution),
+      "exact-update-branch",
+    )
   );
 }
 
@@ -843,8 +850,10 @@ async function recoverAmbiguousCreatedPull(
         pull.body === body &&
         pull.title === execution.inputs.prTitle &&
         pull.headRef === execution.inputs.updateBranch &&
-        pull.headRepository?.toLowerCase() ===
-          execution.context.repositoryFullName.toLowerCase() &&
+        isSameRepository(
+          pull.headRepository,
+          execution.context.repositoryFullName,
+        ) &&
         pull.headSha === newSha &&
         pull.baseRef === execution.context.baseBranch,
     );
@@ -1145,15 +1154,7 @@ function pullFromData(data: {
 }
 
 function isOwned(execution: ActionExecution, pull: PullRequest): boolean {
-  return (
-    pull.author === execution.context.authenticatedLogin &&
-    pull.body?.includes(BODY_MARKER) === true &&
-    pull.headRef === execution.inputs.updateBranch &&
-    pull.headRepository?.toLowerCase() ===
-      execution.context.repositoryFullName.toLowerCase() &&
-    pull.baseRef === execution.context.baseBranch &&
-    pull.labels.includes(execution.inputs.label)
-  );
+  return isOwnedPull(pull, ownershipPolicy(execution), "exact-update-branch");
 }
 
 async function runPrek(

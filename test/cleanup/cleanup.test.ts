@@ -191,37 +191,48 @@ describe("cleanupUpdateBranches safety behavior", () => {
     expect(api.closedNumbers).toEqual([]);
   });
 
-  it("requires authenticated author, marker, label, same repo, and prefix", async () => {
-    const api = new FakeApi();
-    api.open = [
-      pull({ number: 1, user: { login: "other" } }),
-      pull({ number: 2, body: "other" }),
-      pull({ number: 3, labels: [] }),
-      pull({
-        number: 4,
-        head: { ref: branch, sha: "head", repo: { full_name: "fork/repo" } },
-      }),
-      pull({
-        number: 5,
+  it.each([
+    ["another author", { user: { login: "other" } }, branch],
+    ["a missing body marker", { body: "other" }, branch],
+    ["a missing ownership label", { labels: [] }, branch],
+    [
+      "a fork head",
+      { head: { ref: branch, sha: "head", repo: { full_name: "fork/repo" } } },
+      branch,
+    ],
+    ["another base branch", { base: { ref: "release" } }, branch],
+    [
+      "a head outside the update namespace",
+      {
         head: { ref: "unowned", sha: "head", repo: { full_name: repository } },
-      }),
-    ];
-    const result = await cleanupWithApi(api, execution, defaults);
-    expect(result).toEqual({ closedPullRequests: [], deletedBranches: [] });
-  });
+      },
+      "unowned",
+    ],
+  ] satisfies [string, Payload, string][])(
+    "preserves pull requests and refs with %s",
+    async (_reason, overrides, headBranch) => {
+      const ref = `heads/${headBranch}`;
+      const openApi = new FakeApi();
+      openApi.open = [pull(overrides)];
+      openApi.details.set(1, [pull(overrides), closed(overrides)]);
+      openApi.refs.set(ref, "head");
 
-  it("preserves matching open and closed pulls targeting another base", async () => {
-    const api = new FakeApi();
-    api.open = [pull({ base: { ref: "release" } })];
-    api.closed = [closed({ number: 2, base: { ref: "release" } })];
-    api.refs.set(`heads/${branch}`, "head");
+      const closedApi = new FakeApi();
+      const candidate = closed(overrides);
+      closedApi.closed = [candidate];
+      closedApi.details.set(1, [candidate]);
+      closedApi.refs.set(ref, "head");
 
-    const result = await cleanupWithApi(api, execution, defaults);
+      for (const api of [openApi, closedApi]) {
+        const result = await cleanupWithApi(api, execution, defaults);
 
-    expect(result).toEqual({ closedPullRequests: [], deletedBranches: [] });
-    expect(api.closedNumbers).toEqual([]);
-    expect(api.deleted).toEqual([]);
-  });
+        expect(result).toEqual({ closedPullRequests: [], deletedBranches: [] });
+        expect(api.closedNumbers).toEqual([]);
+        expect(api.deleted).toEqual([]);
+        expect(api.refs.get(ref)).toBe("head");
+      }
+    },
+  );
 
   it("does not delete a closed branch whose current SHA differs", async () => {
     const api = new FakeApi();
@@ -244,16 +255,31 @@ describe("cleanupUpdateBranches safety behavior", () => {
     expect(api.deleted).toEqual([]);
   });
 
-  it("deletes with the exact queued SHA after all evidence remains stable", async () => {
-    const api = new FakeApi();
-    const candidate = closed();
-    api.closed = [candidate];
-    api.refs.set(`heads/${branch}`, "head");
-    api.details.set(1, [candidate]);
-    const result = await cleanupWithApi(api, execution, defaults);
-    expect(result.deletedBranches).toEqual([branch]);
-    expect(api.deleted).toEqual([[`heads/${branch}`, "head"]]);
-  });
+  it.each([branch, "automation/old"])(
+    "deletes owned branch %s with the exact queued SHA",
+    async (headBranch) => {
+      const api = new FakeApi();
+      const candidate = closed({
+        head: { ref: headBranch, sha: "head", repo: { full_name: repository } },
+      });
+      api.closed = [candidate];
+      api.refs.set(`heads/${headBranch}`, "head");
+      api.details.set(1, [candidate]);
+
+      const result = await cleanupWithApi(
+        api,
+        {
+          ...execution,
+          inputs: { ...execution.inputs, branchPrefix: "automation/" },
+        },
+        defaults,
+      );
+
+      expect(result.deletedBranches).toEqual([headBranch]);
+      expect(api.deleted).toEqual([[`heads/${headBranch}`, "head"]]);
+      expect(api.refs.has(`heads/${headBranch}`)).toBe(false);
+    },
+  );
 
   it("fails closed on conflicting SHA evidence for a reused branch", async () => {
     const api = new FakeApi();

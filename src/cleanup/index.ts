@@ -4,13 +4,13 @@ import type {
   CleanupResult,
   GitHubClient,
 } from "../contracts.js";
+import { ownershipPolicy, type OwnershipPolicy } from "../ownership.js";
 import { OctokitCleanupApi } from "./github.js";
 import type {
   BranchDeletion,
   CleanupApi,
   ClosedPullCandidate,
   CompensatablePull,
-  OwnershipPolicy,
   Payload,
   PullComparisonSnapshot,
 } from "./model.js";
@@ -27,8 +27,6 @@ import {
   sameCandidate,
   sameRepoHeadRef,
 } from "./payload.js";
-
-const BODY_MARKER = "Automated update of `prek` hooks.";
 
 export async function cleanupUpdateBranches(
   execution: ActionExecution,
@@ -55,15 +53,7 @@ export async function cleanupWithApi(
     closedPullRequests: [] as number[],
     deletedBranches: [] as string[],
   };
-  const policy: OwnershipPolicy = {
-    repository: execution.context.repositoryFullName,
-    baseBranch: execution.context.baseBranch,
-    branch: execution.inputs.updateBranch,
-    branchPrefix: execution.inputs.branchPrefix,
-    labelName: execution.inputs.label,
-    authorLogin: execution.context.authenticatedLogin,
-    bodyMarker: BODY_MARKER,
-  };
+  const policy = ownershipPolicy(execution);
   const openPulls = await api.listPulls("open");
   const workflowOpen = openPulls.filter((pull) => isWorkflowPull(pull, policy));
   const workflowNumbers = new Set(workflowOpen.map(pullNumber));
@@ -541,7 +531,6 @@ export type {
   ClosedPullCandidate,
   CompensatablePull,
   DeleteRefOutcome,
-  OwnershipPolicy,
   Payload,
   PullComparisonSnapshot,
 } from "./model.js";

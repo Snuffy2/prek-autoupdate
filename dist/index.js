@@ -35856,6 +35856,32 @@ function getOctokit(token, options, ...additionalPlugins) {
     return new GitHubWithPlugins(getOctokitOptions(token));
 }
 
+const BODY_MARKER = "Automated update of `prek` hooks.";
+function ownershipPolicy({ context, inputs, }) {
+    return {
+        repository: context.repositoryFullName,
+        baseBranch: context.baseBranch,
+        updateBranch: inputs.updateBranch,
+        branchPrefix: inputs.branchPrefix,
+        labelName: inputs.label,
+        authorLogin: context.authenticatedLogin,
+    };
+}
+function isSameRepository(headRepository, repository) {
+    return headRepository?.toLowerCase() === repository.toLowerCase();
+}
+function isOwnedPull(pull, policy, branchRule) {
+    return (pull.author === policy.authorLogin &&
+        typeof pull.body === "string" &&
+        pull.body.includes(BODY_MARKER) &&
+        isSameRepository(pull.headRepository, policy.repository) &&
+        pull.baseRef === policy.baseBranch &&
+        pull.labels.includes(policy.labelName) &&
+        (pull.headRef === policy.updateBranch ||
+            (branchRule === "update-branch-or-prefix" &&
+                pull.headRef?.startsWith(policy.branchPrefix) === true)));
+}
+
 const BLOCKED_GIT_VARIABLES = new Set([
     "GIT_ASKPASS",
     "GIT_CEILING_DIRECTORIES",
@@ -35946,11 +35972,7 @@ function pullChangedFiles(pull) {
     return value;
 }
 function nestedString(pull, key, field) {
-    const nested = pull[key];
-    if (nested === null || typeof nested !== "object" || Array.isArray(nested))
-        return undefined;
-    const value = nested[field];
-    return typeof value === "string" ? value : undefined;
+    return stringValue(objectField(pull[key], field));
 }
 const pullHeadSha = (pull) => nestedString(pull, "head", "sha");
 const pullHeadRef = (pull) => nestedString(pull, "head", "ref");
@@ -35962,40 +35984,34 @@ function headRef(pull) {
     return ref;
 }
 function sameRepoHeadRef(pull, repository) {
-    const head = pull.head;
-    if (head === null || typeof head !== "object" || Array.isArray(head))
-        return undefined;
-    const headPayload = head;
-    const repo = headPayload.repo;
-    if (repo === null || typeof repo !== "object" || Array.isArray(repo))
-        return undefined;
-    const fullName = repo.full_name;
-    return typeof fullName === "string" &&
-        fullName.toLowerCase() === repository.toLowerCase() &&
-        typeof headPayload.ref === "string"
-        ? headPayload.ref
+    return isSameRepository(pullHeadRepository(pull), repository)
+        ? pullHeadRef(pull)
         : undefined;
 }
+function objectField(value, key) {
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+        ? value[key]
+        : undefined;
+}
+function stringValue(value) {
+    return typeof value === "string" ? value : undefined;
+}
+function pullHeadRepository(pull) {
+    return stringValue(objectField(objectField(pull.head, "repo"), "full_name"));
+}
 function isWorkflowPull(pull, policy) {
-    const labels = pull.labels;
-    if (!Array.isArray(labels) ||
-        !labels.some((label) => label !== null &&
-            typeof label === "object" &&
-            !Array.isArray(label) &&
-            label.name === policy.labelName))
-        return false;
-    const user = pull.user;
-    if (user === null ||
-        typeof user !== "object" ||
-        Array.isArray(user) ||
-        user.login !== policy.authorLogin)
-        return false;
-    if (typeof pull.body !== "string" || !pull.body.includes(policy.bodyMarker))
-        return false;
-    const ref = sameRepoHeadRef(pull, policy.repository);
-    return (pullBaseRef(pull) === policy.baseBranch &&
-        ref !== undefined &&
-        (ref === policy.branch || ref.startsWith(policy.branchPrefix)));
+    return isOwnedPull({
+        author: stringValue(objectField(pull.user, "login")),
+        body: stringValue(pull.body),
+        headRef: pullHeadRef(pull),
+        headRepository: pullHeadRepository(pull),
+        baseRef: pullBaseRef(pull),
+        labels: Array.isArray(pull.labels)
+            ? pull.labels
+                .map((label) => objectField(label, "name"))
+                .filter((name) => typeof name === "string")
+            : [],
+    }, policy, "update-branch-or-prefix");
 }
 function closeIdentity(pull) {
     const number = pull.number;
@@ -36251,7 +36267,6 @@ function isStatus$1(error, status) {
         error.status === status);
 }
 
-const BODY_MARKER$1 = "Automated update of `prek` hooks.";
 async function cleanupUpdateBranches(execution, options) {
     const api = new OctokitCleanupApi(execution.client, execution.context.owner, execution.context.repository, execution.inputs.token, execution.context.serverUrl);
     return cleanupWithApi(api, execution, options);
@@ -36261,15 +36276,7 @@ async function cleanupWithApi(api, execution, options) {
         closedPullRequests: [],
         deletedBranches: [],
     };
-    const policy = {
-        repository: execution.context.repositoryFullName,
-        baseBranch: execution.context.baseBranch,
-        branch: execution.inputs.updateBranch,
-        branchPrefix: execution.inputs.branchPrefix,
-        labelName: execution.inputs.label,
-        authorLogin: execution.context.authenticatedLogin,
-        bodyMarker: BODY_MARKER$1,
-    };
+    const policy = ownershipPolicy(execution);
     const openPulls = await api.listPulls("open");
     const workflowOpen = openPulls.filter((pull) => isWorkflowPull(pull, policy));
     const workflowNumbers = new Set(workflowOpen.map(pullNumber));
@@ -40297,7 +40304,6 @@ async function verifySha256(archive, checksumContents, asset) {
 }
 
 const execFileAsync = promisify(execFile);
-const BODY_MARKER = "Automated update of `prek` hooks.";
 const MAX_OUTPUT = 32_000;
 /** Validate every non-mutating update precondition. */
 async function validateUpdateConfiguration(execution) {
@@ -40734,19 +40740,17 @@ async function disableUnverifiedAutoMerge(execution, pullRequestId) {
     warning("Disabled an auto-merge request after pull-request ownership revalidation failed");
 }
 function isOwnedAutoMergePull(execution, pull, pullNumber, expectedHeadOid) {
-    const labels = pull.labels?.nodes;
-    return (pull.author?.login === execution.context.authenticatedLogin &&
-        pull.baseRefName === execution.context.baseBranch &&
-        typeof pull.body === "string" &&
-        pull.body.includes(BODY_MARKER) &&
-        pull.headRefName === execution.inputs.updateBranch &&
+    return (pull.number === pullNumber &&
+        pull.state === "OPEN" &&
         pull.headRefOid === expectedHeadOid &&
-        pull.headRepository?.nameWithOwner?.toLowerCase() ===
-            execution.context.repositoryFullName.toLowerCase() &&
-        Array.isArray(labels) &&
-        labels.some((label) => label.name === execution.inputs.label) &&
-        pull.number === pullNumber &&
-        pull.state === "OPEN");
+        isOwnedPull({
+            author: pull.author?.login,
+            body: pull.body,
+            headRef: pull.headRefName,
+            headRepository: pull.headRepository?.nameWithOwner,
+            baseRef: pull.baseRefName,
+            labels: pull.labels.nodes.map((label) => label.name),
+        }, ownershipPolicy(execution), "exact-update-branch"));
 }
 async function createTemporaryRoot(create = mkdtemp, resolve = realpath, remove = rm$1) {
     const rawRoot = await create(path$1.join(tmpdir(), "prek-autoupdate-"));
@@ -40815,8 +40819,7 @@ async function recoverAmbiguousCreatedPull(execution, newSha, body) {
         pull.body === body &&
         pull.title === execution.inputs.prTitle &&
         pull.headRef === execution.inputs.updateBranch &&
-        pull.headRepository?.toLowerCase() ===
-            execution.context.repositoryFullName.toLowerCase() &&
+        isSameRepository(pull.headRepository, execution.context.repositoryFullName) &&
         pull.headSha === newSha &&
         pull.baseRef === execution.context.baseBranch);
     return matches.length === 1 ? matches[0]?.number : undefined;
@@ -41034,13 +41037,7 @@ function pullFromData(data) {
     };
 }
 function isOwned(execution, pull) {
-    return (pull.author === execution.context.authenticatedLogin &&
-        pull.body?.includes(BODY_MARKER) === true &&
-        pull.headRef === execution.inputs.updateBranch &&
-        pull.headRepository?.toLowerCase() ===
-            execution.context.repositoryFullName.toLowerCase() &&
-        pull.baseRef === execution.context.baseBranch &&
-        pull.labels.includes(execution.inputs.label));
+    return isOwnedPull(pull, ownershipPolicy(execution), "exact-update-branch");
 }
 async function runPrek(binary, worktree, cooldownDays) {
     try {

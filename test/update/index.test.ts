@@ -18,8 +18,8 @@ vi.mock("@actions/core", async (importOriginal) => {
 vi.mock("../../src/prek/index.js", () => ({ installPrek: prekMocks.install }));
 
 import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
+import { BODY_MARKER } from "../../src/ownership.js";
 import {
-  BODY_MARKER,
   createTemporaryRoot,
   enablePullRequestAutoMerge,
   runUpdate,
@@ -113,10 +113,6 @@ describe("captured output", () => {
     expect(sanitized).not.toContain("\u001B");
     expect(sanitized).not.toContain("\u0000");
     expect(sanitized).toMatch(/\[output truncated\]$/u);
-  });
-
-  it("keeps the exact ownership marker stable", () => {
-    expect(BODY_MARKER).toBe("Automated update of `prek` hooks.");
   });
 });
 

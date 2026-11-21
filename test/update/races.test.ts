@@ -39,7 +39,8 @@ vi.mock("../../src/environment.js", async (importOriginal) => {
 });
 
 import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
-import { BODY_MARKER, runUpdate } from "../../src/update/index.js";
+import { BODY_MARKER } from "../../src/ownership.js";
+import { runUpdate } from "../../src/update/index.js";
 
 const exec = promisify(execFile);
 const cleanups: string[] = [];
@@ -307,6 +308,11 @@ describe("update publication races", () => {
       pullRequestNumber: 42,
     });
 
+    expect(harness.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.stringContaining("Automated update of `prek` hooks."),
+      }),
+    );
     expect(harness.graphql).toHaveBeenCalledWith(
       expect.any(String),
       expect.objectContaining({
@@ -314,6 +320,49 @@ describe("update publication races", () => {
       }),
     );
   });
+
+  it.each([
+    ["a prefix-only head branch", { headRefName: "chore/prek-old" }],
+    ["a closed pull request", { state: "CLOSED" }],
+  ])(
+    "preserves the published update without enabling auto-merge on %s",
+    async (_reason, overrides) => {
+      const harness = await makeHarness();
+      harness.create.mockImplementation(async () => ({
+        data: mergePull(harness.pull, {
+          head: { ...harness.pull.head, sha: await remoteSha(harness.remote) },
+        }),
+      }));
+      let publishedSha: string | undefined;
+      let autoMergeEnabled = false;
+      harness.graphql.mockImplementation(
+        async (_document: string, variables: Record<string, unknown>) => {
+          publishedSha = await remoteSha(harness.remote);
+          if ("expectedHeadOid" in variables) autoMergeEnabled = true;
+          return {
+            repository: {
+              pullRequest: { ...autoMergePull(publishedSha), ...overrides },
+            },
+          };
+        },
+      );
+
+      await expect(
+        runUpdate({
+          ...harness.execution,
+          inputs: { ...harness.execution.inputs, autoMerge: true },
+        }),
+      ).rejects.toMatchObject({
+        publishedPullRequest: { operation: "created", pullRequestNumber: 42 },
+        cause: expect.objectContaining({
+          message:
+            "Pull request changed before squash auto-merge could be enabled",
+        }),
+      });
+      expect(autoMergeEnabled).toBe(false);
+      expect(await remoteSha(harness.remote)).toBe(publishedSha);
+    },
+  );
 
   it.each([
     { existing: false, operation: "created" },
@@ -659,6 +708,17 @@ describe("update publication races", () => {
       pullRequestNumber: 77,
     });
     expect(harness.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves the update ref when the associated pull only matches the cleanup prefix", async () => {
+    const harness = await makeHarness({ existing: true });
+    harness.pull.head.ref = "chore/prek-old";
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(/not owned/u);
+
+    expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
+    expect(harness.create).not.toHaveBeenCalled();
+    expect(harness.update).not.toHaveBeenCalled();
   });
 
   it("preserves a created branch when closing after label failure fails", async () => {

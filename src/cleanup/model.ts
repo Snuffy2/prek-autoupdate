@@ -1,15 +1,5 @@
 export type Payload = Record<string, unknown>;
 
-export interface OwnershipPolicy {
-  readonly repository: string;
-  readonly baseBranch: string;
-  readonly branch: string;
-  readonly branchPrefix: string;
-  readonly labelName: string;
-  readonly authorLogin: string;
-  readonly bodyMarker: string;
-}
-
 export interface PullComparisonSnapshot {
   readonly headSha: string;
   readonly headRef: string;
