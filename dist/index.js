@@ -36045,12 +36045,13 @@ class OctokitGitHubApi {
         this.token = token;
         this.serverUrl = serverUrl;
     }
-    async listPulls(state) {
+    async listPulls(state, filters) {
         const pulls = [];
         for await (const response of this.client.paginate.iterator(this.client.rest.pulls.list, {
             owner: this.owner,
             repo: this.repo,
             state,
+            ...filters,
             per_page: 100,
         })) {
             for (const item of response.data)
@@ -36058,13 +36059,46 @@ class OctokitGitHubApi {
         }
         return pulls;
     }
-    async getPull(number) {
+    async createPull(pull) {
+        const response = await this.client.rest.pulls.create({
+            owner: this.owner,
+            repo: this.repo,
+            ...pull,
+        });
+        return response.data.number;
+    }
+    async getPullWithEtag(number) {
         const response = await this.client.rest.pulls.get({
             owner: this.owner,
             repo: this.repo,
             pull_number: number,
         });
-        return payload(response.data, "pull request object");
+        return pullResponse(response);
+    }
+    async updatePull(number, changes, ifMatch) {
+        const response = await this.client.rest.pulls.update({
+            owner: this.owner,
+            repo: this.repo,
+            pull_number: number,
+            ...changes,
+            ...(ifMatch === undefined ? {} : { headers: { "If-Match": ifMatch } }),
+        });
+        return pullResponse(response);
+    }
+    async ensureLabel(name) {
+        const label = { owner: this.owner, repo: this.repo, name };
+        await ensureLabelExists(() => this.client.rest.issues.getLabel(label), () => this.client.rest.issues.createLabel({ ...label, color: "0366d6" }));
+    }
+    async addLabel(number, name) {
+        await this.client.rest.issues.addLabels({
+            owner: this.owner,
+            repo: this.repo,
+            issue_number: number,
+            labels: [name],
+        });
+    }
+    async getPull(number) {
+        return (await this.getPullWithEtag(number)).data;
     }
     async findPull(number) {
         try {
@@ -36077,13 +36111,7 @@ class OctokitGitHubApi {
         }
     }
     async closePull(number) {
-        const response = await this.client.rest.pulls.update({
-            owner: this.owner,
-            repo: this.repo,
-            pull_number: number,
-            state: "closed",
-        });
-        return payload(response.data, "pull request object");
+        return (await this.updatePull(number, { state: "closed" })).data;
     }
     async reopenPull(number) {
         await this.client.rest.pulls.update({
@@ -36164,14 +36192,7 @@ class OctokitGitHubApi {
     }
     async getRefSha(ref) {
         try {
-            const response = await this.client.rest.git.getRef({
-                owner: this.owner,
-                repo: this.repo,
-                ref,
-            });
-            if (typeof response.data.object.sha !== "string")
-                throw new TypeError("Expected ref object SHA");
-            return response.data.object.sha;
+            return await this.requireRefSha(ref);
         }
         catch (error) {
             if (isStatus(error, 404))
@@ -36179,7 +36200,17 @@ class OctokitGitHubApi {
             throw error;
         }
     }
-    async deleteRef(ref, expectedSha) {
+    async requireRefSha(ref) {
+        const response = await this.client.rest.git.getRef({
+            owner: this.owner,
+            repo: this.repo,
+            ref,
+        });
+        if (typeof response.data.object.sha !== "string")
+            throw new TypeError("Expected ref object SHA");
+        return response.data.object.sha;
+    }
+    async deleteRef(ref, expectedSha, workspace) {
         return await deleteBranch({
             remote: {
                 serverUrl: this.serverUrl,
@@ -36189,6 +36220,7 @@ class OctokitGitHubApi {
             ref: `refs/${ref}`,
             expectedSha,
             readRef: () => this.getRefSha(ref),
+            ...(workspace === undefined ? {} : { workspace }),
         });
     }
     async restoreRef(ref, sha) {
@@ -36207,11 +36239,47 @@ class OctokitGitHubApi {
         }
     }
 }
+async function ensureLabelExists(lookup, create) {
+    try {
+        await lookup();
+        return;
+    }
+    catch (error) {
+        if (!isStatus(error, 404))
+            throw error;
+    }
+    try {
+        await create();
+    }
+    catch (error) {
+        if (isStatus(error, 422)) {
+            // A concurrent run may have created the label after our lookup.
+            try {
+                await lookup();
+                return;
+            }
+            catch {
+                // Preserve the creation failure unless the label now exists.
+            }
+        }
+        throw error;
+    }
+}
+function pullResponse(response) {
+    return {
+        data: payload(response.data, "pull request object"),
+        etag: typeof response.headers?.etag === "string"
+            ? response.headers.etag
+            : undefined,
+    };
+}
 function isStatus(error, status) {
-    return (error !== null &&
-        typeof error === "object" &&
-        "status" in error &&
-        error.status === status);
+    return statusOf(error) === status;
+}
+function statusOf(error) {
+    if (error === null || typeof error !== "object" || !("status" in error))
+        return undefined;
+    return typeof error.status === "number" ? error.status : undefined;
 }
 function payload(value, description) {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -40412,12 +40480,12 @@ function validateCleanupConfiguration(execution) {
     validateBranch(execution.inputs.updateBranch, execution.inputs.branchPrefix, execution.context.baseBranch);
 }
 /** Run prek in an isolated base-SHA worktree and publish its owned update PR. */
-async function runUpdate(execution) {
+async function runUpdate(execution, api = new OctokitGitHubApi(execution.client, execution.context.owner, execution.context.repository, execution.inputs.token, execution.context.serverUrl)) {
     await validateUpdateConfiguration(execution);
     const addPaths = await resolveAddPaths(execution);
-    await proveBase(execution);
-    const remote = await observeRemoteState(execution);
-    await ensureOwnershipLabel(execution);
+    await proveBase(api, execution);
+    const remote = await observeRemoteState(api, execution);
+    await api.ensureLabel(execution.inputs.label);
     const detachedWorktree = await prepareWorktree(execution.context.workspace, execution.context.baseSha);
     const worktree = detachedWorktree.path;
     let installation;
@@ -40440,7 +40508,7 @@ async function runUpdate(execution) {
         }
         const changed = diffStatus === 1;
         if (!changed) {
-            return await closeUnneededPullRequest(execution, remote);
+            return await closeUnneededPullRequest(api, execution, remote);
         }
         await git(worktree, [
             "-c",
@@ -40455,27 +40523,24 @@ async function runUpdate(execution) {
         const body = makeBody(output, execution.context.workspace);
         if (remote.ownedPullRequest !== undefined) {
             await fetchObservedUpdateCommit(execution, worktree, remote);
-            await proveCurrentOwnership(execution, remote);
+            await proveCurrentOwnership(api, execution, remote);
         }
-        await proveBase(execution);
+        await proveBase(api, execution);
         await pushUpdate(execution, worktree, remote.sha);
         if (remote.ownedPullRequest === undefined) {
             let pullNumber;
             try {
-                const response = await execution.client.rest.pulls.create({
-                    owner: execution.context.owner,
-                    repo: execution.context.repository,
+                pullNumber = await api.createPull({
                     head: execution.inputs.updateBranch,
                     base: execution.context.baseBranch,
                     title: execution.inputs.prTitle,
                     body,
                 });
-                pullNumber = response.data.number;
             }
             catch (error) {
                 let recovered;
                 try {
-                    recovered = await recoverAmbiguousCreatedPull(execution, newSha, body);
+                    recovered = await recoverAmbiguousCreatedPull(api, execution, newSha, body);
                 }
                 catch (recoveryError) {
                     throw new Error("Pull request creation had an ambiguous outcome; the lease-protected update branch was preserved for inspection", { cause: new AggregateError([error, recoveryError]) });
@@ -40484,7 +40549,7 @@ async function runUpdate(execution) {
                     pullNumber = recovered;
                 }
                 else if (isDefiniteCreateFailure(error)) {
-                    await rollbackNewBranch(execution, newSha, error);
+                    await rollbackNewBranch(api, execution, newSha, error);
                 }
                 else {
                     throw new Error("Pull request creation had an ambiguous outcome; the lease-protected update branch was preserved for inspection", {
@@ -40499,27 +40564,24 @@ async function runUpdate(execution) {
                 throw new Error("Pull request creation did not return a pull number");
             }
             try {
-                await applyLabel(execution, pullNumber);
-                await proveCreatedOwnership(execution, pullNumber, newSha, body);
+                await api.addLabel(pullNumber, execution.inputs.label);
+                await proveCreatedOwnership(api, execution, pullNumber, newSha, body);
             }
             catch (error) {
-                await rollbackCreatedPullRequest(execution, pullNumber, newSha, error);
+                await rollbackCreatedPullRequest(api, execution, pullNumber, newSha, error);
             }
             await enableAutoMergeForPublishedPull(execution, "created", pullNumber, newSha);
             return { operation: "created", pullRequestNumber: pullNumber };
         }
         try {
-            await provePublishedOwnership(execution, remote, newSha);
+            await provePublishedOwnership(api, execution, remote, newSha);
         }
         catch (error) {
             await rollbackExistingPush(execution, remote, newSha, error);
         }
         let pullUpdateError;
         try {
-            const response = await execution.client.rest.pulls.update({
-                owner: execution.context.owner,
-                repo: execution.context.repository,
-                pull_number: remote.ownedPullRequest.number,
+            const response = await api.updatePull(remote.ownedPullRequest.number, {
                 title: execution.inputs.prTitle,
                 body,
             });
@@ -40541,12 +40603,7 @@ async function runUpdate(execution) {
         }
         let verified;
         try {
-            const response = await execution.client.rest.pulls.get({
-                owner: execution.context.owner,
-                repo: execution.context.repository,
-                pull_number: remote.ownedPullRequest.number,
-            });
-            verified = pullFromData(response.data);
+            verified = pullFromData(await api.getPull(remote.ownedPullRequest.number));
             if (isExactUpdatedPull(execution, verified, remote.ownedPullRequest.number, newSha, body)) {
                 await enableAutoMergeForPublishedPull(execution, "updated", remote.ownedPullRequest.number, newSha);
                 return {
@@ -40812,14 +40869,10 @@ function isExactOriginalMetadataPull(execution, pull, remote, newSha) {
 function bodiesEqual(left, right) {
     return left?.replaceAll("\r\n", "\n") === right?.replaceAll("\r\n", "\n");
 }
-async function recoverAmbiguousCreatedPull(execution, newSha, body) {
-    const pulls = await execution.client.paginate(execution.client.rest.pulls.list, {
-        owner: execution.context.owner,
-        repo: execution.context.repository,
-        state: "open",
+async function recoverAmbiguousCreatedPull(api, execution, newSha, body) {
+    const pulls = await api.listPulls("open", {
         head: `${execution.context.owner}:${execution.inputs.updateBranch}`,
         base: execution.context.baseBranch,
-        per_page: 100,
     });
     const matches = pulls
         .map((pull) => pullFromData(pull))
@@ -40833,13 +40886,8 @@ async function recoverAmbiguousCreatedPull(execution, newSha, body) {
         pull.baseRef === execution.context.baseBranch);
     return matches.length === 1 ? matches[0]?.number : undefined;
 }
-async function proveCreatedOwnership(execution, pullNumber, newSha, body) {
-    const response = await execution.client.rest.pulls.get({
-        owner: execution.context.owner,
-        repo: execution.context.repository,
-        pull_number: pullNumber,
-    });
-    const pull = pullFromData(response.data);
+async function proveCreatedOwnership(api, execution, pullNumber, newSha, body) {
+    const pull = pullFromData(await api.getPull(pullNumber));
     if (pull.number !== pullNumber ||
         pull.state !== "open" ||
         !isOwned(execution, pull) ||
@@ -40948,67 +40996,10 @@ async function assertBaseCommit(execution) {
         execution.context.baseSha,
     ]);
 }
-async function ensureOwnershipLabel(execution) {
-    const label = {
-        owner: execution.context.owner,
-        repo: execution.context.repository,
-        name: execution.inputs.label,
-    };
-    try {
-        await execution.client.rest.issues.getLabel(label);
-        return;
-    }
-    catch (error) {
-        if (!isNotFound(error)) {
-            throw error;
-        }
-    }
-    try {
-        await execution.client.rest.issues.createLabel({
-            ...label,
-            color: "0366d6",
-        });
-    }
-    catch (error) {
-        if (typeof error === "object" &&
-            error !== null &&
-            "status" in error &&
-            error.status === 422) {
-            // A concurrent run may have created the label after our lookup.
-            try {
-                await execution.client.rest.issues.getLabel(label);
-                return;
-            }
-            catch {
-                // Preserve the creation failure unless the label now exists.
-            }
-        }
-        throw error;
-    }
-}
-async function readUpdateBranch(execution) {
-    try {
-        const response = await execution.client.rest.git.getRef({
-            owner: execution.context.owner,
-            repo: execution.context.repository,
-            ref: `heads/${execution.inputs.updateBranch}`,
-        });
-        return response.data.object.sha;
-    }
-    catch (error) {
-        if (isNotFound(error))
-            return undefined;
-        throw error;
-    }
-}
-async function observeRemoteState(execution) {
-    const sha = await readUpdateBranch(execution);
-    const pulls = await execution.client.paginate(execution.client.rest.pulls.list, {
-        owner: execution.context.owner,
-        repo: execution.context.repository,
-        state: "all",
+async function observeRemoteState(api, execution) {
+    const sha = await api.getRefSha(`heads/${execution.inputs.updateBranch}`);
+    const pulls = await api.listPulls("all", {
         head: `${execution.context.owner}:${execution.inputs.updateBranch}`,
-        per_page: 100,
     });
     const associated = pulls.map((pull) => pullFromData(pull));
     const live = associated.filter((pull) => pull.state === "open");
@@ -41032,7 +41023,8 @@ async function observeRemoteState(execution) {
     }
     return { sha, ownedPullRequest: owned[0] };
 }
-function pullFromData(data) {
+function pullFromData(payload) {
+    const data = payload;
     return {
         number: data.number,
         author: data.user?.login ?? null,
@@ -41082,19 +41074,14 @@ async function pushUpdate(execution, worktree, expectedSha) {
         `--force-with-lease=${ref}:${expectedSha ?? ""}`,
     ]);
 }
-async function closeUnneededPullRequest(execution, remote) {
+async function closeUnneededPullRequest(api, execution, remote) {
     const pull = remote.ownedPullRequest;
     if (pull === undefined || remote.sha === undefined) {
         return { operation: "none" };
     }
-    await proveBase(execution);
-    const current = await proveCurrentOwnership(execution, remote);
-    const response = await execution.client.rest.pulls.update({
-        owner: execution.context.owner,
-        repo: execution.context.repository,
-        pull_number: pull.number,
-        state: "closed",
-    });
+    await proveBase(api, execution);
+    const current = await proveCurrentOwnership(api, execution, remote);
+    const response = await api.updatePull(pull.number, { state: "closed" });
     const closed = pullFromData(response.data);
     if (!isOwned(execution, closed) ||
         closed.state !== "closed" ||
@@ -41104,15 +41091,13 @@ async function closeUnneededPullRequest(execution, remote) {
         throw new Error("GitHub returned an unexpected pull request after close");
     }
     try {
-        if ((await deleteUpdateBranch(execution, remote.sha)) === "already-absent") {
+        if ((await deleteUpdateBranch(api, execution, remote.sha)) ===
+            "already-absent") {
             throw new Error("The update branch was already absent at deletion");
         }
     }
     catch (error) {
-        const closeEtag = typeof response.headers?.etag === "string"
-            ? response.headers.etag
-            : undefined;
-        const restored = await compensateClose(execution, closed, closeEtag);
+        const restored = await compensateClose(api, execution, closed, response.etag);
         throw new Error(restored
             ? `Lease-protected branch deletion failed; the exact close of pull request #${pull.number} was compensated`
             : `Lease-protected branch deletion failed; pull request #${pull.number} was not reopened because its state changed after this action's close`, { cause: error });
@@ -41125,66 +41110,45 @@ async function closeUnneededPullRequest(execution, remote) {
         },
     };
 }
-async function proveBase(execution) {
-    const response = await execution.client.rest.git.getRef({
-        owner: execution.context.owner,
-        repo: execution.context.repository,
-        ref: `heads/${execution.context.baseBranch}`,
-    });
-    const current = response.data.object.sha;
+async function proveBase(api, execution) {
+    const current = await api.requireRefSha(`heads/${execution.context.baseBranch}`);
     if (current !== execution.context.baseSha) {
         throw new Error(`The base branch changed after checkout: ${execution.context.baseBranch} is at ${current}, but the checkout is at ${execution.context.baseSha}. For a detached or older checkout, check out the current tip of ${execution.context.baseBranch}.`);
     }
 }
-async function proveCurrentOwnership(execution, remote) {
+async function proveCurrentOwnership(api, execution, remote) {
     const expected = remote.ownedPullRequest;
     if (expected === undefined || remote.sha === undefined) {
         throw new Error("Expected an owned update pull request and branch");
     }
-    const [pullResponse, refResponse] = await Promise.all([
-        execution.client.rest.pulls.get({
-            owner: execution.context.owner,
-            repo: execution.context.repository,
-            pull_number: expected.number,
-        }),
-        execution.client.rest.git.getRef({
-            owner: execution.context.owner,
-            repo: execution.context.repository,
-            ref: `heads/${execution.inputs.updateBranch}`,
-        }),
+    const [pull, refSha] = await Promise.all([
+        api.getPull(expected.number),
+        api.requireRefSha(`heads/${execution.inputs.updateBranch}`),
     ]);
-    const current = pullFromData(pullResponse.data);
+    const current = pullFromData(pull);
     if (current.number !== expected.number ||
         current.state !== "open" ||
         !isOwned(execution, current) ||
         current.headSha !== remote.sha ||
-        refResponse.data.object.sha !== remote.sha) {
+        refSha !== remote.sha) {
         throw new Error("Update pull request or branch changed after initial observation");
     }
     return current;
 }
-async function provePublishedOwnership(execution, remote, newSha) {
-    await proveCurrentOwnership(execution, {
+async function provePublishedOwnership(api, execution, remote, newSha) {
+    await proveCurrentOwnership(api, execution, {
         sha: newSha,
         ownedPullRequest: remote.ownedPullRequest,
     });
 }
-async function compensateClose(execution, closed, closeEtag) {
+async function compensateClose(api, execution, closed, closeEtag) {
     if (closeEtag === undefined) {
         return false;
     }
     try {
-        const [pullResponse, refResponse] = await Promise.all([
-            execution.client.rest.pulls.get({
-                owner: execution.context.owner,
-                repo: execution.context.repository,
-                pull_number: closed.number,
-            }),
-            execution.client.rest.git.getRef({
-                owner: execution.context.owner,
-                repo: execution.context.repository,
-                ref: `heads/${execution.inputs.updateBranch}`,
-            }),
+        const [pullResponse, refSha] = await Promise.all([
+            api.getPullWithEtag(closed.number),
+            api.requireRefSha(`heads/${execution.inputs.updateBranch}`),
         ]);
         const current = pullFromData(pullResponse.data);
         if (current.state !== "closed" ||
@@ -41192,17 +41156,11 @@ async function compensateClose(execution, closed, closeEtag) {
             current.headSha !== closed.headSha ||
             current.updatedAt !== closed.updatedAt ||
             current.closedAt !== closed.closedAt ||
-            pullResponse.headers.etag !== closeEtag ||
-            refResponse.data.object.sha !== closed.headSha) {
+            pullResponse.etag !== closeEtag ||
+            refSha !== closed.headSha) {
             return false;
         }
-        const reopenedResponse = await execution.client.rest.pulls.update({
-            owner: execution.context.owner,
-            repo: execution.context.repository,
-            pull_number: closed.number,
-            state: "open",
-            headers: { "If-Match": closeEtag },
-        });
+        const reopenedResponse = await api.updatePull(closed.number, { state: "open" }, closeEtag);
         const reopened = pullFromData(reopenedResponse.data);
         return (reopened.state === "open" &&
             isOwned(execution, reopened) &&
@@ -41212,22 +41170,9 @@ async function compensateClose(execution, closed, closeEtag) {
         return false;
     }
 }
-async function applyLabel(execution, pullNumber) {
-    await execution.client.rest.issues.addLabels({
-        owner: execution.context.owner,
-        repo: execution.context.repository,
-        issue_number: pullNumber,
-        labels: [execution.inputs.label],
-    });
-}
-async function rollbackCreatedPullRequest(execution, pullNumber, pushedSha, labelError) {
+async function rollbackCreatedPullRequest(api, execution, pullNumber, pushedSha, labelError) {
     try {
-        const response = await execution.client.rest.pulls.update({
-            owner: execution.context.owner,
-            repo: execution.context.repository,
-            pull_number: pullNumber,
-            state: "closed",
-        });
+        const response = await api.updatePull(pullNumber, { state: "closed" });
         const closed = pullFromData(response.data);
         if (closed.number !== pullNumber ||
             closed.state !== "closed" ||
@@ -41240,7 +41185,7 @@ async function rollbackCreatedPullRequest(execution, pullNumber, pushedSha, labe
     }
     let deletion;
     try {
-        deletion = await deleteUpdateBranch(execution, pushedSha);
+        deletion = await deleteUpdateBranch(api, execution, pushedSha);
     }
     catch (rollbackError) {
         throw new Error(`Created pull request #${pullNumber} was closed after ownership setup failed, but lease-protected branch rollback also failed; the branch was preserved`, { cause: new AggregateError([labelError, rollbackError]) });
@@ -41249,10 +41194,10 @@ async function rollbackCreatedPullRequest(execution, pullNumber, pushedSha, labe
         ? `Applying or proving pull request ownership failed; pull request #${pullNumber} was closed and its branch was already absent`
         : `Applying or proving pull request ownership failed; pull request #${pullNumber} was closed and its branch was lease-rolled back`, { cause: labelError });
 }
-async function rollbackNewBranch(execution, pushedSha, createError) {
+async function rollbackNewBranch(api, execution, pushedSha, createError) {
     let deletion;
     try {
-        deletion = await deleteUpdateBranch(execution, pushedSha);
+        deletion = await deleteUpdateBranch(api, execution, pushedSha);
     }
     catch (rollbackError) {
         throw new Error("Pull request creation definitely failed, but lease-protected branch rollback failed; the branch was preserved", { cause: new AggregateError([createError, rollbackError]) });
@@ -41284,34 +41229,19 @@ async function rollbackExistingPush(execution, remote, newSha, proofError) {
         cause: proofError,
     });
 }
-async function deleteUpdateBranch(execution, expectedSha) {
-    const outcome = await deleteBranch({
-        remote: gitRemote(execution),
-        ref: `refs/heads/${execution.inputs.updateBranch}`,
-        expectedSha,
-        readRef: () => readUpdateBranch(execution),
-        workspace: execution.context.workspace,
-    });
+async function deleteUpdateBranch(api, execution, expectedSha) {
+    const outcome = await api.deleteRef(`heads/${execution.inputs.updateBranch}`, expectedSha, execution.context.workspace);
     if (outcome === "lease-rejected") {
         throw new Error("Lease-protected branch deletion rejected because the branch moved");
     }
     return outcome;
 }
 function isDefiniteCreateFailure(error) {
-    if (typeof error !== "object" ||
-        error === null ||
-        !("status" in error) ||
-        typeof error.status !== "number") {
-        return false;
-    }
-    const status = error.status;
-    return status >= 400 && status < 500 && ![408, 409, 429].includes(status);
-}
-function isNotFound(error) {
-    return (typeof error === "object" &&
-        error !== null &&
-        "status" in error &&
-        error.status === 404);
+    const status = statusOf(error);
+    return (status !== undefined &&
+        status >= 400 &&
+        status < 500 &&
+        ![408, 409, 429].includes(status));
 }
 function gitRemote(execution) {
     return {

@@ -39,12 +39,17 @@ vi.mock("../../src/environment.js", async (importOriginal) => {
   };
 });
 
-import { cleanupUpdateBranches } from "../../src/cleanup/index.js";
+import { cleanupWithApi } from "../../src/cleanup/index.js";
 import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
+import { deleteBranch } from "../../src/git.js";
+import type { NewPull } from "../../src/github.js";
+import { InMemoryGitHub } from "../support/in-memory-github.js";
 import { BODY_MARKER } from "../../src/ownership.js";
 import { runUpdate } from "../../src/update/index.js";
 
 const exec = promisify(execFile);
+const updateBranch = "chore/prek-updates";
+const updateRef = `heads/${updateBranch}`;
 const cleanups: string[] = [];
 const originalPath = process.env.PATH;
 
@@ -79,7 +84,9 @@ describe("update publication races", () => {
       await makeWorktreeHarness();
     process.env.TEST_GIT_FAIL_WORKTREE_ADD_BEFORE = "1";
 
-    const error = await runUpdate(execution).catch((caught: unknown) => caught);
+    const error = await runUpdate(execution, execution.api).catch(
+      (caught: unknown) => caught,
+    );
 
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(AggregateError);
@@ -92,7 +99,7 @@ describe("update publication races", () => {
       await makeWorktreeHarness();
     process.env.TEST_GIT_FAIL_WORKTREE_ADD_AFTER = "1";
 
-    await expect(runUpdate(execution)).rejects.toThrow();
+    await expect(runUpdate(execution, execution.api)).rejects.toThrow();
 
     expect(await worktrees(workspace)).toEqual(initial);
     expect(await readdir(scratch)).toEqual([]);
@@ -103,7 +110,9 @@ describe("update publication races", () => {
       await makeWorktreeHarness();
     process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "once";
 
-    await expect(runUpdate(execution)).resolves.toEqual({ operation: "none" });
+    await expect(runUpdate(execution, execution.api)).resolves.toEqual({
+      operation: "none",
+    });
 
     expect(await worktrees(workspace)).toEqual(initial);
     expect(await readdir(scratch)).toEqual([]);
@@ -126,7 +135,7 @@ describe("update publication races", () => {
         process.env.TEST_GIT_FAIL_WORKTREE_LIST = "1";
       }
 
-      await expect(runUpdate(execution)).rejects.toMatchObject({
+      await expect(runUpdate(execution, execution.api)).rejects.toMatchObject({
         message: "Update operation completed but cleanup failed",
         errors: [
           expect.objectContaining({
@@ -153,7 +162,7 @@ describe("update publication races", () => {
     process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "once";
     process.env.TEST_GIT_LOCK_WORKTREE_ON_REMOVE = "1";
 
-    await expect(runUpdate(execution)).rejects.toMatchObject({
+    await expect(runUpdate(execution, execution.api)).rejects.toMatchObject({
       message: "Update operation completed but cleanup failed",
       errors: [
         expect.objectContaining({
@@ -175,7 +184,9 @@ describe("update publication races", () => {
     process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "always";
     process.env.TEST_GIT_UNREGISTER_WORKTREE_ON_REMOVE = "1";
 
-    await expect(runUpdate(execution)).resolves.toEqual({ operation: "none" });
+    await expect(runUpdate(execution, execution.api)).resolves.toEqual({
+      operation: "none",
+    });
 
     expect(await worktrees(workspace)).toEqual(initial);
     expect(core.warning).toHaveBeenCalledWith(
@@ -187,18 +198,16 @@ describe("update publication races", () => {
   });
 
   it("scopes authenticated pushes to the configured Actions server", async () => {
-    const harness = await makeHarness();
-    const serverUrl = "https://github.example.com";
-    const execution: ActionExecution = {
-      ...harness.execution,
-      context: { ...harness.execution.context, serverUrl },
+    const harness = await makeHarness({
+      serverUrl: "https://github.example.com",
+    });
+    harness.api.transitions.beforeCreatePull = () => {
+      throw restError("bad", 422);
     };
-    process.env.TEST_GIT_URL = `${serverUrl}/owner/repo.git`;
-    harness.create.mockRejectedValue(
-      Object.assign(new Error("bad"), { status: 422 }),
-    );
 
-    await expect(runUpdate(execution)).rejects.toThrow(/lease-rolled back/u);
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
+      /lease-rolled back/u,
+    );
     const observedPushes = await pushes(harness.log);
     expect(observedPushes).toHaveLength(2);
     for (const push of observedPushes) {
@@ -212,11 +221,11 @@ describe("update publication races", () => {
 
   it("lease-deletes the exact pushed SHA after a definite create failure", async () => {
     const harness = await makeHarness();
-    harness.create.mockRejectedValue(
-      Object.assign(new Error("bad"), { status: 422 }),
-    );
+    harness.api.transitions.beforeCreatePull = () => {
+      throw restError("bad", 422);
+    };
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
       /lease-rolled back/u,
     );
     expect(await pushes(harness.log)).toEqual([
@@ -227,12 +236,12 @@ describe("update publication races", () => {
         /:refs\/heads\/chore\/prek-updates .*--force-with-lease=refs\/heads\/chore\/prek-updates:[0-9a-f]{40}/u,
       ),
     ]);
-    expect(harness.update).not.toHaveBeenCalled();
+    expect([...harness.api.pulls.keys()]).toEqual([]);
   });
 
   it("reports a branch already absent after a definite create failure", async () => {
     const harness = await makeHarness();
-    harness.create.mockImplementationOnce(async () => {
+    harness.api.transitions.beforeCreatePull = async () => {
       await exec("git", [
         "--git-dir",
         harness.remote,
@@ -241,10 +250,10 @@ describe("update publication races", () => {
         "refs/heads/chore/prek-updates",
         await remoteSha(harness.remote),
       ]);
-      throw Object.assign(new Error("bad"), { status: 422 });
-    });
+      throw restError("bad", 422);
+    };
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
       /creation failed.*branch was already absent/u,
     );
     await expect(remoteSha(harness.remote)).rejects.toThrow();
@@ -253,7 +262,7 @@ describe("update publication races", () => {
   it("preserves a moved ref when a definite create failure triggers rollback", async () => {
     const harness = await makeHarness();
     const movedSha = harness.execution.context.baseSha;
-    harness.create.mockImplementationOnce(async () => {
+    harness.api.transitions.beforeCreatePull = async () => {
       await exec("git", [
         "--git-dir",
         harness.remote,
@@ -262,10 +271,12 @@ describe("update publication races", () => {
         movedSha,
         await remoteSha(harness.remote),
       ]);
-      throw Object.assign(new Error("bad"), { status: 422 });
-    });
+      throw restError("bad", 422);
+    };
 
-    await expect(runUpdate(harness.execution)).rejects.toMatchObject({
+    await expect(
+      runUpdate(harness.execution, harness.api),
+    ).rejects.toMatchObject({
       message: expect.stringMatching(/rollback failed.*branch was preserved/u),
       cause: expect.objectContaining({
         errors: expect.arrayContaining([
@@ -280,46 +291,24 @@ describe("update publication races", () => {
 
   it("recovers an exact concurrent pull even when create reports 422", async () => {
     const harness = await makeHarness();
-    harness.create.mockRejectedValue(
-      Object.assign(new Error("already exists"), { status: 422 }),
-    );
-    harness.paginate.mockResolvedValueOnce([]).mockImplementation(async () => [
-      mergePull(harness.pull, {
-        number: 77,
-        head: {
-          ...harness.pull.head,
-          sha: await remoteSha(harness.remote),
-        },
-      }),
-    ]);
-    harness.get.mockImplementation(async () => ({
-      data: mergePull(harness.pull, {
-        number: 77,
-        head: {
-          ...harness.pull.head,
-          sha: await remoteSha(harness.remote),
-        },
-      }),
-      headers: { etag: '"created"' },
-    }));
+    harness.api.transitions.beforeCreatePull = async (request) => {
+      await seedConcurrentPull(harness, request, 77);
+      throw restError("already exists", 422);
+    };
 
-    await expect(runUpdate(harness.execution)).resolves.toEqual({
+    await expect(runUpdate(harness.execution, harness.api)).resolves.toEqual({
       operation: "created",
       pullRequestNumber: 77,
     });
-    expect(await pushes(harness.log)).toHaveLength(1);
+    expect(harness.api.pulls.get(77)).toMatchObject({
+      state: "open",
+      labels: [{ name: "dependencies" }],
+      head: { sha: await remoteSha(harness.remote) },
+    });
   });
 
   it("enables auto-merge after proving the exact created pull revision", async () => {
     const harness = await makeHarness();
-    harness.create.mockImplementation(async () => ({
-      data: mergePull(harness.pull, {
-        head: {
-          ...harness.pull.head,
-          sha: await remoteSha(harness.remote),
-        },
-      }),
-    }));
     const execution: ActionExecution = {
       ...harness.execution,
       inputs: { ...harness.execution.inputs, autoMerge: true },
@@ -342,15 +331,13 @@ describe("update publication races", () => {
       },
     );
 
-    await expect(runUpdate(execution)).resolves.toEqual({
+    await expect(runUpdate(execution, harness.api)).resolves.toEqual({
       operation: "created",
       pullRequestNumber: 42,
     });
 
-    expect(harness.create).toHaveBeenCalledWith(
-      expect.objectContaining({
-        body: expect.stringContaining("Automated update of `prek` hooks."),
-      }),
+    expect(harness.api.pulls.get(42)?.body).toContain(
+      "Automated update of `prek` hooks.",
     );
     expect(harness.graphql).toHaveBeenCalledWith(
       expect.any(String),
@@ -367,11 +354,6 @@ describe("update publication races", () => {
     "preserves the published update without enabling auto-merge on %s",
     async (_reason, overrides) => {
       const harness = await makeHarness();
-      harness.create.mockImplementation(async () => ({
-        data: mergePull(harness.pull, {
-          head: { ...harness.pull.head, sha: await remoteSha(harness.remote) },
-        }),
-      }));
       let publishedSha: string | undefined;
       let autoMergeEnabled = false;
       harness.graphql.mockImplementation(
@@ -387,10 +369,13 @@ describe("update publication races", () => {
       );
 
       await expect(
-        runUpdate({
-          ...harness.execution,
-          inputs: { ...harness.execution.inputs, autoMerge: true },
-        }),
+        runUpdate(
+          {
+            ...harness.execution,
+            inputs: { ...harness.execution.inputs, autoMerge: true },
+          },
+          harness.api,
+        ),
       ).rejects.toMatchObject({
         publishedPullRequest: { operation: "created", pullRequestNumber: 42 },
         cause: expect.objectContaining({
@@ -410,16 +395,6 @@ describe("update publication races", () => {
     "reports the $operation pull when auto-merge fails",
     async ({ existing, operation }) => {
       const harness = await makeHarness({ existing });
-      if (!existing) {
-        harness.create.mockImplementation(async () => ({
-          data: mergePull(harness.pull, {
-            head: {
-              ...harness.pull.head,
-              sha: await remoteSha(harness.remote),
-            },
-          }),
-        }));
-      }
       const execution: ActionExecution = {
         ...harness.execution,
         inputs: { ...harness.execution.inputs, autoMerge: true },
@@ -432,7 +407,7 @@ describe("update publication races", () => {
         }))
         .mockRejectedValueOnce(new Error("auto-merge rejected"));
 
-      const error = await runUpdate(execution).catch(
+      const error = await runUpdate(execution, harness.api).catch(
         (caught: unknown) => caught,
       );
 
@@ -444,14 +419,6 @@ describe("update publication races", () => {
 
   it("does not attempt auto-merge when the token is not a PAT", async () => {
     const harness = await makeHarness();
-    harness.create.mockImplementation(async () => ({
-      data: mergePull(harness.pull, {
-        head: {
-          ...harness.pull.head,
-          sha: await remoteSha(harness.remote),
-        },
-      }),
-    }));
     const execution: ActionExecution = {
       ...harness.execution,
       context: {
@@ -461,7 +428,7 @@ describe("update publication races", () => {
       inputs: { ...harness.execution.inputs, autoMerge: true },
     };
 
-    await expect(runUpdate(execution)).resolves.toEqual({
+    await expect(runUpdate(execution, harness.api)).resolves.toEqual({
       operation: "created",
       pullRequestNumber: 42,
     });
@@ -474,83 +441,58 @@ describe("update publication races", () => {
 
   it("preserves the pushed branch when create has an ambiguous outcome", async () => {
     const harness = await makeHarness();
-    harness.create.mockRejectedValue(
-      Object.assign(new Error("timeout"), { status: 504 }),
-    );
+    harness.api.transitions.beforeCreatePull = () => {
+      throw restError("timeout", 504);
+    };
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
       /ambiguous outcome/u,
     );
     expect(await pushes(harness.log)).toHaveLength(1);
-    expect(harness.update).not.toHaveBeenCalled();
+    expect([...harness.api.pulls.keys()]).toEqual([]);
   });
 
   it("recovers one exact ambiguous create result, labels it, and proves it", async () => {
     const harness = await makeHarness();
-    harness.create.mockRejectedValue(
-      Object.assign(new Error("timeout"), { status: 504 }),
-    );
-    harness.paginate.mockResolvedValueOnce([]).mockImplementation(async () => [
-      mergePull(harness.pull, {
-        number: 77,
-        head: {
-          ...harness.pull.head,
-          sha: await remoteSha(harness.remote),
-        },
-      }),
-    ]);
-    harness.get.mockImplementation(async () => ({
-      data: mergePull(harness.pull, {
-        number: 77,
-        head: {
-          ...harness.pull.head,
-          sha: await remoteSha(harness.remote),
-        },
-      }),
-      headers: { etag: '"created"' },
-    }));
+    harness.api.transitions.beforeCreatePull = async (request) => {
+      await seedConcurrentPull(harness, request, 77);
+      throw restError("timeout", 504);
+    };
 
-    await expect(runUpdate(harness.execution)).resolves.toEqual({
+    await expect(runUpdate(harness.execution, harness.api)).resolves.toEqual({
       operation: "created",
       pullRequestNumber: 77,
     });
-    expect(harness.addLabels).toHaveBeenCalledWith(
-      expect.objectContaining({
-        issue_number: 77,
-        labels: ["dependencies"],
-      }),
-    );
-    expect(await pushes(harness.log)).toHaveLength(1);
+    expect(harness.api.pulls.get(77)).toMatchObject({
+      state: "open",
+      labels: [{ name: "dependencies" }],
+      head: { sha: await remoteSha(harness.remote) },
+    });
   });
 
   it.each(["nonexact", "multiple"] as const)(
     "preserves an ambiguous create with %s recovery candidates without labeling",
     async (variant) => {
       const harness = await makeHarness();
-      harness.create.mockRejectedValue(
-        Object.assign(new Error("timeout"), { status: 504 }),
-      );
-      harness.paginate
-        .mockResolvedValueOnce([])
-        .mockImplementation(async () => {
-          const exact = mergePull(harness.pull, {
-            number: 77,
-            head: {
-              ...harness.pull.head,
-              sha: await remoteSha(harness.remote),
-            },
-          });
-          return variant === "multiple"
-            ? [exact, mergePull(exact, { number: 78 })]
-            : [mergePull(exact, { body: "not the requested body" })];
-        });
+      harness.api.transitions.beforeCreatePull = async (request) => {
+        await seedConcurrentPull(harness, request, 77);
+        if (variant === "multiple")
+          await seedConcurrentPull(harness, request, 78);
+        else harness.api.patchPull(77, { body: "not the requested body" });
+        throw restError("timeout", 504);
+      };
 
-      await expect(runUpdate(harness.execution)).rejects.toThrow(
+      await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
         /ambiguous outcome/u,
       );
-      expect(harness.addLabels).not.toHaveBeenCalled();
-      expect(harness.get).not.toHaveBeenCalled();
-      expect(await pushes(harness.log)).toHaveLength(1);
+      const sha = await remoteSha(harness.remote);
+      for (const pull of harness.api.pulls.values()) {
+        expect(pull).toMatchObject({
+          state: "open",
+          labels: [],
+          head: { sha },
+        });
+      }
     },
   );
 
@@ -560,39 +502,52 @@ describe("update publication races", () => {
     ["state loss", { state: "closed" }],
     ["base loss", { base: { ref: "other" } }],
     [
-      "head loss",
-      { head: { ref: "other", repo: { full_name: "owner/repo" }, sha: "OLD" } },
+      "head loss to a cleanup-prefix branch",
+      {
+        head: {
+          ref: "chore/prek-old",
+          repo: { full_name: "owner/repo" },
+          sha: "OLD",
+        },
+      },
     ],
   ])(
     "does not push or patch after pre-push %s",
     async (_name, changed) => {
       const harness = await makeHarness({ existing: true });
-      harness.get.mockResolvedValueOnce({
-        data: mergePull(harness.pull, changed),
-        headers: { etag: '"before"' },
-      });
+      const patch =
+        "head" in changed
+          ? { ...changed, head: { ...changed.head, sha: harness.oldSha } }
+          : changed;
+      harness.api.transitions.afterListPulls = (state) => {
+        if (state === "all") harness.api.patchPull(42, patch);
+      };
 
-      await expect(runUpdate(harness.execution)).rejects.toThrow(
+      await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
         /changed after initial observation/u,
       );
       expect(await pushes(harness.log)).toEqual([]);
-      expect(harness.update).not.toHaveBeenCalled();
+      expect(harness.api.pulls.get(42)).toMatchObject(patch);
+      expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
     },
     15_000,
   );
 
   it("does not push or patch when the observed branch ref disappears before push", async () => {
-    const harness = await makeHarness({ existing: true, refLossAt: 2 });
+    const harness = await makeHarness({ existing: true, refLoss: true });
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(/missing/u);
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
+      /missing/u,
+    );
     expect(await pushes(harness.log)).toEqual([]);
-    expect(harness.update).not.toHaveBeenCalled();
+    expect(harness.api.pulls.get(42)?.body).toBe(BODY_MARKER);
+    await expect(remoteSha(harness.remote)).rejects.toThrow();
   });
 
   it("rolls post-push proof loss back to the exact observed SHA without patching", async () => {
     const harness = await makeHarness({ existing: true, loseAfterPush: true });
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
       /lease-rolled back/u,
     );
     const observedPushes = await pushes(harness.log);
@@ -603,245 +558,205 @@ describe("update publication races", () => {
     expect(observedPushes[1]).toMatch(
       /--force-with-lease=refs\/heads\/chore\/prek-updates:[0-9a-f]{40}/u,
     );
-    expect(harness.update).not.toHaveBeenCalled();
+    expect(harness.api.pulls.get(42)).toMatchObject({
+      labels: [],
+      body: BODY_MARKER,
+    });
+    expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
   });
 
   it("reports partial state when the post-push rollback lease fails", async () => {
     const harness = await makeHarness({ existing: true, loseAfterPush: true });
     process.env.TEST_GIT_FAIL_PUSH = "2";
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
       /rollback also failed.*preserved/u,
     );
     expect(await pushes(harness.log)).toHaveLength(2);
-    expect(harness.update).not.toHaveBeenCalled();
+    expect(harness.api.pulls.get(42)).toMatchObject({
+      labels: [],
+      body: BODY_MARKER,
+      head: { sha: await remoteSha(harness.remote) },
+    });
+    expect(await remoteSha(harness.remote)).not.toBe(harness.oldSha);
   });
 
   it("rolls an existing branch back when pull metadata update fails", async () => {
     const harness = await makeHarness({ existing: true });
-    harness.pull.title = "Previous update";
-    harness.update.mockRejectedValueOnce(new Error("timeout"));
-    harness.get.mockImplementation(async () => {
-      const sha = await remoteSha(harness.remote);
-      return {
-        data: mergePull(harness.pull, {
-          head: { ...harness.pull.head, sha },
-        }),
-        headers: { etag: '"after"' },
-      };
-    });
+    harness.api.patchPull(42, { title: "Previous update" });
+    harness.api.transitions.beforeUpdatePull = () => {
+      throw new Error("timeout");
+    };
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
       /lease-rolled back/u,
     );
     expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
+    expect(harness.api.pulls.get(42)?.title).toBe("Previous update");
   });
 
   it("preserves the new branch when an applied metadata update cannot be verified", async () => {
     const harness = await makeHarness({ existing: true });
-    let metadataUpdateAttempted = false;
-    harness.get.mockImplementation(async () => {
-      const sha = await remoteSha(harness.remote);
-      if (metadataUpdateAttempted && sha !== harness.oldSha) {
+    harness.api.patchPull(42, { title: "Previous update" });
+    harness.api.transitions.afterUpdatePull = ({ data }) => {
+      data.body = "unexpected response";
+      harness.api.transitions.beforeReadPull = () => {
         throw new Error("verification timeout");
-      }
-      return {
-        data: mergePull(harness.pull, {
-          head: { ...harness.pull.head, sha },
-        }),
-        headers: { etag: '"after"' },
       };
-    });
-    harness.update.mockImplementationOnce(async () => {
-      metadataUpdateAttempted = true;
-      return {
-        data: mergePull(harness.pull, { body: "unexpected response" }),
-        headers: { etag: '"unexpected"' },
-      };
-    });
+    };
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
       /metadata outcome is ambiguous.*new branch was preserved/u,
     );
     expect(await remoteSha(harness.remote)).not.toBe(harness.oldSha);
-    expect(await pushes(harness.log)).toHaveLength(1);
+    expect(harness.api.pulls.get(42)?.title).toBe("Update");
   });
 
   it("normalizes CRLF only when verifying unchanged original metadata", async () => {
     const harness = await makeHarness({ existing: true });
-    harness.pull.body = `${BODY_MARKER}\r\noriginal`;
-    harness.update.mockRejectedValueOnce(new Error("timeout"));
-    harness.get.mockImplementation(async () => ({
-      data: mergePull(harness.pull, {
-        body: `${BODY_MARKER}\noriginal`,
-        head: {
-          ...harness.pull.head,
-          sha: await remoteSha(harness.remote),
-        },
-      }),
-      headers: { etag: '"after"' },
-    }));
+    harness.api.patchPull(42, { body: `${BODY_MARKER}\r\noriginal` });
+    harness.api.transitions.beforeUpdatePull = () => {
+      harness.api.patchPull(42, { body: `${BODY_MARKER}\noriginal` });
+      throw new Error("timeout");
+    };
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
       /lease-rolled back/u,
     );
     expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
+    expect(harness.api.pulls.get(42)?.body).toBe(`${BODY_MARKER}\noriginal`);
   });
 
   it("normalizes CRLF when verifying freshly updated metadata", async () => {
     const harness = await makeHarness({ existing: true });
     await writeFile(
       harness.prek,
-      "#!/bin/sh\nprintf 'updated\\n' > prek.toml\nprintf 'detail\\n'\n",
+      "#!/bin/sh\nprintf 'updated\n' > prek.toml\nprintf 'detail\n'\n",
     );
-    harness.update.mockResolvedValueOnce({
-      data: mergePull(harness.pull, { body: "unexpected response" }),
-      headers: { etag: '"unexpected"' },
-    });
-    const updatedBody = `${BODY_MARKER}\r\n\r\n<details><summary>prek output</summary>\r\n\r\n\`\`\`text\r\ndetail\r\n\`\`\`\r\n</details>`;
-    harness.get.mockImplementation(async () => ({
-      data: mergePull(harness.pull, {
-        body: updatedBody,
-        head: {
-          ...harness.pull.head,
-          sha: await remoteSha(harness.remote),
-        },
-      }),
-      headers: { etag: '"after"' },
-    }));
+    harness.api.transitions.afterUpdatePull = ({ data }) => {
+      const body = String(data.body).replaceAll("\n", "\r\n");
+      harness.api.patchPull(42, { body });
+      data.body = "unexpected response";
+    };
 
-    await expect(runUpdate(harness.execution)).resolves.toEqual({
+    await expect(runUpdate(harness.execution, harness.api)).resolves.toEqual({
       operation: "updated",
       pullRequestNumber: 42,
     });
+    expect(harness.api.pulls.get(42)?.body).toContain("\r\ndetail\r\n");
   });
 
   it("reconciles a branch tied to one exact closed owned pull request", async () => {
     const harness = await makeHarness({ existing: true, closedExisting: true });
-    harness.create.mockImplementation(async () => ({
-      data: mergePull(harness.pull, {
-        number: 77,
-        state: "open",
-        closed_at: null,
-        head: {
-          ...harness.pull.head,
-          sha: await remoteSha(harness.remote),
-        },
-      }),
-    }));
-    harness.get.mockImplementation(async () => ({
-      data: mergePull(harness.pull, {
-        number: 77,
-        state: "open",
-        closed_at: null,
-        head: {
-          ...harness.pull.head,
-          sha: await remoteSha(harness.remote),
-        },
-      }),
-      headers: { etag: '"created"' },
-    }));
 
-    await expect(runUpdate(harness.execution)).resolves.toEqual({
+    await expect(runUpdate(harness.execution, harness.api)).resolves.toEqual({
       operation: "created",
-      pullRequestNumber: 77,
+      pullRequestNumber: 43,
     });
-    expect(harness.create).toHaveBeenCalledTimes(1);
+    expect(harness.api.pulls.get(42)).toMatchObject({
+      state: "closed",
+      head: { sha: harness.oldSha },
+    });
+    expect(harness.api.pulls.get(43)).toMatchObject({
+      state: "open",
+      labels: [{ name: "dependencies" }],
+      head: { sha: await remoteSha(harness.remote) },
+    });
   });
 
   it("preserves the update ref when the associated pull only matches the cleanup prefix", async () => {
     const harness = await makeHarness({ existing: true });
-    harness.pull.head.ref = "chore/prek-old";
+    const prefixPull = ownedPull(harness.oldSha);
+    prefixPull.head.ref = "chore/prek-old";
+    harness.api.pulls.set(42, prefixPull);
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(/not owned/u);
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
+      /not owned/u,
+    );
 
     expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
-    expect(harness.create).not.toHaveBeenCalled();
-    expect(harness.update).not.toHaveBeenCalled();
+    expect([...harness.api.pulls.values()]).toEqual([prefixPull]);
+    expect(harness.api.pulls.get(42)?.body).toBe(BODY_MARKER);
   });
 
   it("preserves a created branch when closing after label failure fails", async () => {
     const harness = await makeHarness();
-    harness.create.mockImplementation(async () => ({
-      data: mergePull(harness.pull, {
-        head: {
-          ...harness.pull.head,
-          sha: await remoteSha(harness.remote),
-        },
-      }),
-    }));
-    harness.addLabels.mockRejectedValueOnce(new Error("label failed"));
-    harness.update.mockRejectedValueOnce(new Error("close failed"));
+    harness.api.transitions.beforeAddLabel = () => {
+      throw new Error("label failed");
+    };
+    harness.api.transitions.beforeUpdatePull = () => {
+      throw new Error("close failed");
+    };
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
       /closing it also failed.*branch was preserved/u,
     );
-    expect(await pushes(harness.log)).toHaveLength(1);
+    expect(harness.api.pulls.get(42)).toMatchObject({
+      state: "open",
+      labels: [],
+      head: { sha: await remoteSha(harness.remote) },
+    });
   });
 
   it("closes a created pull before lease-deleting after label failure", async () => {
     const harness = await makeHarness();
-    harness.create.mockImplementation(async () => ({
-      data: mergePull(harness.pull, {
-        head: {
-          ...harness.pull.head,
-          sha: await remoteSha(harness.remote),
-        },
-      }),
-    }));
-    harness.addLabels.mockRejectedValueOnce(new Error("label failed"));
+    harness.api.transitions.beforeAddLabel = () => {
+      throw new Error("label failed");
+    };
+    harness.api.transitions.afterClosePull = async () => {
+      // Keep an open pull's branch available until closure is confirmed.
+      await expect(remoteSha(harness.remote)).resolves.toMatch(
+        /^[0-9a-f]{40}$/u,
+      );
+    };
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
       /closed and its branch was lease-rolled back/u,
     );
-    expect(harness.update).toHaveBeenCalledWith(
-      expect.objectContaining({ pull_number: 42, state: "closed" }),
-    );
-    expect(await pushes(harness.log)).toHaveLength(2);
+    expect(harness.api.pulls.get(42)).toMatchObject({
+      state: "closed",
+      labels: [],
+    });
+    await expect(remoteSha(harness.remote)).rejects.toThrow();
   });
 
   it("accepts an unexpected update response only after an exact fresh GET", async () => {
     const harness = await makeHarness({ existing: true });
-    const unexpectedResponse = {
-      data: mergePull(harness.pull, { body: "unexpected response" }),
-      headers: { etag: '"unexpected"' },
-    };
-    const pendingUpdate = Promise.withResolvers<typeof unexpectedResponse>();
-    let getCallsWhenUpdateStarted = 0;
-    harness.update.mockImplementationOnce(() => {
-      getCallsWhenUpdateStarted = harness.get.mock.calls.length;
-      return pendingUpdate.promise;
+    harness.api.patchPull(42, {
+      title: "Previous update",
+      body: `${BODY_MARKER}\nPrevious body`,
     });
+    harness.api.transitions.afterUpdatePull = ({ data }) => {
+      data.body = "unexpected response";
+    };
 
-    const result = runUpdate(harness.execution);
-    await vi.waitFor(() => expect(harness.update).toHaveBeenCalledOnce());
-    expect(harness.get).toHaveBeenCalledTimes(getCallsWhenUpdateStarted);
-
-    pendingUpdate.resolve(unexpectedResponse);
-    await expect(result).resolves.toEqual({
+    await expect(runUpdate(harness.execution, harness.api)).resolves.toEqual({
       operation: "updated",
       pullRequestNumber: 42,
     });
-    expect(harness.get.mock.calls.length).toBeGreaterThan(
-      getCallsWhenUpdateStarted,
-    );
-    expect(await pushes(harness.log)).toHaveLength(1);
+    expect(harness.api.pulls.get(42)).toMatchObject({
+      state: "open",
+      title: "Update",
+      body: BODY_MARKER,
+      head: { sha: await remoteSha(harness.remote) },
+    });
   });
 
   it("does not close or delete an existing pull when cached diff errors", async () => {
     const harness = await makeHarness({ existing: true, noChange: true });
     process.env.TEST_GIT_FAIL_DIFF = "1";
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
       /diff --cached --quiet failed/u,
     );
-    expect(harness.update).not.toHaveBeenCalled();
+    expect(harness.api.pulls.get(42)?.state).toBe("open");
+    expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
     expect(await pushes(harness.log)).toEqual([]);
   });
 
   it("does not persist the bot commit identity in repository config", async () => {
     const harness = await makeHarness({ existing: true });
-    await runUpdate(harness.execution);
+    await runUpdate(harness.execution, harness.api);
 
     expect(
       (
@@ -866,25 +781,25 @@ describe("update publication races", () => {
   });
 
   it.each([
-    ["before the run", 1],
-    ["during the run", 2],
-  ])(
+    ["before the run", "before"],
+    ["during the run", "during"],
+  ] as const)(
     "prevents mutation when the base ref drifts %s",
-    async (_name, driftAt) => {
-      const harness = await makeHarness({ baseDriftAt: driftAt });
+    async (_name, baseDrift) => {
+      const harness = await makeHarness({ baseDrift });
 
-      await expect(runUpdate(harness.execution)).rejects.toThrow(
+      await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
         /base branch changed/u,
       );
       expect(await pushes(harness.log)).toEqual([]);
-      expect(harness.create).not.toHaveBeenCalled();
+      expect([...harness.api.pulls.keys()]).toEqual([]);
     },
   );
 });
 
 describe("detached caller checkout", () => {
   it("refuses a stale detached checkout with an actionable message and no mutation", async () => {
-    const harness = await makeHarness({ detached: true, baseDriftAt: 1 });
+    const harness = await makeHarness({ detached: true, baseDrift: "before" });
     expect(
       (
         await exec("git", [
@@ -896,7 +811,7 @@ describe("detached caller checkout", () => {
       ).stdout.trim(),
     ).toBe("");
 
-    const error = await runUpdate(harness.execution).catch(
+    const error = await runUpdate(harness.execution, harness.api).catch(
       (caught: unknown) => caught,
     );
     expect(error).toBeInstanceOf(Error);
@@ -905,7 +820,7 @@ describe("detached caller checkout", () => {
     expect(message).toContain("DRIFT");
     expect(message).toContain(harness.execution.context.baseSha);
     expect(await pushes(harness.log)).toEqual([]);
-    expect(harness.create).not.toHaveBeenCalled();
+    expect([...harness.api.pulls.keys()]).toEqual([]);
   });
 
   it("proceeds from a detached checkout at the branch tip", async () => {
@@ -914,7 +829,9 @@ describe("detached caller checkout", () => {
       existing: true,
       noChange: true,
     });
-    await expect(runUpdate(harness.execution)).resolves.toMatchObject({
+    await expect(
+      runUpdate(harness.execution, harness.api),
+    ).resolves.toMatchObject({
       operation: "closed",
     });
   });
@@ -923,47 +840,59 @@ describe("detached caller checkout", () => {
 describe("no-change close compensation", () => {
   it("returns the closed pull and deleted branch for reporting", async () => {
     const harness = await makeHarness({ existing: true, noChange: true });
-    await expect(runUpdate(harness.execution)).resolves.toEqual({
+    await expect(runUpdate(harness.execution, harness.api)).resolves.toEqual({
       operation: "closed",
       cleanup: {
         closedPullRequests: [42],
         deletedBranches: ["chore/prek-updates"],
       },
     });
+    expect(harness.api.pulls.get(42)?.state).toBe("closed");
+    await expect(remoteSha(harness.remote)).rejects.toThrow();
   });
 
   it("preserves the branch and refuses reopen when close response loses identity", async () => {
     const harness = await makeHarness({ existing: true, noChange: true });
-    harness.update.mockResolvedValueOnce({
-      data: mergePull(harness.pull, {
-        state: "closed",
-        body: "changed",
-        closed_at: "2026-07-28T00:00:01Z",
-      }),
-      headers: { etag: '"close"' },
-    });
+    harness.api.transitions.afterClosePull = () => {
+      harness.api.patchPull(42, { body: "changed" });
+    };
+    harness.api.transitions.afterUpdatePull = ({ data }) => {
+      data.body = "changed";
+    };
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
       /unexpected pull request after close/u,
     );
     expect(await pushes(harness.log)).toEqual([]);
-    expect(harness.update).toHaveBeenCalledTimes(1);
+    expect(harness.api.pulls.get(42)?.state).toBe("closed");
+    expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
   });
 
   it("reopens only the exact unchanged close event with its ETag after delete failure", async () => {
     const harness = await makeHarness({ existing: true, noChange: true });
     process.env.TEST_GIT_FAIL_PUSH = "1";
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
       /was compensated/u,
     );
-    expect(harness.update).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        state: "open",
-        headers: { "If-Match": '"close"' },
-      }),
+    expect(harness.api.pulls.get(42)?.state).toBe("open");
+    expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
+  });
+
+  it("leaves the pull closed when its ETag changes before the conditional reopen", async () => {
+    const harness = await makeHarness({ existing: true, noChange: true });
+    process.env.TEST_GIT_FAIL_PUSH = "1";
+    harness.api.transitions.beforeUpdatePull = ({ number, changes }) => {
+      if ("state" in changes && changes.state === "open") {
+        harness.api.pullEtags.set(number, '"concurrent-edit"');
+      }
+    };
+
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
+      /was not reopened/u,
     );
+    expect(harness.api.pulls.get(42)?.state).toBe("closed");
+    expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
   });
 
   it.each([
@@ -973,43 +902,29 @@ describe("no-change close compensation", () => {
   ])("never reopens after %s", async (_name, changed) => {
     const harness = await makeHarness({ existing: true, noChange: true });
     process.env.TEST_GIT_FAIL_PUSH = "1";
-    harness.get
-      .mockResolvedValueOnce({
-        data: harness.pull,
-        headers: { etag: '"before"' },
-      })
-      .mockResolvedValueOnce({
-        data: mergePull(harness.pull, {
-          state: "closed",
-          closed_at: "2026-07-28T00:00:01Z",
-          ...changed,
-        }),
-        headers: { etag: '"close"' },
-      });
+    harness.api.transitions.afterClosePull = () => {
+      harness.api.patchPull(42, changed);
+    };
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow(
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
       /was not reopened/u,
     );
-    expect(harness.update).toHaveBeenCalledTimes(1);
+    expect(harness.api.pulls.get(42)?.state).toBe("closed");
+    expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
   });
 });
 
 it("preserves a cleanup ref and discards credentials from a rejected push error", async () => {
-  const harness = await makeHarness({ existing: true, closedExisting: true });
   const token = "fake-cleanup-credential";
-  const execution = {
-    ...harness.execution,
-    inputs: { ...harness.execution.inputs, token },
-  };
-  Object.assign(execution.client.paginate, {
-    async *iterator(_endpoint: unknown, { state }: { state: string }) {
-      yield { data: state === "closed" ? [harness.pull] : [] };
-    },
+  const harness = await makeHarness({
+    existing: true,
+    closedExisting: true,
+    token,
   });
   process.env.TEST_GIT_FAIL_PUSH = "1";
   process.env.TEST_GIT_FAILURE_OUTPUT = token;
 
-  const error = await cleanupUpdateBranches(execution, {
+  const error = await cleanupWithApi(harness.api, harness.execution, {
     keepLatestOpenPullRequest: false,
     closeStalePullRequests: false,
     closeObsoletePullRequests: false,
@@ -1033,9 +948,11 @@ interface HarnessOptions {
   closedExisting?: boolean;
   noChange?: boolean;
   loseAfterPush?: boolean;
-  baseDriftAt?: number;
+  baseDrift?: "before" | "during";
+  serverUrl?: string;
+  token?: string;
   detached?: boolean;
-  refLossAt?: number;
+  refLoss?: boolean;
 }
 
 async function makeHarness(options: HarnessOptions = {}) {
@@ -1101,65 +1018,16 @@ async function makeHarness(options: HarnessOptions = {}) {
     pull.state = "closed";
     pull.closed_at = "2026-07-28T00:00:00Z";
   }
-  const create = vi.fn();
-  let closedPull: ReturnType<typeof ownedPull> | undefined;
-  const update = vi.fn(
-    async ({
-      state,
-      body,
-      title,
-    }: {
-      state?: string;
-      body?: string;
-      title?: string;
-    }) => {
-      const data = mergePull(pull, {
-        state: state ?? pull.state,
-        body: body ?? pull.body,
-        title: title ?? pull.title,
-        head: {
-          ...pull.head,
-          sha: await remoteSha(remote),
-        },
-        updated_at:
-          state === "closed" ? "2026-07-28T00:00:01Z" : pull.updated_at,
-        closed_at: state === "closed" ? "2026-07-28T00:00:01Z" : pull.closed_at,
-      });
-      if (state === "closed") closedPull = data;
-      return { data, headers: { etag: '"close"' } };
-    },
+  const api = new InMemoryGitHub(options.existing ? [pull] : []);
+  api.labels.set("dependencies", "0366d6");
+  api.refs.set(
+    "heads/main",
+    options.baseDrift === "before" ? "DRIFT" : baseSha,
   );
-  let getCalls = 0;
-  const get = vi.fn(async () => {
-    getCalls += 1;
-    const currentSha = await remoteSha(remote);
-    const data =
-      closedPull ??
-      (options.loseAfterPush && getCalls > 1
-        ? mergePull(pull, {
-            labels: [],
-            head: { ...pull.head, sha: currentSha },
-          })
-        : mergePull(pull, { head: { ...pull.head, sha: currentSha } }));
-    return { data, headers: { etag: '"close"' } };
-  });
-  let baseChecks = 0;
-  let updateRefChecks = 0;
-  const getRef = vi.fn(async ({ ref }: { ref: string }) => {
-    if (ref === "heads/main") {
-      baseChecks += 1;
-      return {
-        data: {
-          object: {
-            sha:
-              baseChecks >= (options.baseDriftAt ?? Infinity)
-                ? "DRIFT"
-                : baseSha,
-          },
-        },
-      };
-    }
-    updateRefChecks += 1;
+  let removeRef: Promise<unknown> | undefined;
+  api.transitions.beforeReadRef = async (ref) => {
+    if (ref !== updateRef) return;
+    await removeRef;
     const { stdout } = await exec("git", [
       "ls-remote",
       "--refs",
@@ -1167,24 +1035,38 @@ async function makeHarness(options: HarnessOptions = {}) {
       `refs/${ref}`,
     ]);
     const sha = stdout.split("\t")[0];
-    if (!sha || updateRefChecks >= (options.refLossAt ?? Infinity)) {
-      throw Object.assign(new Error("missing"), { status: 404 });
+    if (sha) api.refs.set(ref, sha);
+    else api.refs.delete(ref);
+  };
+  api.transitions.beforeReadPull = async (number) => {
+    const current = api.pulls.get(number);
+    if (current === undefined || current.state !== "open") return;
+    const head = current.head as typeof pull.head;
+    if (head.ref !== updateBranch) return;
+    if (options.refLoss) {
+      removeRef ??= exec("git", [
+        "--git-dir",
+        remote,
+        "update-ref",
+        "-d",
+        `refs/${updateRef}`,
+        oldSha,
+      ]);
     }
-    return { data: { object: { sha } } };
-  });
-  const paginate = vi.fn(async () => (options.existing ? [pull] : []));
-  const addLabels = vi.fn();
-  const getLabel = vi.fn(async () => ({ data: { name: "dependencies" } }));
+    const sha = await api.getRefSha(updateRef);
+    if (sha === undefined) return;
+    api.patchPull(number, {
+      head: { ...head, sha },
+      ...(options.loseAfterPush && sha !== oldSha ? { labels: [] } : {}),
+    });
+  };
+  if (options.baseDrift === "during") {
+    api.transitions.afterListPulls = () => {
+      api.refs.set("heads/main", "DRIFT");
+    };
+  }
   const graphql = vi.fn();
-  const client = {
-    graphql,
-    paginate,
-    rest: {
-      git: { getRef },
-      issues: { addLabels, getLabel },
-      pulls: { create, get, list: vi.fn(), update },
-    },
-  } as unknown as GitHubClient;
+  const client = { graphql } as unknown as GitHubClient;
   const execution = {
     client,
     context: {
@@ -1196,7 +1078,7 @@ async function makeHarness(options: HarnessOptions = {}) {
       owner: "owner",
       repository: "repo",
       repositoryFullName: "owner/repo",
-      serverUrl: "https://github.com",
+      serverUrl: options.serverUrl ?? "https://github.com",
       workspace,
     },
     inputs: {
@@ -1208,25 +1090,32 @@ async function makeHarness(options: HarnessOptions = {}) {
       cooldownDays: "7",
       label: "dependencies",
       prTitle: "Update",
-      token: "token",
+      token: options.token ?? "token",
       updateBranch: "chore/prek-updates",
       updateDay: 1,
     },
   } satisfies ActionExecution;
   process.env.TEST_GIT_URL = `${execution.context.serverUrl}/${execution.context.repositoryFullName}.git`;
+  api.deleteRef = (ref, expectedSha, workspace) =>
+    deleteBranch({
+      remote: {
+        serverUrl: execution.context.serverUrl,
+        token: execution.inputs.token,
+        repositoryFullName: execution.context.repositoryFullName,
+      },
+      ref: `refs/${ref}`,
+      expectedSha,
+      readRef: () => api.getRefSha(ref),
+      ...(workspace === undefined ? {} : { workspace }),
+    });
   return {
-    addLabels,
-    create,
-    execution,
-    get,
+    api,
+    execution: { ...execution, api },
     graphql,
     log,
     oldSha,
-    paginate,
     prek,
-    pull,
     remote,
-    update,
   };
 }
 
@@ -1327,11 +1216,22 @@ async function remoteSha(remote: string): Promise<string> {
   ).stdout.trim();
 }
 
-function mergePull(
-  pull: ReturnType<typeof ownedPull>,
-  changed: Record<string, unknown>,
-): ReturnType<typeof ownedPull> {
-  return { ...pull, ...changed } as ReturnType<typeof ownedPull>;
+async function seedConcurrentPull(
+  harness: Awaited<ReturnType<typeof makeHarness>>,
+  request: NewPull,
+  number: number,
+): Promise<void> {
+  harness.api.pulls.set(number, {
+    ...ownedPull(await remoteSha(harness.remote)),
+    title: request.title,
+    body: request.body,
+    number,
+    labels: [],
+  });
+}
+
+function restError(message: string, status: number): Error {
+  return Object.assign(new Error(message), { status });
 }
 
 function autoMergePull(headRefOid: string, enabled = false) {

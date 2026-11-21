@@ -10,13 +10,18 @@ import {
 } from "../contracts.js";
 import { sanitizedChildEnvironment } from "../environment.js";
 import {
-  deleteBranch,
   git,
   gitAuthenticated,
   gitExit,
   repositoryUrl,
   type DeleteRefOutcome,
 } from "../git.js";
+import {
+  OctokitGitHubApi,
+  statusOf,
+  type GitHubApi,
+  type Payload,
+} from "../github.js";
 import {
   BODY_MARKER,
   isOwnedPull,
@@ -82,12 +87,19 @@ export function validateCleanupConfiguration(execution: ActionExecution): void {
 /** Run prek in an isolated base-SHA worktree and publish its owned update PR. */
 export async function runUpdate(
   execution: ActionExecution,
+  api: GitHubApi = new OctokitGitHubApi(
+    execution.client,
+    execution.context.owner,
+    execution.context.repository,
+    execution.inputs.token,
+    execution.context.serverUrl,
+  ),
 ): Promise<UpdateResult> {
   await validateUpdateConfiguration(execution);
   const addPaths = await resolveAddPaths(execution);
-  await proveBase(execution);
-  const remote = await observeRemoteState(execution);
-  await ensureOwnershipLabel(execution);
+  await proveBase(api, execution);
+  const remote = await observeRemoteState(api, execution);
+  await api.ensureLabel(execution.inputs.label);
   const detachedWorktree = await prepareWorktree(
     execution.context.workspace,
     execution.context.baseSha,
@@ -119,7 +131,7 @@ export async function runUpdate(
     }
     const changed = diffStatus === 1;
     if (!changed) {
-      return await closeUnneededPullRequest(execution, remote);
+      return await closeUnneededPullRequest(api, execution, remote);
     }
 
     await git(worktree, [
@@ -135,26 +147,24 @@ export async function runUpdate(
     const body = makeBody(output, execution.context.workspace);
     if (remote.ownedPullRequest !== undefined) {
       await fetchObservedUpdateCommit(execution, worktree, remote);
-      await proveCurrentOwnership(execution, remote);
+      await proveCurrentOwnership(api, execution, remote);
     }
-    await proveBase(execution);
+    await proveBase(api, execution);
     await pushUpdate(execution, worktree, remote.sha);
     if (remote.ownedPullRequest === undefined) {
       let pullNumber: number | undefined;
       try {
-        const response = await execution.client.rest.pulls.create({
-          owner: execution.context.owner,
-          repo: execution.context.repository,
+        pullNumber = await api.createPull({
           head: execution.inputs.updateBranch,
           base: execution.context.baseBranch,
           title: execution.inputs.prTitle,
           body,
         });
-        pullNumber = response.data.number;
       } catch (error) {
         let recovered: number | undefined;
         try {
           recovered = await recoverAmbiguousCreatedPull(
+            api,
             execution,
             newSha,
             body,
@@ -168,7 +178,7 @@ export async function runUpdate(
         if (recovered !== undefined) {
           pullNumber = recovered;
         } else if (isDefiniteCreateFailure(error)) {
-          await rollbackNewBranch(execution, newSha, error);
+          await rollbackNewBranch(api, execution, newSha, error);
         } else {
           throw new Error(
             "Pull request creation had an ambiguous outcome; the lease-protected update branch was preserved for inspection",
@@ -185,10 +195,16 @@ export async function runUpdate(
         throw new Error("Pull request creation did not return a pull number");
       }
       try {
-        await applyLabel(execution, pullNumber);
-        await proveCreatedOwnership(execution, pullNumber, newSha, body);
+        await api.addLabel(pullNumber, execution.inputs.label);
+        await proveCreatedOwnership(api, execution, pullNumber, newSha, body);
       } catch (error) {
-        await rollbackCreatedPullRequest(execution, pullNumber, newSha, error);
+        await rollbackCreatedPullRequest(
+          api,
+          execution,
+          pullNumber,
+          newSha,
+          error,
+        );
       }
       await enableAutoMergeForPublishedPull(
         execution,
@@ -200,16 +216,13 @@ export async function runUpdate(
     }
 
     try {
-      await provePublishedOwnership(execution, remote, newSha);
+      await provePublishedOwnership(api, execution, remote, newSha);
     } catch (error) {
       await rollbackExistingPush(execution, remote, newSha, error);
     }
     let pullUpdateError: unknown;
     try {
-      const response = await execution.client.rest.pulls.update({
-        owner: execution.context.owner,
-        repo: execution.context.repository,
-        pull_number: remote.ownedPullRequest.number,
+      const response = await api.updatePull(remote.ownedPullRequest.number, {
         title: execution.inputs.prTitle,
         body,
       });
@@ -245,12 +258,9 @@ export async function runUpdate(
     }
     let verified: PullRequest;
     try {
-      const response = await execution.client.rest.pulls.get({
-        owner: execution.context.owner,
-        repo: execution.context.repository,
-        pull_number: remote.ownedPullRequest.number,
-      });
-      verified = pullFromData(response.data);
+      verified = pullFromData(
+        await api.getPull(remote.ownedPullRequest.number),
+      );
       if (
         isExactUpdatedPull(
           execution,
@@ -735,21 +745,15 @@ function bodiesEqual(left: string | null, right: string | null): boolean {
 }
 
 async function recoverAmbiguousCreatedPull(
+  api: GitHubApi,
   execution: ActionExecution,
   newSha: string,
   body: string,
 ): Promise<number | undefined> {
-  const pulls = await execution.client.paginate(
-    execution.client.rest.pulls.list,
-    {
-      owner: execution.context.owner,
-      repo: execution.context.repository,
-      state: "open",
-      head: `${execution.context.owner}:${execution.inputs.updateBranch}`,
-      base: execution.context.baseBranch,
-      per_page: 100,
-    },
-  );
+  const pulls = await api.listPulls("open", {
+    head: `${execution.context.owner}:${execution.inputs.updateBranch}`,
+    base: execution.context.baseBranch,
+  });
   const matches = pulls
     .map((pull) => pullFromData(pull))
     .filter(
@@ -770,17 +774,13 @@ async function recoverAmbiguousCreatedPull(
 }
 
 async function proveCreatedOwnership(
+  api: GitHubApi,
   execution: ActionExecution,
   pullNumber: number,
   newSha: string,
   body: string,
 ): Promise<void> {
-  const response = await execution.client.rest.pulls.get({
-    owner: execution.context.owner,
-    repo: execution.context.repository,
-    pull_number: pullNumber,
-  });
-  const pull = pullFromData(response.data);
+  const pull = pullFromData(await api.getPull(pullNumber));
   if (
     pull.number !== pullNumber ||
     pull.state !== "open" ||
@@ -930,76 +930,14 @@ async function assertBaseCommit(execution: ActionExecution): Promise<void> {
   ]);
 }
 
-async function ensureOwnershipLabel(execution: ActionExecution): Promise<void> {
-  const label = {
-    owner: execution.context.owner,
-    repo: execution.context.repository,
-    name: execution.inputs.label,
-  };
-  try {
-    await execution.client.rest.issues.getLabel(label);
-    return;
-  } catch (error) {
-    if (!isNotFound(error)) {
-      throw error;
-    }
-  }
-
-  try {
-    await execution.client.rest.issues.createLabel({
-      ...label,
-      color: "0366d6",
-    });
-  } catch (error) {
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "status" in error &&
-      error.status === 422
-    ) {
-      // A concurrent run may have created the label after our lookup.
-      try {
-        await execution.client.rest.issues.getLabel(label);
-        return;
-      } catch {
-        // Preserve the creation failure unless the label now exists.
-      }
-    }
-    throw error;
-  }
-}
-
-async function readUpdateBranch(
-  execution: ActionExecution,
-): Promise<string | undefined> {
-  try {
-    const response = await execution.client.rest.git.getRef({
-      owner: execution.context.owner,
-      repo: execution.context.repository,
-      ref: `heads/${execution.inputs.updateBranch}`,
-    });
-    return response.data.object.sha;
-  } catch (error) {
-    if (isNotFound(error)) return undefined;
-    throw error;
-  }
-}
-
 async function observeRemoteState(
+  api: GitHubApi,
   execution: ActionExecution,
 ): Promise<RemoteState> {
-  const sha = await readUpdateBranch(execution);
-
-  const pulls = await execution.client.paginate(
-    execution.client.rest.pulls.list,
-    {
-      owner: execution.context.owner,
-      repo: execution.context.repository,
-      state: "all",
-      head: `${execution.context.owner}:${execution.inputs.updateBranch}`,
-      per_page: 100,
-    },
-  );
+  const sha = await api.getRefSha(`heads/${execution.inputs.updateBranch}`);
+  const pulls = await api.listPulls("all", {
+    head: `${execution.context.owner}:${execution.inputs.updateBranch}`,
+  });
   const associated = pulls.map((pull) => pullFromData(pull));
   const live = associated.filter((pull) => pull.state === "open");
   const owned = live.filter((pull) => isOwned(execution, pull));
@@ -1033,7 +971,7 @@ async function observeRemoteState(
   return { sha, ownedPullRequest: owned[0] };
 }
 
-function pullFromData(data: {
+interface RestPull {
   readonly number: number;
   readonly user: { readonly login?: string } | null;
   readonly body: string | null;
@@ -1048,7 +986,10 @@ function pullFromData(data: {
   readonly labels: readonly (string | { readonly name?: string })[];
   readonly updated_at: string;
   readonly closed_at: string | null;
-}): PullRequest {
+}
+
+function pullFromData(payload: Payload): PullRequest {
+  const data = payload as unknown as RestPull;
   return {
     number: data.number,
     author: data.user?.login ?? null,
@@ -1124,6 +1065,7 @@ async function pushUpdate(
 }
 
 async function closeUnneededPullRequest(
+  api: GitHubApi,
   execution: ActionExecution,
   remote: RemoteState,
 ): Promise<UpdateResult> {
@@ -1131,14 +1073,9 @@ async function closeUnneededPullRequest(
   if (pull === undefined || remote.sha === undefined) {
     return { operation: "none" };
   }
-  await proveBase(execution);
-  const current = await proveCurrentOwnership(execution, remote);
-  const response = await execution.client.rest.pulls.update({
-    owner: execution.context.owner,
-    repo: execution.context.repository,
-    pull_number: pull.number,
-    state: "closed",
-  });
+  await proveBase(api, execution);
+  const current = await proveCurrentOwnership(api, execution, remote);
+  const response = await api.updatePull(pull.number, { state: "closed" });
   const closed = pullFromData(response.data);
   if (
     !isOwned(execution, closed) ||
@@ -1151,16 +1088,18 @@ async function closeUnneededPullRequest(
   }
   try {
     if (
-      (await deleteUpdateBranch(execution, remote.sha)) === "already-absent"
+      (await deleteUpdateBranch(api, execution, remote.sha)) ===
+      "already-absent"
     ) {
       throw new Error("The update branch was already absent at deletion");
     }
   } catch (error) {
-    const closeEtag =
-      typeof response.headers?.etag === "string"
-        ? response.headers.etag
-        : undefined;
-    const restored = await compensateClose(execution, closed, closeEtag);
+    const restored = await compensateClose(
+      api,
+      execution,
+      closed,
+      response.etag,
+    );
     throw new Error(
       restored
         ? `Lease-protected branch deletion failed; the exact close of pull request #${pull.number} was compensated`
@@ -1177,13 +1116,13 @@ async function closeUnneededPullRequest(
   };
 }
 
-async function proveBase(execution: ActionExecution): Promise<void> {
-  const response = await execution.client.rest.git.getRef({
-    owner: execution.context.owner,
-    repo: execution.context.repository,
-    ref: `heads/${execution.context.baseBranch}`,
-  });
-  const current = response.data.object.sha;
+async function proveBase(
+  api: GitHubApi,
+  execution: ActionExecution,
+): Promise<void> {
+  const current = await api.requireRefSha(
+    `heads/${execution.context.baseBranch}`,
+  );
   if (current !== execution.context.baseSha) {
     throw new Error(
       `The base branch changed after checkout: ${execution.context.baseBranch} is at ${current}, but the checkout is at ${execution.context.baseSha}. For a detached or older checkout, check out the current tip of ${execution.context.baseBranch}.`,
@@ -1192,6 +1131,7 @@ async function proveBase(execution: ActionExecution): Promise<void> {
 }
 
 async function proveCurrentOwnership(
+  api: GitHubApi,
   execution: ActionExecution,
   remote: RemoteState,
 ): Promise<PullRequest> {
@@ -1199,25 +1139,17 @@ async function proveCurrentOwnership(
   if (expected === undefined || remote.sha === undefined) {
     throw new Error("Expected an owned update pull request and branch");
   }
-  const [pullResponse, refResponse] = await Promise.all([
-    execution.client.rest.pulls.get({
-      owner: execution.context.owner,
-      repo: execution.context.repository,
-      pull_number: expected.number,
-    }),
-    execution.client.rest.git.getRef({
-      owner: execution.context.owner,
-      repo: execution.context.repository,
-      ref: `heads/${execution.inputs.updateBranch}`,
-    }),
+  const [pull, refSha] = await Promise.all([
+    api.getPull(expected.number),
+    api.requireRefSha(`heads/${execution.inputs.updateBranch}`),
   ]);
-  const current = pullFromData(pullResponse.data);
+  const current = pullFromData(pull);
   if (
     current.number !== expected.number ||
     current.state !== "open" ||
     !isOwned(execution, current) ||
     current.headSha !== remote.sha ||
-    refResponse.data.object.sha !== remote.sha
+    refSha !== remote.sha
   ) {
     throw new Error(
       "Update pull request or branch changed after initial observation",
@@ -1227,17 +1159,19 @@ async function proveCurrentOwnership(
 }
 
 async function provePublishedOwnership(
+  api: GitHubApi,
   execution: ActionExecution,
   remote: RemoteState,
   newSha: string,
 ): Promise<void> {
-  await proveCurrentOwnership(execution, {
+  await proveCurrentOwnership(api, execution, {
     sha: newSha,
     ownedPullRequest: remote.ownedPullRequest,
   });
 }
 
 async function compensateClose(
+  api: GitHubApi,
   execution: ActionExecution,
   closed: PullRequest,
   closeEtag: string | undefined,
@@ -1246,17 +1180,9 @@ async function compensateClose(
     return false;
   }
   try {
-    const [pullResponse, refResponse] = await Promise.all([
-      execution.client.rest.pulls.get({
-        owner: execution.context.owner,
-        repo: execution.context.repository,
-        pull_number: closed.number,
-      }),
-      execution.client.rest.git.getRef({
-        owner: execution.context.owner,
-        repo: execution.context.repository,
-        ref: `heads/${execution.inputs.updateBranch}`,
-      }),
+    const [pullResponse, refSha] = await Promise.all([
+      api.getPullWithEtag(closed.number),
+      api.requireRefSha(`heads/${execution.inputs.updateBranch}`),
     ]);
     const current = pullFromData(pullResponse.data);
     if (
@@ -1265,18 +1191,16 @@ async function compensateClose(
       current.headSha !== closed.headSha ||
       current.updatedAt !== closed.updatedAt ||
       current.closedAt !== closed.closedAt ||
-      pullResponse.headers.etag !== closeEtag ||
-      refResponse.data.object.sha !== closed.headSha
+      pullResponse.etag !== closeEtag ||
+      refSha !== closed.headSha
     ) {
       return false;
     }
-    const reopenedResponse = await execution.client.rest.pulls.update({
-      owner: execution.context.owner,
-      repo: execution.context.repository,
-      pull_number: closed.number,
-      state: "open",
-      headers: { "If-Match": closeEtag },
-    });
+    const reopenedResponse = await api.updatePull(
+      closed.number,
+      { state: "open" },
+      closeEtag,
+    );
     const reopened = pullFromData(reopenedResponse.data);
     return (
       reopened.state === "open" &&
@@ -1288,31 +1212,15 @@ async function compensateClose(
   }
 }
 
-async function applyLabel(
-  execution: ActionExecution,
-  pullNumber: number,
-): Promise<void> {
-  await execution.client.rest.issues.addLabels({
-    owner: execution.context.owner,
-    repo: execution.context.repository,
-    issue_number: pullNumber,
-    labels: [execution.inputs.label],
-  });
-}
-
 async function rollbackCreatedPullRequest(
+  api: GitHubApi,
   execution: ActionExecution,
   pullNumber: number,
   pushedSha: string,
   labelError: unknown,
 ): Promise<never> {
   try {
-    const response = await execution.client.rest.pulls.update({
-      owner: execution.context.owner,
-      repo: execution.context.repository,
-      pull_number: pullNumber,
-      state: "closed",
-    });
+    const response = await api.updatePull(pullNumber, { state: "closed" });
     const closed = pullFromData(response.data);
     if (
       closed.number !== pullNumber ||
@@ -1329,7 +1237,7 @@ async function rollbackCreatedPullRequest(
   }
   let deletion: CompletedDeletion;
   try {
-    deletion = await deleteUpdateBranch(execution, pushedSha);
+    deletion = await deleteUpdateBranch(api, execution, pushedSha);
   } catch (rollbackError) {
     throw new Error(
       `Created pull request #${pullNumber} was closed after ownership setup failed, but lease-protected branch rollback also failed; the branch was preserved`,
@@ -1345,13 +1253,14 @@ async function rollbackCreatedPullRequest(
 }
 
 async function rollbackNewBranch(
+  api: GitHubApi,
   execution: ActionExecution,
   pushedSha: string,
   createError: unknown,
 ): Promise<never> {
   let deletion: CompletedDeletion;
   try {
-    deletion = await deleteUpdateBranch(execution, pushedSha);
+    deletion = await deleteUpdateBranch(api, execution, pushedSha);
   } catch (rollbackError) {
     throw new Error(
       "Pull request creation definitely failed, but lease-protected branch rollback failed; the branch was preserved",
@@ -1406,16 +1315,15 @@ async function rollbackExistingPush(
 type CompletedDeletion = Exclude<DeleteRefOutcome, "lease-rejected">;
 
 async function deleteUpdateBranch(
+  api: GitHubApi,
   execution: ActionExecution,
   expectedSha: string,
 ): Promise<CompletedDeletion> {
-  const outcome = await deleteBranch({
-    remote: gitRemote(execution),
-    ref: `refs/heads/${execution.inputs.updateBranch}`,
+  const outcome = await api.deleteRef(
+    `heads/${execution.inputs.updateBranch}`,
     expectedSha,
-    readRef: () => readUpdateBranch(execution),
-    workspace: execution.context.workspace,
-  });
+    execution.context.workspace,
+  );
   if (outcome === "lease-rejected") {
     throw new Error(
       "Lease-protected branch deletion rejected because the branch moved",
@@ -1425,24 +1333,12 @@ async function deleteUpdateBranch(
 }
 
 function isDefiniteCreateFailure(error: unknown): boolean {
-  if (
-    typeof error !== "object" ||
-    error === null ||
-    !("status" in error) ||
-    typeof (error as { status?: unknown }).status !== "number"
-  ) {
-    return false;
-  }
-  const status = (error as { status: number }).status;
-  return status >= 400 && status < 500 && ![408, 409, 429].includes(status);
-}
-
-function isNotFound(error: unknown): boolean {
+  const status = statusOf(error);
   return (
-    typeof error === "object" &&
-    error !== null &&
-    "status" in error &&
-    (error as { status: unknown }).status === 404
+    status !== undefined &&
+    status >= 400 &&
+    status < 500 &&
+    ![408, 409, 429].includes(status)
   );
 }
 
