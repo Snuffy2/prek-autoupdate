@@ -41,7 +41,11 @@ vi.mock("../../src/environment.js", async (importOriginal) => {
 });
 
 import { cleanupWithApi } from "../../src/cleanup/index.js";
-import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
+import {
+  PublishedPullRequestError,
+  type ActionExecution,
+  type GitHubClient,
+} from "../../src/contracts.js";
 import { deleteBranch } from "../../src/git.js";
 import { OctokitGitHubApi, type NewPull } from "../../src/github.js";
 import { InMemoryGitHub } from "../support/in-memory-github.js";
@@ -371,22 +375,66 @@ describe("update publication races", () => {
   );
 
   it.each([
-    { existing: false, operation: "created" },
-    { existing: true, operation: "updated" },
+    { publication: "new", operation: "created" },
+    { publication: "updated", operation: "updated" },
+    { publication: "recovered metadata update", operation: "updated" },
   ] as const)(
-    "reports and preserves the $operation pull when auto-merge fails",
-    async ({ existing, operation }) => {
-      const harness = await makeHarness({ existing });
+    "keeps the $publication pull through cleanup after auto-merge fails",
+    async ({ publication, operation }) => {
+      const harness = await makeHarness({ existing: publication !== "new" });
+      if (publication === "recovered metadata update") {
+        harness.api.transitions.afterUpdatePull = () => {
+          throw new Error("metadata response lost");
+        };
+      }
       harness.api.transitions.beforeEnableAutoMerge = () => {
         throw new Error("auto-merge rejected");
       };
 
-      await expect(runWithAutoMerge(harness)).rejects.toMatchObject({
+      const error = await runWithAutoMerge(harness).catch(
+        (caught: unknown) => caught,
+      );
+      expect(error).toBeInstanceOf(PublishedPullRequestError);
+      expect(error).toMatchObject({
         publishedPullRequest: { operation, pullRequestNumber: 42 },
         cause: expect.objectContaining({ message: "auto-merge rejected" }),
       });
+      if (!(error instanceof PublishedPullRequestError)) throw error;
+
+      const publishedSha = await remoteSha(harness.remote);
+      const newerBranch = "chore/prek-newer";
+      await exec("git", [
+        "--git-dir",
+        harness.remote,
+        "update-ref",
+        `refs/heads/${newerBranch}`,
+        publishedSha,
+      ]);
+      const newer = ownedPull(publishedSha);
+      harness.api.pulls.set(43, {
+        ...newer,
+        number: 43,
+        changed_files: 1,
+        head: { ...newer.head, ref: newerBranch },
+      });
+      await expect(
+        cleanupWithApi(harness.api, harness.execution, {
+          keepPullRequestNumber: error.publishedPullRequest.pullRequestNumber,
+          keepLatestOpenPullRequest: false,
+          closeStalePullRequests: true,
+          closeObsoletePullRequests: false,
+          deleteStaleBranches: true,
+          deleteMergedBranches: true,
+        }),
+      ).resolves.toEqual({ closedPullRequests: [43], deletedBranches: [] });
+
       expect(harness.api.autoMergeRequests.get(42)).toBeUndefined();
-      await expectPublishedPull(harness);
+      expect(harness.api.pulls.get(42)).toMatchObject({
+        state: "open",
+        head: { sha: publishedSha },
+      });
+      expect(await remoteSha(harness.remote)).toBe(publishedSha);
+      expect(harness.api.pulls.get(43)?.state).toBe("closed");
     },
   );
 

@@ -27,6 +27,12 @@ export default defineConfig(
     files: ["src/update/index.ts"],
     rules: {
       "no-control-regex": "off",
+    },
+  },
+  {
+    files: ["src/update/publication.ts"],
+    rules: {
+      // Publication combines caught operation and recovery errors in AggregateError.
       "preserve-caught-error": "off",
     },
   },

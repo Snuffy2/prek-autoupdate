@@ -40526,251 +40526,115 @@ async function verifySha256(archive, checksumContents, asset) {
     }
 }
 
-/** Allocate a detached worktree. Clean up even if Git only partially adds it. */
-async function prepareWorktree(workspace, baseSha) {
-    const root = await createTemporaryRoot();
-    const worktree = join(root, "worktree");
-    return {
-        path: worktree,
-        async add() {
-            await git(workspace, ["worktree", "add", "--detach", worktree, baseSha]);
-        },
-        async cleanup() {
-            const remove = ["worktree", "remove", "--force", worktree];
-            try {
-                await git(workspace, remove).catch(() => git(workspace, remove));
-            }
-            catch (removalError) {
-                await reconcileRemoval(workspace, worktree, removalError);
-            }
-            await rm$1(root, { force: true, recursive: true });
-        },
-    };
+/** Publish a prepared commit and verify its pull request before post-publication setup. */
+async function publishUpdate(api, execution, remote, { worktree, sha: newSha, body }) {
+    const original = remote.ownedPullRequest;
+    if (original !== undefined) {
+        await fetchObservedUpdateCommit(execution, worktree.path, remote);
+        await proveCurrentOwnership(api, execution, remote);
+    }
+    await proveBase(api, execution);
+    await pushUpdate(execution, worktree.path, remote.sha);
+    const operation = original === undefined ? "created" : "updated";
+    let pullNumber;
+    if (original === undefined) {
+        pullNumber = await publishNewPull(api, execution, newSha, body);
+    }
+    else {
+        pullNumber = original.number;
+        await publishExistingPull(api, execution, remote, pullNumber, newSha, body);
+    }
+    await enableAutoMergeForPublishedPull(api, execution, operation, pullNumber, newSha);
+    return { operation, pullRequestNumber: pullNumber };
 }
-async function reconcileRemoval(workspace, worktree, removalError) {
-    let registrations;
+async function publishNewPull(api, execution, newSha, body) {
+    let pullNumber;
     try {
-        registrations = await git(workspace, [
-            "worktree",
-            "list",
-            "--porcelain",
-            "-z",
-        ]);
-    }
-    catch (inspectionError) {
-        throw new AggregateError([removalError, inspectionError], `Failed to reconcile action-owned worktree registration; ${worktree} was preserved for inspection`, { cause: inspectionError });
-    }
-    // NUL delimiters keep paths with embedded newlines intact.
-    if (registrations.split("\0").includes(`worktree ${worktree}`)) {
-        throw new Error(`Failed to remove action-owned worktree; ${worktree} was preserved for inspection`, { cause: removalError });
-    }
-    warning(`Failed to remove action-owned worktree, but its registration was already absent; continuing cleanup: ${String(removalError)}`);
-}
-async function createTemporaryRoot(create = mkdtemp, resolve = realpath, remove = rm$1) {
-    const rawRoot = await create(join(tmpdir(), "prek-autoupdate-"));
-    try {
-        return await resolve(rawRoot);
+        pullNumber = await api.createPull({
+            head: execution.inputs.updateBranch,
+            base: execution.context.baseBranch,
+            title: execution.inputs.prTitle,
+            body,
+        });
     }
     catch (error) {
-        let failure = error;
+        let recovered;
         try {
-            await remove(rawRoot, { force: true, recursive: true });
+            recovered = await recoverAmbiguousCreatedPull(api, execution, newSha, body);
         }
-        catch (cleanupError) {
-            failure = new AggregateError([error, cleanupError], "Temporary root resolution failed and cleanup also failed", { cause: error });
+        catch (recoveryError) {
+            throw new Error("Pull request creation had an ambiguous outcome; the lease-protected update branch was preserved for inspection", { cause: new AggregateError([error, recoveryError]) });
         }
-        throw failure;
-    }
-}
-
-const execFileAsync = promisify(execFile);
-const MAX_OUTPUT = 32_000;
-/** Validate every non-mutating update precondition. */
-async function validateUpdateConfiguration(execution) {
-    validateCleanupConfiguration(execution);
-    if (!Number.isInteger(execution.inputs.updateDay) ||
-        execution.inputs.updateDay < 0 ||
-        execution.inputs.updateDay > 6) {
-        throw new Error("update-day must be an integer from 0 through 6");
-    }
-    if (!/^(?:0|[1-9]\d*)$/u.test(execution.inputs.cooldownDays)) {
-        throw new Error("cooldown-days must be a nonnegative integer");
-    }
-    for (const addPath of execution.inputs.addPaths) {
-        validateAddPath(addPath);
-    }
-    await assertBaseCommit(execution);
-}
-/** Validate the ownership namespace before cleanup is allowed to mutate. */
-function validateCleanupConfiguration(execution) {
-    validateBranch(execution.inputs.updateBranch, execution.inputs.branchPrefix, execution.context.baseBranch);
-}
-/** Run prek in an isolated base-SHA worktree and publish its owned update PR. */
-async function runUpdate(execution, api = new OctokitGitHubApi(execution.client, execution.context.owner, execution.context.repository, execution.inputs.token, execution.context.serverUrl)) {
-    await validateUpdateConfiguration(execution);
-    const addPaths = await resolveAddPaths(execution);
-    await proveBase(api, execution);
-    const remote = await observeRemoteState(api, execution);
-    await api.ensureLabel(execution.inputs.label);
-    const detachedWorktree = await prepareWorktree(execution.context.workspace, execution.context.baseSha);
-    const worktree = detachedWorktree.path;
-    let installation;
-    let updateFailed = false;
-    let updateError;
-    try {
-        await detachedWorktree.add();
-        installation = await installPrek();
-        const output = await runPrek(installation.binary, worktree, execution.inputs.cooldownDays);
-        await git(worktree, ["add", "--", ...addPaths]);
-        const diffStatus = await gitExit(worktree, [
-            "diff",
-            "--cached",
-            "--quiet",
-            "--",
-            ...addPaths,
-        ]);
-        if (diffStatus !== 0 && diffStatus !== 1) {
-            throw new Error(`git diff --cached --quiet failed with status ${diffStatus}`);
+        if (recovered !== undefined) {
+            pullNumber = recovered;
         }
-        const changed = diffStatus === 1;
-        if (!changed) {
-            return await closeUnneededPullRequest(api, execution, remote);
+        else if (isDefiniteCreateFailure(error)) {
+            await rollbackNewBranch(api, execution, newSha, error);
         }
-        await git(worktree, [
-            "-c",
-            "user.name=github-actions[bot]",
-            "-c",
-            "user.email=41898282+github-actions[bot]@users.noreply.github.com",
-            "commit",
-            "-m",
-            execution.inputs.commitMessage,
-        ]);
-        const newSha = await git(worktree, ["rev-parse", "HEAD"]);
-        const body = makeBody(output, execution.context.workspace);
-        if (remote.ownedPullRequest !== undefined) {
-            await fetchObservedUpdateCommit(execution, worktree, remote);
-            await proveCurrentOwnership(api, execution, remote);
-        }
-        await proveBase(api, execution);
-        await pushUpdate(execution, worktree, remote.sha);
-        if (remote.ownedPullRequest === undefined) {
-            let pullNumber;
-            try {
-                pullNumber = await api.createPull({
-                    head: execution.inputs.updateBranch,
-                    base: execution.context.baseBranch,
-                    title: execution.inputs.prTitle,
-                    body,
-                });
-            }
-            catch (error) {
-                let recovered;
-                try {
-                    recovered = await recoverAmbiguousCreatedPull(api, execution, newSha, body);
-                }
-                catch (recoveryError) {
-                    throw new Error("Pull request creation had an ambiguous outcome; the lease-protected update branch was preserved for inspection", { cause: new AggregateError([error, recoveryError]) });
-                }
-                if (recovered !== undefined) {
-                    pullNumber = recovered;
-                }
-                else if (isDefiniteCreateFailure(error)) {
-                    await rollbackNewBranch(api, execution, newSha, error);
-                }
-                else {
-                    throw new Error("Pull request creation had an ambiguous outcome; the lease-protected update branch was preserved for inspection", {
-                        cause: new AggregateError([
-                            error,
-                            new Error("No exact created pull request was observable"),
-                        ]),
-                    });
-                }
-            }
-            if (pullNumber === undefined) {
-                throw new Error("Pull request creation did not return a pull number");
-            }
-            try {
-                await api.addLabel(pullNumber, execution.inputs.label);
-                await proveCreatedOwnership(api, execution, pullNumber, newSha, body);
-            }
-            catch (error) {
-                await rollbackCreatedPullRequest(api, execution, pullNumber, newSha, error);
-            }
-            await enableAutoMergeForPublishedPull(api, execution, "created", pullNumber, newSha);
-            return { operation: "created", pullRequestNumber: pullNumber };
-        }
-        try {
-            await provePublishedOwnership(api, execution, remote, newSha);
-        }
-        catch (error) {
-            await rollbackExistingPush(execution, remote, newSha, error);
-        }
-        let pullUpdateError;
-        try {
-            const response = await api.updatePull(remote.ownedPullRequest.number, {
-                title: execution.inputs.prTitle,
-                body,
+        else {
+            throw new Error("Pull request creation had an ambiguous outcome; the lease-protected update branch was preserved for inspection", {
+                cause: new AggregateError([
+                    error,
+                    new Error("No exact created pull request was observable"),
+                ]),
             });
-            const updated = pullFromData(response.data);
-            if (isExactUpdatedPull(execution, updated, remote.ownedPullRequest.number, newSha, body)) {
-                await enableAutoMergeForPublishedPull(api, execution, "updated", remote.ownedPullRequest.number, newSha);
-                return {
-                    operation: "updated",
-                    pullRequestNumber: remote.ownedPullRequest.number,
-                };
-            }
-            pullUpdateError = new Error("GitHub returned an unexpected pull request after update");
         }
-        catch (error) {
-            if (error instanceof PublishedPullRequestError) {
-                throw error;
-            }
-            pullUpdateError = error;
+    }
+    if (pullNumber === undefined) {
+        throw new Error("Pull request creation did not return a pull number");
+    }
+    try {
+        await api.addLabel(pullNumber, execution.inputs.label);
+        await proveCreatedOwnership(api, execution, pullNumber, newSha, body);
+    }
+    catch (error) {
+        await rollbackCreatedPullRequest(api, execution, pullNumber, newSha, error);
+    }
+    return pullNumber;
+}
+async function publishExistingPull(api, execution, remote, pullNumber, newSha, body) {
+    try {
+        await provePublishedOwnership(api, execution, remote, newSha);
+    }
+    catch (error) {
+        await rollbackExistingPush(execution, remote, newSha, error);
+    }
+    let pullUpdateError;
+    try {
+        const response = await api.updatePull(pullNumber, {
+            title: execution.inputs.prTitle,
+            body,
+        });
+        const updated = pullFromData(response.data);
+        if (isExactUpdatedPull(execution, updated, pullNumber, newSha, body)) {
+            return;
         }
-        let verified;
-        try {
-            verified = pullFromData(await api.getPull(remote.ownedPullRequest.number));
-            if (isExactUpdatedPull(execution, verified, remote.ownedPullRequest.number, newSha, body)) {
-                await enableAutoMergeForPublishedPull(api, execution, "updated", remote.ownedPullRequest.number, newSha);
-                return {
-                    operation: "updated",
-                    pullRequestNumber: remote.ownedPullRequest.number,
-                };
-            }
+        pullUpdateError = new Error("GitHub returned an unexpected pull request after update");
+    }
+    catch (error) {
+        if (error instanceof PublishedPullRequestError) {
+            throw error;
         }
-        catch (verificationError) {
-            if (verificationError instanceof PublishedPullRequestError) {
-                throw verificationError;
-            }
-            throw new Error("Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved", { cause: new AggregateError([pullUpdateError, verificationError]) });
+        pullUpdateError = error;
+    }
+    let verified;
+    try {
+        verified = pullFromData(await api.getPull(pullNumber));
+        if (isExactUpdatedPull(execution, verified, pullNumber, newSha, body)) {
+            return;
         }
-        const verificationError = new Error("Fresh pull request verification was not exact");
-        if (isExactOriginalMetadataPull(execution, verified, remote, newSha)) {
-            return await rollbackExistingPush(execution, remote, newSha, new AggregateError([pullUpdateError, verificationError]));
+    }
+    catch (verificationError) {
+        if (verificationError instanceof PublishedPullRequestError) {
+            throw verificationError;
         }
         throw new Error("Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved", { cause: new AggregateError([pullUpdateError, verificationError]) });
     }
-    catch (error) {
-        updateFailed = true;
-        updateError = error;
-        throw error;
+    const verificationError = new Error("Fresh pull request verification was not exact");
+    if (isExactOriginalMetadataPull(execution, verified, remote, newSha)) {
+        return await rollbackExistingPush(execution, remote, newSha, new AggregateError([pullUpdateError, verificationError]));
     }
-    finally {
-        const cleanupErrors = [];
-        try {
-            await installation?.cleanup();
-        }
-        catch (error) {
-            cleanupErrors.push(error);
-        }
-        try {
-            await detachedWorktree.cleanup();
-        }
-        catch (error) {
-            cleanupErrors.push(error);
-        }
-        reportCleanupFailures(updateFailed, updateError, cleanupErrors);
-    }
+    throw new Error("Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved", { cause: new AggregateError([pullUpdateError, verificationError]) });
 }
 async function enableAutoMergeIfRequested(api, execution, pullNumber, expectedHeadOid) {
     if (!execution.inputs.autoMerge) {
@@ -40832,15 +40696,6 @@ function isOwnedAutoMergePull(execution, pull, pullNumber, expectedHeadOid) {
         pull.state === "OPEN" &&
         pull.headSha === expectedHeadOid &&
         isOwnedPull(pull, ownershipPolicy(execution), "exact-update-branch"));
-}
-function reportCleanupFailures(updateFailed, updateError, cleanupErrors) {
-    if (cleanupErrors.length === 0) {
-        return;
-    }
-    if (updateFailed) {
-        throw new AggregateError([updateError, ...cleanupErrors], "Update failed and cleanup also failed", { cause: updateError });
-    }
-    throw new AggregateError(cleanupErrors, "Update operation completed but cleanup failed");
 }
 function isExactUpdatedPull(execution, pull, pullNumber, newSha, body) {
     return (isOwned(execution, pull) &&
@@ -40907,89 +40762,6 @@ async function fetchObservedUpdateCommit(execution, worktree, remote) {
         throw new Error("Update branch changed while preparing its rollback commit");
     }
 }
-function validateAddPath(addPath) {
-    if (addPath === "" ||
-        path$1.posix.isAbsolute(addPath) ||
-        path$1.win32.isAbsolute(addPath) ||
-        addPath.includes("\\") ||
-        addPath.split("/").some((segment) => segment === "." || segment === "..") ||
-        addPath.startsWith(":") ||
-        /[*?[]/u.test(addPath) ||
-        addPath.includes("\0")) {
-        throw new Error(`Unsafe add-path: ${JSON.stringify(addPath)}`);
-    }
-}
-function sanitizeOutput(output, workspace = "") {
-    let sanitized = output
-        .replace(/\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/gu, "")
-        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, "");
-    if (workspace !== "") {
-        sanitized = sanitized.replaceAll(workspace, "$GITHUB_WORKSPACE");
-    }
-    if (sanitized.length > MAX_OUTPUT) {
-        sanitized = `${sanitized.slice(0, MAX_OUTPUT)}\n[output truncated]`;
-    }
-    return sanitized.trim();
-}
-function validateBranch(updateBranch, prefix, baseBranch) {
-    for (const [name, value, allowTrailingSlash] of [
-        ["update-branch", updateBranch, false],
-        ["branch-prefix", prefix, true],
-    ]) {
-        if (value === "" ||
-            value.startsWith("-") ||
-            value.includes("..") ||
-            value.includes("@{") ||
-            /[\u0000-\u0020\u007F~^:?*[\]\\]/u.test(value) ||
-            value.startsWith("/") ||
-            (!allowTrailingSlash && value.endsWith("/")) ||
-            value.endsWith(".") ||
-            value.includes("//") ||
-            value === "@") {
-            throw new Error(`Invalid ${name}: ${JSON.stringify(value)}`);
-        }
-        const components = (allowTrailingSlash ? value.replace(/\/$/u, "") : value).split("/");
-        if (components.some((component) => component === "" ||
-            component.startsWith(".") ||
-            component.endsWith(".lock"))) {
-            throw new Error(`Invalid ${name}: ${JSON.stringify(value)}`);
-        }
-    }
-    if (updateBranch === baseBranch) {
-        throw new Error("update-branch must differ from the base branch");
-    }
-    if (baseBranch.startsWith(prefix)) {
-        throw new Error("branch-prefix must not include the base branch");
-    }
-}
-async function resolveAddPaths(execution) {
-    if (execution.inputs.addPaths.length > 0) {
-        return execution.inputs.addPaths;
-    }
-    const configs = ["prek.toml", ".pre-commit-config.yaml"];
-    const existing = [];
-    for (const config of configs) {
-        if ((await gitExit(execution.context.workspace, [
-            "cat-file",
-            "-e",
-            `${execution.context.baseSha}:${config}`,
-        ])) === 0) {
-            existing.push(config);
-        }
-    }
-    if (existing.length !== 1) {
-        throw new Error("Expected exactly one prek config: prek.toml or .pre-commit-config.yaml");
-    }
-    return existing;
-}
-async function assertBaseCommit(execution) {
-    await git(execution.context.workspace, [
-        "merge-base",
-        "--is-ancestor",
-        execution.context.baseSha,
-        execution.context.baseSha,
-    ]);
-}
 async function observeRemoteState(api, execution) {
     const sha = await api.getRefSha(`heads/${execution.inputs.updateBranch}`);
     const pulls = await api.listPulls("all", {
@@ -41036,27 +40808,6 @@ function pullFromData(payload) {
 }
 function isOwned(execution, pull) {
     return isOwnedPull(pull, ownershipPolicy(execution), "exact-update-branch");
-}
-async function runPrek(binary, worktree, cooldownDays) {
-    try {
-        const result = await execFileAsync(binary, ["autoupdate", "--cooldown-days", cooldownDays], {
-            cwd: worktree,
-            encoding: "utf8",
-            env: sanitizedChildEnvironment(),
-            maxBuffer: 2 * 1024 * 1024,
-        });
-        return `${result.stdout}${result.stderr}`;
-    }
-    catch (error) {
-        const detail = error;
-        throw new Error(`prek autoupdate failed: ${sanitizeOutput(`${detail.stdout ?? ""}${detail.stderr ?? ""}${detail.message ?? ""}`, worktree)}`, { cause: error });
-    }
-}
-function makeBody(output, workspace) {
-    const detail = sanitizeOutput(output, workspace);
-    return detail === ""
-        ? BODY_MARKER
-        : `${BODY_MARKER}\n\n<details><summary>prek output</summary>\n\n\`\`\`text\n${detail.replaceAll("```", "` ` `")}\n\`\`\`\n</details>`;
 }
 async function pushUpdate(execution, worktree, expectedSha) {
     const ref = `refs/heads/${execution.inputs.updateBranch}`;
@@ -41243,6 +40994,269 @@ function gitRemote(execution) {
         token: execution.inputs.token,
         repositoryFullName: execution.context.repositoryFullName,
     };
+}
+
+/** Allocate a detached worktree. Clean up even if Git only partially adds it. */
+async function prepareWorktree(workspace, baseSha) {
+    const root = await createTemporaryRoot();
+    const worktree = join(root, "worktree");
+    return {
+        path: worktree,
+        async add() {
+            await git(workspace, ["worktree", "add", "--detach", worktree, baseSha]);
+        },
+        async cleanup() {
+            const remove = ["worktree", "remove", "--force", worktree];
+            try {
+                await git(workspace, remove).catch(() => git(workspace, remove));
+            }
+            catch (removalError) {
+                await reconcileRemoval(workspace, worktree, removalError);
+            }
+            await rm$1(root, { force: true, recursive: true });
+        },
+    };
+}
+async function reconcileRemoval(workspace, worktree, removalError) {
+    let registrations;
+    try {
+        registrations = await git(workspace, [
+            "worktree",
+            "list",
+            "--porcelain",
+            "-z",
+        ]);
+    }
+    catch (inspectionError) {
+        throw new AggregateError([removalError, inspectionError], `Failed to reconcile action-owned worktree registration; ${worktree} was preserved for inspection`, { cause: inspectionError });
+    }
+    // NUL delimiters keep paths with embedded newlines intact.
+    if (registrations.split("\0").includes(`worktree ${worktree}`)) {
+        throw new Error(`Failed to remove action-owned worktree; ${worktree} was preserved for inspection`, { cause: removalError });
+    }
+    warning(`Failed to remove action-owned worktree, but its registration was already absent; continuing cleanup: ${String(removalError)}`);
+}
+async function createTemporaryRoot(create = mkdtemp, resolve = realpath, remove = rm$1) {
+    const rawRoot = await create(join(tmpdir(), "prek-autoupdate-"));
+    try {
+        return await resolve(rawRoot);
+    }
+    catch (error) {
+        let failure = error;
+        try {
+            await remove(rawRoot, { force: true, recursive: true });
+        }
+        catch (cleanupError) {
+            failure = new AggregateError([error, cleanupError], "Temporary root resolution failed and cleanup also failed", { cause: error });
+        }
+        throw failure;
+    }
+}
+
+const execFileAsync = promisify(execFile);
+const MAX_OUTPUT = 32_000;
+/** Validate every non-mutating update precondition. */
+async function validateUpdateConfiguration(execution) {
+    validateCleanupConfiguration(execution);
+    if (!Number.isInteger(execution.inputs.updateDay) ||
+        execution.inputs.updateDay < 0 ||
+        execution.inputs.updateDay > 6) {
+        throw new Error("update-day must be an integer from 0 through 6");
+    }
+    if (!/^(?:0|[1-9]\d*)$/u.test(execution.inputs.cooldownDays)) {
+        throw new Error("cooldown-days must be a nonnegative integer");
+    }
+    for (const addPath of execution.inputs.addPaths) {
+        validateAddPath(addPath);
+    }
+    await assertBaseCommit(execution);
+}
+/** Validate the ownership namespace before cleanup is allowed to mutate. */
+function validateCleanupConfiguration(execution) {
+    validateBranch(execution.inputs.updateBranch, execution.inputs.branchPrefix, execution.context.baseBranch);
+}
+/** Run prek in an isolated base-SHA worktree and publish its owned update PR. */
+async function runUpdate(execution, api = new OctokitGitHubApi(execution.client, execution.context.owner, execution.context.repository, execution.inputs.token, execution.context.serverUrl)) {
+    await validateUpdateConfiguration(execution);
+    const addPaths = await resolveAddPaths(execution);
+    await proveBase(api, execution);
+    const remote = await observeRemoteState(api, execution);
+    await api.ensureLabel(execution.inputs.label);
+    const detachedWorktree = await prepareWorktree(execution.context.workspace, execution.context.baseSha);
+    const worktree = detachedWorktree.path;
+    let installation;
+    let updateFailed = false;
+    let updateError;
+    try {
+        await detachedWorktree.add();
+        installation = await installPrek();
+        const output = await runPrek(installation.binary, worktree, execution.inputs.cooldownDays);
+        await git(worktree, ["add", "--", ...addPaths]);
+        const diffStatus = await gitExit(worktree, [
+            "diff",
+            "--cached",
+            "--quiet",
+            "--",
+            ...addPaths,
+        ]);
+        if (diffStatus !== 0 && diffStatus !== 1) {
+            throw new Error(`git diff --cached --quiet failed with status ${diffStatus}`);
+        }
+        const changed = diffStatus === 1;
+        if (!changed) {
+            return await closeUnneededPullRequest(api, execution, remote);
+        }
+        await git(worktree, [
+            "-c",
+            "user.name=github-actions[bot]",
+            "-c",
+            "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+            "commit",
+            "-m",
+            execution.inputs.commitMessage,
+        ]);
+        const newSha = await git(worktree, ["rev-parse", "HEAD"]);
+        const body = makeBody(output, execution.context.workspace);
+        return await publishUpdate(api, execution, remote, {
+            worktree: detachedWorktree,
+            sha: newSha,
+            body,
+        });
+    }
+    catch (error) {
+        updateFailed = true;
+        updateError = error;
+        throw error;
+    }
+    finally {
+        const cleanupErrors = [];
+        try {
+            await installation?.cleanup();
+        }
+        catch (error) {
+            cleanupErrors.push(error);
+        }
+        try {
+            await detachedWorktree.cleanup();
+        }
+        catch (error) {
+            cleanupErrors.push(error);
+        }
+        reportCleanupFailures(updateFailed, updateError, cleanupErrors);
+    }
+}
+function reportCleanupFailures(updateFailed, updateError, cleanupErrors) {
+    if (cleanupErrors.length === 0) {
+        return;
+    }
+    if (updateFailed) {
+        throw new AggregateError([updateError, ...cleanupErrors], "Update failed and cleanup also failed", { cause: updateError });
+    }
+    throw new AggregateError(cleanupErrors, "Update operation completed but cleanup failed");
+}
+function validateAddPath(addPath) {
+    if (addPath === "" ||
+        path$1.posix.isAbsolute(addPath) ||
+        path$1.win32.isAbsolute(addPath) ||
+        addPath.includes("\\") ||
+        addPath.split("/").some((segment) => segment === "." || segment === "..") ||
+        addPath.startsWith(":") ||
+        /[*?[]/u.test(addPath) ||
+        addPath.includes("\0")) {
+        throw new Error(`Unsafe add-path: ${JSON.stringify(addPath)}`);
+    }
+}
+function sanitizeOutput(output, workspace = "") {
+    let sanitized = output
+        .replace(/\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/gu, "")
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, "");
+    if (workspace !== "") {
+        sanitized = sanitized.replaceAll(workspace, "$GITHUB_WORKSPACE");
+    }
+    if (sanitized.length > MAX_OUTPUT) {
+        sanitized = `${sanitized.slice(0, MAX_OUTPUT)}\n[output truncated]`;
+    }
+    return sanitized.trim();
+}
+function validateBranch(updateBranch, prefix, baseBranch) {
+    for (const [name, value, allowTrailingSlash] of [
+        ["update-branch", updateBranch, false],
+        ["branch-prefix", prefix, true],
+    ]) {
+        if (value === "" ||
+            value.startsWith("-") ||
+            value.includes("..") ||
+            value.includes("@{") ||
+            /[\u0000-\u0020\u007F~^:?*[\]\\]/u.test(value) ||
+            value.startsWith("/") ||
+            (!allowTrailingSlash && value.endsWith("/")) ||
+            value.endsWith(".") ||
+            value.includes("//") ||
+            value === "@") {
+            throw new Error(`Invalid ${name}: ${JSON.stringify(value)}`);
+        }
+        const components = (allowTrailingSlash ? value.replace(/\/$/u, "") : value).split("/");
+        if (components.some((component) => component === "" ||
+            component.startsWith(".") ||
+            component.endsWith(".lock"))) {
+            throw new Error(`Invalid ${name}: ${JSON.stringify(value)}`);
+        }
+    }
+    if (updateBranch === baseBranch) {
+        throw new Error("update-branch must differ from the base branch");
+    }
+    if (baseBranch.startsWith(prefix)) {
+        throw new Error("branch-prefix must not include the base branch");
+    }
+}
+async function resolveAddPaths(execution) {
+    if (execution.inputs.addPaths.length > 0) {
+        return execution.inputs.addPaths;
+    }
+    const configs = ["prek.toml", ".pre-commit-config.yaml"];
+    const existing = [];
+    for (const config of configs) {
+        if ((await gitExit(execution.context.workspace, [
+            "cat-file",
+            "-e",
+            `${execution.context.baseSha}:${config}`,
+        ])) === 0) {
+            existing.push(config);
+        }
+    }
+    if (existing.length !== 1) {
+        throw new Error("Expected exactly one prek config: prek.toml or .pre-commit-config.yaml");
+    }
+    return existing;
+}
+async function assertBaseCommit(execution) {
+    await git(execution.context.workspace, [
+        "merge-base",
+        "--is-ancestor",
+        execution.context.baseSha,
+        execution.context.baseSha,
+    ]);
+}
+async function runPrek(binary, worktree, cooldownDays) {
+    try {
+        const result = await execFileAsync(binary, ["autoupdate", "--cooldown-days", cooldownDays], {
+            cwd: worktree,
+            encoding: "utf8",
+            env: sanitizedChildEnvironment(),
+            maxBuffer: 2 * 1024 * 1024,
+        });
+        return `${result.stdout}${result.stderr}`;
+    }
+    catch (error) {
+        const detail = error;
+        throw new Error(`prek autoupdate failed: ${sanitizeOutput(`${detail.stdout ?? ""}${detail.stderr ?? ""}${detail.message ?? ""}`, worktree)}`, { cause: error });
+    }
+}
+function makeBody(output, workspace) {
+    const detail = sanitizeOutput(output, workspace);
+    return detail === ""
+        ? BODY_MARKER
+        : `${BODY_MARKER}\n\n<details><summary>prek output</summary>\n\n\`\`\`text\n${detail.replaceAll("```", "` ` `")}\n\`\`\`\n</details>`;
 }
 
 /** Return the version banner shown at the start of each action run. */

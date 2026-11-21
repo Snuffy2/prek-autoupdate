@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { git } from "../git.js";
 
-interface DetachedWorktree {
+export interface DetachedWorktree {
   readonly path: string;
   readonly add: () => Promise<void>;
   readonly cleanup: () => Promise<void>;
