@@ -192,6 +192,33 @@ describe("Octokit GitHub adapter", () => {
     expect(pulls.get(8)).toBe("closed");
   });
 
+  it("sends the close event ETag when conditionally reopening a pull", async () => {
+    const path = `${repositoryPath}/pulls/7`;
+    let state = "closed";
+    const api = adapter((url, request) => {
+      if (url.pathname !== path || request?.method !== "PATCH")
+        return failed(404);
+      const { state: requestedState } = JSON.parse(String(request.body)) as {
+        state?: string;
+      };
+      if (requestedState !== "open") return failed(422);
+      if (new Headers(request.headers).get("if-match") !== '"current-close"')
+        return failed(412);
+      state = requestedState;
+      return jsonPage({ number: 7, state });
+    });
+
+    await expect(
+      api.updatePull(7, { state: "open" }, '"stale-close"'),
+    ).rejects.toMatchObject({ status: 412 });
+    expect(state).toBe("closed");
+
+    await expect(
+      api.updatePull(7, { state: "open" }, '"current-close"'),
+    ).resolves.toMatchObject({ data: { number: 7, state: "open" } });
+    expect(state).toBe("open");
+  });
+
   it.each([
     { number: 7, state: "closed" },
     { number: 8, state: "open" },
