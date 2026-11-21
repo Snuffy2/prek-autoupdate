@@ -20,13 +20,13 @@ vi.mock("../../src/prek/index.js", () => ({ installPrek: prekMocks.install }));
 import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
 import { BODY_MARKER } from "../../src/ownership.js";
 import {
-  createTemporaryRoot,
   enablePullRequestAutoMerge,
   runUpdate,
   sanitizeOutput,
   validateAddPath,
   validateUpdateConfiguration,
 } from "../../src/update/index.js";
+import { createTemporaryRoot } from "../../src/update/worktree.js";
 
 const exec = promisify(execFile);
 const temporaryDirectories: string[] = [];

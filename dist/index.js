@@ -40336,6 +40336,63 @@ async function verifySha256(archive, checksumContents, asset) {
     }
 }
 
+/** Allocate a detached worktree. Clean up even if Git only partially adds it. */
+async function prepareWorktree(workspace, baseSha) {
+    const root = await createTemporaryRoot();
+    const worktree = join(root, "worktree");
+    return {
+        path: worktree,
+        async add() {
+            await git(workspace, ["worktree", "add", "--detach", worktree, baseSha]);
+        },
+        async cleanup() {
+            const remove = ["worktree", "remove", "--force", worktree];
+            try {
+                await git(workspace, remove).catch(() => git(workspace, remove));
+            }
+            catch (removalError) {
+                await reconcileRemoval(workspace, worktree, removalError);
+            }
+            await rm$1(root, { force: true, recursive: true });
+        },
+    };
+}
+async function reconcileRemoval(workspace, worktree, removalError) {
+    let registrations;
+    try {
+        registrations = await git(workspace, [
+            "worktree",
+            "list",
+            "--porcelain",
+            "-z",
+        ]);
+    }
+    catch (inspectionError) {
+        throw new AggregateError([removalError, inspectionError], `Failed to reconcile action-owned worktree registration; ${worktree} was preserved for inspection`, { cause: inspectionError });
+    }
+    // NUL delimiters keep paths with embedded newlines intact.
+    if (registrations.split("\0").includes(`worktree ${worktree}`)) {
+        throw new Error(`Failed to remove action-owned worktree; ${worktree} was preserved for inspection`, { cause: removalError });
+    }
+    warning(`Failed to remove action-owned worktree, but its registration was already absent; continuing cleanup: ${String(removalError)}`);
+}
+async function createTemporaryRoot(create = mkdtemp, resolve = realpath, remove = rm$1) {
+    const rawRoot = await create(join(tmpdir(), "prek-autoupdate-"));
+    try {
+        return await resolve(rawRoot);
+    }
+    catch (error) {
+        let failure = error;
+        try {
+            await remove(rawRoot, { force: true, recursive: true });
+        }
+        catch (cleanupError) {
+            failure = new AggregateError([error, cleanupError], "Temporary root resolution failed and cleanup also failed", { cause: error });
+        }
+        throw failure;
+    }
+}
+
 const execFileAsync = promisify(execFile);
 const MAX_OUTPUT = 32_000;
 /** Validate every non-mutating update precondition. */
@@ -40365,21 +40422,13 @@ async function runUpdate(execution) {
     await proveBase(execution);
     const remote = await observeRemoteState(execution);
     await ensureOwnershipLabel(execution);
-    const temporaryRoot = await createTemporaryRoot();
-    const worktree = path$1.join(temporaryRoot, "worktree");
-    let added = false;
+    const detachedWorktree = await prepareWorktree(execution.context.workspace, execution.context.baseSha);
+    const worktree = detachedWorktree.path;
     let installation;
     let updateFailed = false;
     let updateError;
     try {
-        added = true;
-        await git(execution.context.workspace, [
-            "worktree",
-            "add",
-            "--detach",
-            worktree,
-            execution.context.baseSha,
-        ]);
+        await detachedWorktree.add();
         installation = await installPrek();
         const output = await runPrek(installation.binary, worktree, execution.inputs.cooldownDays);
         await git(worktree, ["add", "--", ...addPaths]);
@@ -40529,65 +40578,17 @@ async function runUpdate(execution) {
     }
     finally {
         const cleanupErrors = [];
-        let preserveTemporaryRoot = false;
         try {
             await installation?.cleanup();
         }
         catch (error) {
             cleanupErrors.push(error);
         }
-        if (added) {
-            let removalFailed = false;
-            let removalError;
-            for (let attempt = 0; attempt < 2; attempt += 1) {
-                try {
-                    await git(execution.context.workspace, [
-                        "worktree",
-                        "remove",
-                        "--force",
-                        ...(attempt === 0 ? [] : ["--force"]),
-                        worktree,
-                    ]);
-                    removalFailed = false;
-                    break;
-                }
-                catch (error) {
-                    removalFailed = true;
-                    removalError = error;
-                }
-            }
-            if (removalFailed) {
-                try {
-                    const registeredWorktrees = await git(execution.context.workspace, [
-                        "worktree",
-                        "list",
-                        "--porcelain",
-                    ]);
-                    if (registeredWorktrees
-                        .split("\n")
-                        .some((line) => line === `worktree ${worktree}`)) {
-                        preserveTemporaryRoot = true;
-                        cleanupErrors.push(new Error(`Failed to remove action-owned worktree; ${worktree} was preserved for inspection`, { cause: removalError }));
-                    }
-                    else {
-                        warning(`Failed to remove action-owned worktree, but its registration was already absent; continuing cleanup: ${String(removalError)}`);
-                    }
-                }
-                catch (inspectionError) {
-                    preserveTemporaryRoot = true;
-                    cleanupErrors.push(new Error(`Failed to reconcile action-owned worktree registration; ${worktree} was preserved for inspection`, {
-                        cause: new AggregateError([removalError, inspectionError]),
-                    }));
-                }
-            }
+        try {
+            await detachedWorktree.cleanup();
         }
-        if (!preserveTemporaryRoot) {
-            try {
-                await rm$1(temporaryRoot, { force: true, recursive: true });
-            }
-            catch (error) {
-                cleanupErrors.push(error);
-            }
+        catch (error) {
+            cleanupErrors.push(error);
         }
         reportCleanupFailures(updateFailed, updateError, cleanupErrors);
     }
@@ -40784,27 +40785,6 @@ function isOwnedAutoMergePull(execution, pull, pullNumber, expectedHeadOid) {
             baseRef: pull.baseRefName,
             labels: pull.labels.nodes.map((label) => label.name),
         }, ownershipPolicy(execution), "exact-update-branch"));
-}
-async function createTemporaryRoot(create = mkdtemp, resolve = realpath, remove = rm$1) {
-    const rawRoot = await create(path$1.join(tmpdir(), "prek-autoupdate-"));
-    try {
-        return await resolve(rawRoot);
-    }
-    catch (error) {
-        let cleanupFailed = false;
-        let cleanupError;
-        try {
-            await remove(rawRoot, { force: true, recursive: true });
-        }
-        catch (caughtCleanupError) {
-            cleanupFailed = true;
-            cleanupError = caughtCleanupError;
-        }
-        if (cleanupFailed) {
-            throw new AggregateError([error, cleanupError], "Temporary root resolution failed and cleanup also failed", { cause: error });
-        }
-        throw error;
-    }
 }
 function reportCleanupFailures(updateFailed, updateError, cleanupErrors) {
     if (cleanupErrors.length === 0) {

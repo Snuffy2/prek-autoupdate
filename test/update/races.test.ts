@@ -5,6 +5,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   writeFile,
@@ -56,11 +57,13 @@ afterEach(async () => {
   delete process.env.TEST_GIT_FAILURE_OUTPUT;
   delete process.env.TEST_GIT_FAIL_DIFF;
   delete process.env.TEST_GIT_FAIL_WORKTREE_REMOVE;
+  delete process.env.TEST_GIT_FAIL_WORKTREE_LIST;
+  delete process.env.TEST_GIT_LOCK_WORKTREE_ON_REMOVE;
   delete process.env.TEST_GIT_UNREGISTER_WORKTREE_ON_REMOVE;
   delete process.env.TEST_GIT_FAIL_WORKTREE_ADD_AFTER;
   delete process.env.TEST_GIT_FAIL_WORKTREE_ADD_BEFORE;
-  delete process.env.TEST_GIT_WORKTREE_ADD_LOG;
-  delete process.env.TEST_GIT_WORKTREE_REMOVE_LOG;
+  delete process.env.TEST_GIT_WORKTREE_REMOVE_SENTINEL;
+  vi.unstubAllEnvs();
   installPrek.mockReset();
   vi.mocked(core.warning).mockReset();
   await Promise.all(
@@ -72,129 +75,115 @@ afterEach(async () => {
 
 describe("update publication races", () => {
   it("cleans an ordinary pre-registration worktree add failure", async () => {
-    const harness = await makeHarness({ noChange: true });
-    const initial = await worktrees(harness.execution.context.workspace);
+    const { execution, initial, scratch, workspace } =
+      await makeWorktreeHarness();
     process.env.TEST_GIT_FAIL_WORKTREE_ADD_BEFORE = "1";
-    process.env.TEST_GIT_WORKTREE_ADD_LOG = `${harness.log}.worktree-add`;
 
-    const error = await runUpdate(harness.execution).catch(
-      (caught: unknown) => caught,
-    );
+    const error = await runUpdate(execution).catch((caught: unknown) => caught);
 
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(AggregateError);
-    expect(await worktrees(harness.execution.context.workspace)).toEqual(
-      initial,
-    );
-    const addArguments = await readFile(
-      process.env.TEST_GIT_WORKTREE_ADD_LOG,
-      "utf8",
-    );
-    const addParts = addArguments.trim().split(" ");
-    const worktreePath = addParts[addParts.indexOf("--detach") + 1]!;
-    await expect(access(path.dirname(worktreePath))).rejects.toThrow();
+    expect(await worktrees(workspace)).toEqual(initial);
+    expect(await readdir(scratch)).toEqual([]);
   });
 
   it("cleans a partially successful worktree add", async () => {
-    const harness = await makeHarness({ noChange: true });
-    const initial = await worktrees(harness.execution.context.workspace);
+    const { execution, initial, scratch, workspace } =
+      await makeWorktreeHarness();
     process.env.TEST_GIT_FAIL_WORKTREE_ADD_AFTER = "1";
 
-    await expect(runUpdate(harness.execution)).rejects.toThrow();
+    await expect(runUpdate(execution)).rejects.toThrow();
 
-    expect(await worktrees(harness.execution.context.workspace)).toEqual(
-      initial,
-    );
+    expect(await worktrees(workspace)).toEqual(initial);
+    expect(await readdir(scratch)).toEqual([]);
   });
 
-  it("retries worktree removal once and restores the initial worktree list", async () => {
-    const harness = await makeHarness({ noChange: true });
-    const initial = await worktrees(harness.execution.context.workspace);
-    process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "1";
-    process.env.TEST_GIT_WORKTREE_REMOVE_LOG = `${harness.log}.worktree`;
+  it("retries worktree removal after a transient failure", async () => {
+    const { execution, initial, scratch, workspace } =
+      await makeWorktreeHarness();
+    process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "once";
 
-    await expect(runUpdate(harness.execution)).resolves.toEqual({
-      operation: "none",
-    });
+    await expect(runUpdate(execution)).resolves.toEqual({ operation: "none" });
 
-    expect(await worktrees(harness.execution.context.workspace)).toEqual(
-      initial,
-    );
-    const removals = (
-      await readFile(process.env.TEST_GIT_WORKTREE_REMOVE_LOG!, "utf8")
-    )
-      .trim()
-      .split("\n");
-    expect(removals[0]).toContain("worktree remove --force");
-    expect(removals[1]).toContain("worktree remove --force --force");
+    expect(await worktrees(workspace)).toEqual(initial);
+    expect(await readdir(scratch)).toEqual([]);
   });
 
-  it("aggregates persistent worktree removal failure", async () => {
-    const harness = await makeHarness({ noChange: true });
-    const initial = await worktrees(harness.execution.context.workspace);
-    process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "always";
-    process.env.TEST_GIT_WORKTREE_REMOVE_LOG = `${harness.log}.worktree`;
+  it.each([
+    { scenario: "a path containing a newline", scratchName: "worktree\ntmp" },
+    {
+      scenario: "failed registration inspection",
+      scratchName: "worktree-tmp",
+      inspectionFails: true,
+    },
+  ])(
+    "preserves a registered worktree after persistent removal failure with $scenario",
+    async ({ scratchName, inspectionFails }) => {
+      const { execution, initial, workspace } =
+        await makeWorktreeHarness(scratchName);
+      process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "always";
+      if (inspectionFails) {
+        process.env.TEST_GIT_FAIL_WORKTREE_LIST = "1";
+      }
 
-    const error = await runUpdate(harness.execution).catch(
-      (caught: unknown) => caught,
-    );
+      await expect(runUpdate(execution)).rejects.toMatchObject({
+        message: "Update operation completed but cleanup failed",
+        errors: [
+          expect.objectContaining({
+            message: expect.stringContaining(
+              inspectionFails
+                ? "Failed to reconcile action-owned worktree registration"
+                : "Failed to remove action-owned worktree",
+            ),
+          }),
+        ],
+      });
 
-    expect(error).toMatchObject({
+      delete process.env.TEST_GIT_FAIL_WORKTREE_LIST;
+      const preserved = (await worktrees(workspace)).filter(
+        (entry) => !initial.includes(entry),
+      );
+      expect(preserved).toHaveLength(1);
+      await expect(access(preserved[0]!)).resolves.toBeUndefined();
+    },
+  );
+
+  it("preserves a worktree locked before the removal retry", async () => {
+    const { execution, initial, workspace } = await makeWorktreeHarness();
+    process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "once";
+    process.env.TEST_GIT_LOCK_WORKTREE_ON_REMOVE = "1";
+
+    await expect(runUpdate(execution)).rejects.toMatchObject({
       message: "Update operation completed but cleanup failed",
+      errors: [
+        expect.objectContaining({
+          message: expect.stringContaining("preserved for inspection"),
+        }),
+      ],
     });
-    expect((error as AggregateError).errors).toEqual([
-      expect.objectContaining({
-        message: expect.stringMatching(/preserved for inspection/u),
-      }),
-    ]);
-    const final = await worktrees(harness.execution.context.workspace);
-    expect(final).toHaveLength(initial.length + 1);
-    const preserved = final.find((entry) => !initial.includes(entry))!;
-    const preservedPath = preserved.replace(/^worktree /u, "");
-    await expect(access(preservedPath)).resolves.toBeUndefined();
 
-    delete process.env.TEST_GIT_FAIL_WORKTREE_REMOVE;
-    await exec("git", [
-      "-C",
-      harness.execution.context.workspace,
-      "worktree",
-      "remove",
-      "--force",
-      "--force",
-      preservedPath,
-    ]);
-    await rm(path.dirname(preservedPath), { force: true, recursive: true });
+    const preserved = (await worktrees(workspace)).filter(
+      (entry) => !initial.includes(entry),
+    );
+    expect(preserved).toHaveLength(1);
+    await expect(access(preserved[0]!)).resolves.toBeUndefined();
   });
 
   it("warns when failed removals are reconciled by an absent registration", async () => {
-    const harness = await makeHarness({ noChange: true });
-    const initial = await worktrees(harness.execution.context.workspace);
+    const { execution, initial, scratch, workspace } =
+      await makeWorktreeHarness();
     process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "always";
     process.env.TEST_GIT_UNREGISTER_WORKTREE_ON_REMOVE = "1";
-    process.env.TEST_GIT_WORKTREE_REMOVE_LOG = `${harness.log}.worktree`;
-    await expect(runUpdate(harness.execution)).resolves.toEqual({
-      operation: "none",
-    });
 
-    expect(await worktrees(harness.execution.context.workspace)).toEqual(
-      initial,
-    );
+    await expect(runUpdate(execution)).resolves.toEqual({ operation: "none" });
+
+    expect(await worktrees(workspace)).toEqual(initial);
     expect(core.warning).toHaveBeenCalledWith(
-      expect.stringMatching(
-        /Failed to remove action-owned worktree, but its registration was already absent; continuing cleanup: Error: Command failed/u,
+      expect.stringContaining(
+        "registration was already absent; continuing cleanup",
       ),
     );
-    const removals = await readFile(
-      process.env.TEST_GIT_WORKTREE_REMOVE_LOG,
-      "utf8",
-    );
-    const worktreePath = removals
-      .trim()
-      .split("\n")[0]!
-      .trim()
-      .split(" ")
-      .at(-1)!;
-    await expect(access(path.dirname(worktreePath))).rejects.toThrow();
+    expect(await readdir(scratch)).toEqual([]);
   });
 
   it("scopes authenticated pushes to the configured Actions server", async () => {
@@ -1241,6 +1230,16 @@ async function makeHarness(options: HarnessOptions = {}) {
   };
 }
 
+async function makeWorktreeHarness(scratchName = "worktree-tmp") {
+  const { execution, log } = await makeHarness({ noChange: true });
+  const { workspace } = execution.context;
+  const scratch = path.join(path.dirname(log), scratchName);
+  await mkdir(scratch);
+  vi.stubEnv("TMPDIR", scratch);
+  process.env.TEST_GIT_WORKTREE_REMOVE_SENTINEL = `${log}.worktree`;
+  return { execution, initial: await worktrees(workspace), scratch, workspace };
+}
+
 async function installGitProxy(directory: string): Promise<void> {
   await mkdir(directory, { recursive: true });
   const realGit = (await exec("which", ["git"])).stdout.trim();
@@ -1254,7 +1253,6 @@ for arg in "$@"; do
 done
 case " $* " in
   *" worktree add --detach "*)
-    [ -n "$TEST_GIT_WORKTREE_ADD_LOG" ] && printf '%s\n' "$*" >> "$TEST_GIT_WORKTREE_ADD_LOG"
     [ "$TEST_GIT_FAIL_WORKTREE_ADD_BEFORE" = "1" ] && exit 1
     if [ "$TEST_GIT_FAIL_WORKTREE_ADD_AFTER" = "1" ]; then
       eval ${JSON.stringify(realGit)} "$args" || exit $?
@@ -1263,13 +1261,22 @@ case " $* " in
     ;;
   *" worktree remove --force "*)
     if [ -n "$TEST_GIT_FAIL_WORKTREE_REMOVE" ]; then
-      printf '%s\n' "$*" >> "$TEST_GIT_WORKTREE_REMOVE_LOG"
-      count=$(wc -l < "$TEST_GIT_WORKTREE_REMOVE_LOG" | tr -d ' ')
-      if [ "$TEST_GIT_UNREGISTER_WORKTREE_ON_REMOVE" = "1" ] && [ "$count" = "1" ]; then
-        eval ${JSON.stringify(realGit)} "$args" || exit $?
+      if [ ! -e "$TEST_GIT_WORKTREE_REMOVE_SENTINEL" ]; then
+        : > "$TEST_GIT_WORKTREE_REMOVE_SENTINEL"
+        if [ "$TEST_GIT_LOCK_WORKTREE_ON_REMOVE" = "1" ]; then
+          for worktree do :; done
+          ${JSON.stringify(realGit)} -C "$worktree" worktree lock "$worktree" || exit $?
+        fi
+        if [ "$TEST_GIT_UNREGISTER_WORKTREE_ON_REMOVE" = "1" ]; then
+          eval ${JSON.stringify(realGit)} "$args" || exit $?
+        fi
+        exit 1
       fi
-      { [ "$TEST_GIT_FAIL_WORKTREE_REMOVE" = "always" ] || [ "$count" = "$TEST_GIT_FAIL_WORKTREE_REMOVE" ]; } && exit 1
+      [ "$TEST_GIT_FAIL_WORKTREE_REMOVE" = "always" ] && exit 1
     fi
+    ;;
+  *" worktree list "*)
+    [ "$TEST_GIT_FAIL_WORKTREE_LIST" = "1" ] && exit 1
     ;;
   *" diff --cached --quiet "*)
     [ "$TEST_GIT_FAIL_DIFF" = "1" ] && exit 2
@@ -1301,8 +1308,12 @@ async function worktrees(workspace: string): Promise<string[]> {
     "worktree",
     "list",
     "--porcelain",
+    "-z",
   ]);
-  return result.stdout.match(/^worktree .+$/gmu) ?? [];
+  return result.stdout
+    .split("\0")
+    .filter((entry) => entry.startsWith("worktree "))
+    .map((entry) => entry.slice("worktree ".length));
 }
 
 async function remoteSha(remote: string): Promise<string> {
