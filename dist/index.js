@@ -41018,23 +41018,42 @@ async function prepareWorktree(workspace, baseSha) {
     };
 }
 async function reconcileRemoval(workspace, worktree, removalError) {
-    let registrations;
+    let registered;
     try {
-        registrations = await git(workspace, [
-            "worktree",
-            "list",
-            "--porcelain",
-            "-z",
-        ]);
+        registered = await hasWorktreeRegistration(workspace, worktree);
     }
     catch (inspectionError) {
         throw new AggregateError([removalError, inspectionError], `Failed to reconcile action-owned worktree registration; ${worktree} was preserved for inspection`, { cause: inspectionError });
     }
-    // NUL delimiters keep paths with embedded newlines intact.
-    if (registrations.split("\0").includes(`worktree ${worktree}`)) {
+    if (registered) {
         throw new Error(`Failed to remove action-owned worktree; ${worktree} was preserved for inspection`, { cause: removalError });
     }
     warning(`Failed to remove action-owned worktree, but its registration was already absent; continuing cleanup: ${String(removalError)}`);
+}
+async function hasWorktreeRegistration(workspace, worktree) {
+    const list = ["worktree", "list", "--porcelain"];
+    const entry = `worktree ${worktree}`;
+    try {
+        const registrations = await git(workspace, [...list, "-z"]);
+        return registrations.split("\0").includes(entry);
+    }
+    catch (error) {
+        const { code, stderr } = error;
+        // Older Git rejects the fixed list arguments with a usage error.
+        if (code !== 129 ||
+            typeof stderr !== "string" ||
+            !stderr.includes("git worktree list [")) {
+            throw error;
+        }
+        // Legacy porcelain prints paths raw, so a newline can split an entry.
+        if (worktree.includes("\n")) {
+            throw new Error("Legacy Git cannot unambiguously list this worktree path", {
+                cause: error,
+            });
+        }
+        const registrations = await git(workspace, list);
+        return registrations.split("\n").includes(entry);
+    }
 }
 async function createTemporaryRoot(create = mkdtemp, resolve = realpath, remove = rm$1) {
     const rawRoot = await create(join(tmpdir(), "prek-autoupdate-"));

@@ -68,6 +68,7 @@ afterEach(async () => {
   delete process.env.TEST_GIT_FAIL_DIFF;
   delete process.env.TEST_GIT_FAIL_WORKTREE_REMOVE;
   delete process.env.TEST_GIT_FAIL_WORKTREE_LIST;
+  delete process.env.TEST_GIT_LEGACY_WORKTREE_LIST;
   delete process.env.TEST_GIT_LOCK_WORKTREE_ON_REMOVE;
   delete process.env.TEST_GIT_UNREGISTER_WORKTREE_ON_REMOVE;
   delete process.env.TEST_GIT_FAIL_WORKTREE_ADD_AFTER;
@@ -84,20 +85,27 @@ afterEach(async () => {
 });
 
 describe("update publication races", () => {
-  it("cleans an ordinary pre-registration worktree add failure", async () => {
-    const { execution, initial, scratch, workspace } =
-      await makeWorktreeHarness();
-    process.env.TEST_GIT_FAIL_WORKTREE_ADD_BEFORE = "1";
+  it.each(["modern", "legacy"])(
+    "cleans a pre-registration worktree add failure with %s Git",
+    async (gitVersion) => {
+      const { execution, initial, scratch, workspace } =
+        await makeWorktreeHarness();
+      process.env.TEST_GIT_FAIL_WORKTREE_ADD_BEFORE = "1";
+      if (gitVersion === "legacy") {
+        process.env.TEST_GIT_LEGACY_WORKTREE_LIST = "1";
+      }
 
-    const error = await runUpdate(execution, execution.api).catch(
-      (caught: unknown) => caught,
-    );
+      const error = await runUpdate(execution, execution.api).catch(
+        (caught: unknown) => caught,
+      );
 
-    expect(error).toBeInstanceOf(Error);
-    expect(error).not.toBeInstanceOf(AggregateError);
-    expect(await worktrees(workspace)).toEqual(initial);
-    expect(await readdir(scratch)).toEqual([]);
-  });
+      delete process.env.TEST_GIT_LEGACY_WORKTREE_LIST;
+      expect(await worktrees(workspace)).toEqual(initial);
+      expect(await readdir(scratch)).toEqual([]);
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(AggregateError);
+    },
+  );
 
   it("cleans a partially successful worktree add", async () => {
     const { execution, initial, scratch, workspace } =
@@ -126,18 +134,32 @@ describe("update publication races", () => {
   it.each([
     { scenario: "a path containing a newline", scratchName: "worktree\ntmp" },
     {
+      scenario: "legacy Git",
+      scratchName: "worktree tmp",
+      legacyGit: true,
+    },
+    {
+      scenario: "legacy Git and a path containing a newline",
+      scratchName: "worktree\ntmp",
+      legacyGit: true,
+      ambiguousPath: true,
+    },
+    {
       scenario: "failed registration inspection",
       scratchName: "worktree-tmp",
       inspectionFails: true,
     },
   ])(
     "preserves a registered worktree after persistent removal failure with $scenario",
-    async ({ scratchName, inspectionFails }) => {
+    async ({ scratchName, inspectionFails, legacyGit, ambiguousPath }) => {
       const { execution, initial, workspace } =
         await makeWorktreeHarness(scratchName);
       process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "always";
       if (inspectionFails) {
         process.env.TEST_GIT_FAIL_WORKTREE_LIST = "1";
+      }
+      if (legacyGit) {
+        process.env.TEST_GIT_LEGACY_WORKTREE_LIST = "1";
       }
 
       await expect(runUpdate(execution, execution.api)).rejects.toMatchObject({
@@ -145,7 +167,7 @@ describe("update publication races", () => {
         errors: [
           expect.objectContaining({
             message: expect.stringContaining(
-              inspectionFails
+              inspectionFails || ambiguousPath
                 ? "Failed to reconcile action-owned worktree registration"
                 : "Failed to remove action-owned worktree",
             ),
@@ -154,6 +176,7 @@ describe("update publication races", () => {
       });
 
       delete process.env.TEST_GIT_FAIL_WORKTREE_LIST;
+      delete process.env.TEST_GIT_LEGACY_WORKTREE_LIST;
       const preserved = (await worktrees(workspace)).filter(
         (entry) => !initial.includes(entry),
       );
@@ -1289,8 +1312,14 @@ case " $* " in
       [ "$TEST_GIT_FAIL_WORKTREE_REMOVE" = "always" ] && exit 1
     fi
     ;;
-  *" worktree list "*)
+  *" worktree list --porcelain -z "*)
     [ "$TEST_GIT_FAIL_WORKTREE_LIST" = "1" ] && exit 1
+    if [ "$TEST_GIT_LEGACY_WORKTREE_LIST" = "1" ]; then
+      printf "%s\\n" "error: unknown switch \\\`z'" \\
+        "usage: git worktree add [<options>] <path> [<commit-ish>]" \\
+        "   or: git worktree list [<options>]" >&2
+      exit 129
+    fi
     ;;
   *" diff --cached --quiet "*)
     [ "$TEST_GIT_FAIL_DIFF" = "1" ] && exit 2
