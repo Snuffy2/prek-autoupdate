@@ -73,6 +73,8 @@ afterEach(async () => {
   delete process.env.TEST_GIT_UNREGISTER_WORKTREE_ON_REMOVE;
   delete process.env.TEST_GIT_FAIL_WORKTREE_ADD_AFTER;
   delete process.env.TEST_GIT_FAIL_WORKTREE_ADD_BEFORE;
+  delete process.env.TEST_GIT_LOCK_WORKTREE_AFTER_ADD;
+  delete process.env.TEST_GIT_FAIL_DOUBLE_REMOVE_AFTER_UNREGISTER;
   delete process.env.TEST_GIT_WORKTREE_REMOVE_SENTINEL;
   vi.unstubAllEnvs();
   installPrek.mockReset();
@@ -113,6 +115,24 @@ describe("update publication races", () => {
     process.env.TEST_GIT_FAIL_WORKTREE_ADD_AFTER = "1";
 
     await expect(runUpdate(execution, execution.api)).rejects.toThrow();
+
+    expect(await worktrees(workspace)).toEqual(initial);
+    expect(await readdir(scratch)).toEqual([]);
+  });
+
+  it("removes a failed worktree add that left a registration lock", async () => {
+    const { execution, initial, scratch, workspace } =
+      await makeWorktreeHarness();
+    process.env.TEST_GIT_FAIL_WORKTREE_ADD_AFTER = "1";
+    process.env.TEST_GIT_LOCK_WORKTREE_AFTER_ADD = "1";
+    process.env.TEST_GIT_FAIL_DOUBLE_REMOVE_AFTER_UNREGISTER = "1";
+
+    const error = await runUpdate(execution, execution.api).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(AggregateError);
+    expect(error).toMatchObject({ code: 1 });
 
     expect(await worktrees(workspace)).toEqual(initial);
     expect(await readdir(scratch)).toEqual([]);
@@ -1292,6 +1312,18 @@ case " $* " in
   *" worktree add --detach "*)
     [ "$TEST_GIT_FAIL_WORKTREE_ADD_BEFORE" = "1" ] && exit 1
     if [ "$TEST_GIT_FAIL_WORKTREE_ADD_AFTER" = "1" ]; then
+      eval ${JSON.stringify(realGit)} "$args" || exit $?
+      if [ "$TEST_GIT_LOCK_WORKTREE_AFTER_ADD" = "1" ]; then
+        previous=""
+        current=""
+        for arg do previous="$current"; current="$arg"; done
+        ${JSON.stringify(realGit)} -C "$previous" worktree lock --reason initializing "$previous" || exit $?
+      fi
+      exit 1
+    fi
+    ;;
+  *" worktree remove --force --force "*)
+    if [ "$TEST_GIT_FAIL_DOUBLE_REMOVE_AFTER_UNREGISTER" = "1" ]; then
       eval ${JSON.stringify(realGit)} "$args" || exit $?
       exit 1
     fi

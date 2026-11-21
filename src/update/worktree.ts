@@ -18,17 +18,29 @@ export async function prepareWorktree(
 ): Promise<DetachedWorktree> {
   const root = await createTemporaryRoot();
   const worktree = join(root, "worktree");
+  let addFailed = false;
   return {
     path: worktree,
     async add() {
-      await git(workspace, ["worktree", "add", "--detach", worktree, baseSha]);
+      try {
+        await git(workspace, [
+          "worktree",
+          "add",
+          "--detach",
+          worktree,
+          baseSha,
+        ]);
+      } catch (error) {
+        addFailed = true;
+        throw error;
+      }
     },
     async cleanup() {
       const remove = ["worktree", "remove", "--force", worktree];
       try {
         await git(workspace, remove).catch(() => git(workspace, remove));
       } catch (removalError) {
-        await reconcileRemoval(workspace, worktree, removalError);
+        await reconcileRemoval(workspace, worktree, removalError, addFailed);
       }
       await rm(root, { force: true, recursive: true });
     },
@@ -39,6 +51,7 @@ async function reconcileRemoval(
   workspace: string,
   worktree: string,
   removalError: unknown,
+  addFailed: boolean,
 ): Promise<void> {
   let registered: boolean;
   try {
@@ -51,6 +64,24 @@ async function reconcileRemoval(
     );
   }
   if (registered) {
+    // A failed add can leave Git's transient initialization lock behind. This
+    // path is private to this action and was never exposed as a successful
+    // worktree, so use double-force only for that failed lifecycle.
+    if (addFailed) {
+      try {
+        await git(workspace, [
+          "worktree",
+          "remove",
+          "--force",
+          "--force",
+          worktree,
+        ]);
+        return;
+      } catch (error) {
+        await reconcileRemoval(workspace, worktree, error, false);
+        return;
+      }
+    }
     throw new Error(
       `Failed to remove action-owned worktree; ${worktree} was preserved for inspection`,
       { cause: removalError },
