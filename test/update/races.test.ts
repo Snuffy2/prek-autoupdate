@@ -11,7 +11,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
+import { inspect, promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -38,6 +38,7 @@ vi.mock("../../src/environment.js", async (importOriginal) => {
   };
 });
 
+import { cleanupUpdateBranches } from "../../src/cleanup/index.js";
 import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
 import { BODY_MARKER } from "../../src/ownership.js";
 import { runUpdate } from "../../src/update/index.js";
@@ -52,6 +53,7 @@ afterEach(async () => {
   delete process.env.TEST_GIT_REMOTE;
   delete process.env.TEST_GIT_URL;
   delete process.env.TEST_GIT_FAIL_PUSH;
+  delete process.env.TEST_GIT_FAILURE_OUTPUT;
   delete process.env.TEST_GIT_FAIL_DIFF;
   delete process.env.TEST_GIT_FAIL_WORKTREE_REMOVE;
   delete process.env.TEST_GIT_UNREGISTER_WORKTREE_ON_REMOVE;
@@ -237,6 +239,54 @@ describe("update publication races", () => {
       ),
     ]);
     expect(harness.update).not.toHaveBeenCalled();
+  });
+
+  it("reports a branch already absent after a definite create failure", async () => {
+    const harness = await makeHarness();
+    harness.create.mockImplementationOnce(async () => {
+      await exec("git", [
+        "--git-dir",
+        harness.remote,
+        "update-ref",
+        "-d",
+        "refs/heads/chore/prek-updates",
+        await remoteSha(harness.remote),
+      ]);
+      throw Object.assign(new Error("bad"), { status: 422 });
+    });
+
+    await expect(runUpdate(harness.execution)).rejects.toThrow(
+      /creation failed.*branch was already absent/u,
+    );
+    await expect(remoteSha(harness.remote)).rejects.toThrow();
+  });
+
+  it("preserves a moved ref when a definite create failure triggers rollback", async () => {
+    const harness = await makeHarness();
+    const movedSha = harness.execution.context.baseSha;
+    harness.create.mockImplementationOnce(async () => {
+      await exec("git", [
+        "--git-dir",
+        harness.remote,
+        "update-ref",
+        "refs/heads/chore/prek-updates",
+        movedSha,
+        await remoteSha(harness.remote),
+      ]);
+      throw Object.assign(new Error("bad"), { status: 422 });
+    });
+
+    await expect(runUpdate(harness.execution)).rejects.toMatchObject({
+      message: expect.stringMatching(/rollback failed.*branch was preserved/u),
+      cause: expect.objectContaining({
+        errors: expect.arrayContaining([
+          expect.objectContaining({
+            message: expect.stringMatching(/branch moved/u),
+          }),
+        ]),
+      }),
+    });
+    expect(await remoteSha(harness.remote)).toBe(movedSha);
   });
 
   it("recovers an exact concurrent pull even when create reports 422", async () => {
@@ -955,6 +1005,40 @@ describe("no-change close compensation", () => {
   });
 });
 
+it("preserves a cleanup ref and discards credentials from a rejected push error", async () => {
+  const harness = await makeHarness({ existing: true, closedExisting: true });
+  const token = "fake-cleanup-credential";
+  const execution = {
+    ...harness.execution,
+    inputs: { ...harness.execution.inputs, token },
+  };
+  Object.assign(execution.client.paginate, {
+    async *iterator(_endpoint: unknown, { state }: { state: string }) {
+      yield { data: state === "closed" ? [harness.pull] : [] };
+    },
+  });
+  process.env.TEST_GIT_FAIL_PUSH = "1";
+  process.env.TEST_GIT_FAILURE_OUTPUT = token;
+
+  const error = await cleanupUpdateBranches(execution, {
+    keepLatestOpenPullRequest: false,
+    closeStalePullRequests: false,
+    closeObsoletePullRequests: false,
+    deleteStaleBranches: true,
+    deleteMergedBranches: false,
+  }).catch((caught: unknown) => caught);
+
+  expect(error).toMatchObject({
+    message: expect.stringContaining("Lease-protected branch deletion failed"),
+  });
+  const errorText = inspect(error, { depth: null });
+  expect(errorText).not.toContain(token);
+  expect(errorText).not.toContain(
+    Buffer.from(`x-access-token:${token}`).toString("base64"),
+  );
+  expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
+});
+
 interface HarnessOptions {
   existing?: boolean;
   closedExisting?: boolean;
@@ -1086,14 +1170,18 @@ async function makeHarness(options: HarnessOptions = {}) {
         },
       };
     }
-    if (!options.existing) {
-      throw Object.assign(new Error("missing"), { status: 404 });
-    }
     updateRefChecks += 1;
-    if (updateRefChecks >= (options.refLossAt ?? Infinity)) {
+    const { stdout } = await exec("git", [
+      "ls-remote",
+      "--refs",
+      remote,
+      `refs/${ref}`,
+    ]);
+    const sha = stdout.split("\t")[0];
+    if (!sha || updateRefChecks >= (options.refLossAt ?? Infinity)) {
       throw Object.assign(new Error("missing"), { status: 404 });
     }
-    return { data: { object: { sha: await remoteSha(remote) } } };
+    return { data: { object: { sha } } };
   });
   const paginate = vi.fn(async () => (options.existing ? [pull] : []));
   const addLabels = vi.fn();
@@ -1189,7 +1277,10 @@ case " $* " in
   *" push "*)
     printf '%s\\n' "$*" >> "$TEST_GIT_LOG"
     count=$(wc -l < "$TEST_GIT_LOG" | tr -d ' ')
-    [ "$count" = "$TEST_GIT_FAIL_PUSH" ] && exit 1
+    if [ "$count" = "$TEST_GIT_FAIL_PUSH" ]; then
+      printf '%s\\n' "$TEST_GIT_FAILURE_OUTPUT" >&2
+      exit 1
+    fi
     ;;
 esac
 eval exec ${JSON.stringify(realGit)} "$args"

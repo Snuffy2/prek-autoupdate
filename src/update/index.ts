@@ -10,10 +10,15 @@ import {
   type ActionExecution,
   type UpdateResult,
 } from "../contracts.js";
+import { sanitizedChildEnvironment } from "../environment.js";
 import {
-  hardenedGitArguments,
-  sanitizedChildEnvironment,
-} from "../environment.js";
+  deleteBranch,
+  git,
+  gitAuthenticated,
+  gitExit,
+  repositoryUrl,
+  type DeleteRefOutcome,
+} from "../git.js";
 import {
   BODY_MARKER,
   isOwnedPull,
@@ -894,10 +899,11 @@ async function fetchObservedUpdateCommit(
   if (remote.sha === undefined) {
     throw new Error("Expected an observed update branch revision");
   }
-  await gitAuthenticated(execution, worktree, [
+  const destination = gitRemote(execution);
+  await gitAuthenticated(destination, worktree, [
     "fetch",
     "--no-tags",
-    repositoryUrl(execution),
+    repositoryUrl(destination),
     `refs/heads/${execution.inputs.updateBranch}`,
   ]);
   const fetched = await git(worktree, ["rev-parse", "FETCH_HEAD"]);
@@ -1059,22 +1065,26 @@ async function ensureOwnershipLabel(execution: ActionExecution): Promise<void> {
   }
 }
 
-async function observeRemoteState(
+async function readUpdateBranch(
   execution: ActionExecution,
-): Promise<RemoteState> {
-  let sha: string | undefined;
+): Promise<string | undefined> {
   try {
     const response = await execution.client.rest.git.getRef({
       owner: execution.context.owner,
       repo: execution.context.repository,
       ref: `heads/${execution.inputs.updateBranch}`,
     });
-    sha = response.data.object.sha;
+    return response.data.object.sha;
   } catch (error) {
-    if (!isNotFound(error)) {
-      throw error;
-    }
+    if (isNotFound(error)) return undefined;
+    throw error;
   }
+}
+
+async function observeRemoteState(
+  execution: ActionExecution,
+): Promise<RemoteState> {
+  const sha = await readUpdateBranch(execution);
 
   const pulls = await execution.client.paginate(
     execution.client.rest.pulls.list,
@@ -1200,9 +1210,10 @@ async function pushUpdate(
   expectedSha: string | undefined,
 ): Promise<void> {
   const ref = `refs/heads/${execution.inputs.updateBranch}`;
-  await gitAuthenticated(execution, worktree, [
+  const destination = gitRemote(execution);
+  await gitAuthenticated(destination, worktree, [
     "push",
-    repositoryUrl(execution),
+    repositoryUrl(destination),
     `HEAD:${ref}`,
     `--force-with-lease=${ref}:${expectedSha ?? ""}`,
   ]);
@@ -1235,7 +1246,11 @@ async function closeUnneededPullRequest(
     throw new Error("GitHub returned an unexpected pull request after close");
   }
   try {
-    await deleteBranch(execution, remote.sha);
+    if (
+      (await deleteUpdateBranch(execution, remote.sha)) === "already-absent"
+    ) {
+      throw new Error("The update branch was already absent at deletion");
+    }
   } catch (error) {
     const closeEtag =
       typeof response.headers?.etag === "string"
@@ -1408,8 +1423,9 @@ async function rollbackCreatedPullRequest(
       { cause: new AggregateError([labelError, closeError]) },
     );
   }
+  let deletion: CompletedDeletion;
   try {
-    await deleteBranch(execution, pushedSha);
+    deletion = await deleteUpdateBranch(execution, pushedSha);
   } catch (rollbackError) {
     throw new Error(
       `Created pull request #${pullNumber} was closed after ownership setup failed, but lease-protected branch rollback also failed; the branch was preserved`,
@@ -1417,7 +1433,9 @@ async function rollbackCreatedPullRequest(
     );
   }
   throw new Error(
-    `Applying or proving pull request ownership failed; pull request #${pullNumber} was closed and its branch was lease-rolled back`,
+    deletion === "already-absent"
+      ? `Applying or proving pull request ownership failed; pull request #${pullNumber} was closed and its branch was already absent`
+      : `Applying or proving pull request ownership failed; pull request #${pullNumber} was closed and its branch was lease-rolled back`,
     { cause: labelError },
   );
 }
@@ -1427,8 +1445,9 @@ async function rollbackNewBranch(
   pushedSha: string,
   createError: unknown,
 ): Promise<never> {
+  let deletion: CompletedDeletion;
   try {
-    await deleteBranch(execution, pushedSha);
+    deletion = await deleteUpdateBranch(execution, pushedSha);
   } catch (rollbackError) {
     throw new Error(
       "Pull request creation definitely failed, but lease-protected branch rollback failed; the branch was preserved",
@@ -1436,7 +1455,9 @@ async function rollbackNewBranch(
     );
   }
   throw new Error(
-    "Pull request creation failed; the newly pushed branch was lease-rolled back",
+    deletion === "already-absent"
+      ? "Pull request creation failed; the newly pushed branch was already absent"
+      : "Pull request creation failed; the newly pushed branch was lease-rolled back",
     { cause: createError },
   );
 }
@@ -1456,10 +1477,11 @@ async function rollbackExistingPush(
     );
   }
   const ref = `refs/heads/${execution.inputs.updateBranch}`;
+  const destination = gitRemote(execution);
   try {
-    await gitAuthenticated(execution, execution.context.workspace, [
+    await gitAuthenticated(destination, execution.context.workspace, [
       "push",
-      repositoryUrl(execution),
+      repositoryUrl(destination),
       `${remote.sha}:${ref}`,
       `--force-with-lease=${ref}:${newSha}`,
     ]);
@@ -1477,17 +1499,25 @@ async function rollbackExistingPush(
   );
 }
 
-async function deleteBranch(
+type CompletedDeletion = Exclude<DeleteRefOutcome, "lease-rejected">;
+
+async function deleteUpdateBranch(
   execution: ActionExecution,
   expectedSha: string,
-): Promise<void> {
-  const ref = `refs/heads/${execution.inputs.updateBranch}`;
-  await gitAuthenticated(execution, execution.context.workspace, [
-    "push",
-    repositoryUrl(execution),
-    `:${ref}`,
-    `--force-with-lease=${ref}:${expectedSha}`,
-  ]);
+): Promise<CompletedDeletion> {
+  const outcome = await deleteBranch({
+    remote: gitRemote(execution),
+    ref: `refs/heads/${execution.inputs.updateBranch}`,
+    expectedSha,
+    readRef: () => readUpdateBranch(execution),
+    workspace: execution.context.workspace,
+  });
+  if (outcome === "lease-rejected") {
+    throw new Error(
+      "Lease-protected branch deletion rejected because the branch moved",
+    );
+  }
+  return outcome;
 }
 
 function isDefiniteCreateFailure(error: unknown): boolean {
@@ -1512,66 +1542,10 @@ function isNotFound(error: unknown): boolean {
   );
 }
 
-async function git(
-  workspace: string,
-  arguments_: readonly string[],
-): Promise<string> {
-  const { stdout } = await execFileAsync(
-    "git",
-    hardenedGitArguments(["-C", workspace, ...arguments_]),
-    {
-      encoding: "utf8",
-      env: sanitizedChildEnvironment(),
-    },
-  );
-  return stdout.trim();
-}
-
-async function gitAuthenticated(
-  execution: ActionExecution,
-  workspace: string,
-  arguments_: readonly string[],
-): Promise<string> {
-  const credential = Buffer.from(
-    `x-access-token:${execution.inputs.token}`,
-  ).toString("base64");
-  core.setSecret(credential);
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      hardenedGitArguments([
-        "-c",
-        `http.${execution.context.serverUrl}/.extraheader=AUTHORIZATION: basic ${credential}`,
-        "-C",
-        workspace,
-        ...arguments_,
-      ]),
-      { encoding: "utf8", env: sanitizedChildEnvironment() },
-    );
-    return stdout.trim();
-  } catch {
-    throw new Error(
-      "Authenticated git operation failed; credentials were not included in output",
-    );
-  }
-}
-
-function repositoryUrl(execution: ActionExecution): string {
-  return `${execution.context.serverUrl}/${execution.context.repositoryFullName}.git`;
-}
-
-async function gitExit(
-  workspace: string,
-  arguments_: readonly string[],
-): Promise<number> {
-  try {
-    await git(workspace, arguments_);
-    return 0;
-  } catch (error) {
-    const exit = error as { code?: number };
-    if (typeof exit.code === "number") {
-      return exit.code;
-    }
-    throw error;
-  }
+function gitRemote(execution: ActionExecution) {
+  return {
+    serverUrl: execution.context.serverUrl,
+    token: execution.inputs.token,
+    repositoryFullName: execution.context.repositoryFullName,
+  };
 }

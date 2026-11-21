@@ -35930,16 +35930,6 @@ function sanitizedChildEnvironment(additions = {}) {
         PATH: TRUSTED_SYSTEM_PATH,
     };
 }
-/** Prefix Git arguments with settings that suppress hooks and credential helpers. */
-function hardenedGitArguments(arguments_) {
-    return [
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "credential.helper=",
-        ...arguments_,
-    ];
-}
 function isBlocked(key) {
     return (key.startsWith("INPUT_") ||
         key.startsWith("LD_") ||
@@ -35948,6 +35938,98 @@ function isBlocked(key) {
         key.startsWith("GIT_CONFIG_VALUE_") ||
         key.startsWith("GIT_TRACE") ||
         BLOCKED_GIT_VARIABLES.has(key));
+}
+
+const execFileAsync$1 = promisify(execFile);
+const CLEANUP_TIMEOUT_MS = 30_000;
+async function runGit(arguments_, timeout) {
+    const { stdout } = await execFileAsync$1("git", [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "credential.helper=",
+        ...arguments_,
+    ], { encoding: "utf8", env: sanitizedChildEnvironment(), timeout });
+    return stdout.trim();
+}
+function git(workspace, arguments_) {
+    return runGit(["-C", workspace, ...arguments_]);
+}
+async function gitOptional(workspace, arguments_) {
+    try {
+        return await git(workspace, arguments_);
+    }
+    catch (error) {
+        if (error?.code === 1)
+            return "";
+        throw error;
+    }
+}
+async function gitExit(workspace, arguments_) {
+    try {
+        await git(workspace, arguments_);
+        return 0;
+    }
+    catch (error) {
+        const code = error?.code;
+        if (typeof code === "number")
+            return code;
+        throw error;
+    }
+}
+async function gitAuthenticated(remote, workspace, arguments_, timeout) {
+    const credential = Buffer.from(`x-access-token:${remote.token}`).toString("base64");
+    setSecret(credential);
+    try {
+        return await runGit([
+            "-C",
+            workspace,
+            "-c",
+            `http.${remote.serverUrl}/.extraheader=AUTHORIZATION: basic ${credential}`,
+            ...arguments_,
+        ], timeout);
+    }
+    catch {
+        // execFile errors include the command and can retain its output.
+        throw new Error("Authenticated git operation failed; credentials were not included in output");
+    }
+}
+function repositoryUrl({ serverUrl, repositoryFullName, }) {
+    return `${serverUrl}/${repositoryFullName}.git`;
+}
+/** Remove only the expected revision, reconciling a failed push with the remote ref. */
+async function deleteBranch(deletion) {
+    if (deletion.workspace !== undefined) {
+        return await pushDeletion(deletion, deletion.workspace);
+    }
+    // Cleanup does not depend on the caller checkout or its local Git config.
+    const directory = await mkdtemp(join(tmpdir(), "prek-autoupdate-git-"));
+    try {
+        await runGit(["init", "--quiet", directory], CLEANUP_TIMEOUT_MS);
+        return await pushDeletion(deletion, directory, CLEANUP_TIMEOUT_MS);
+    }
+    finally {
+        await rm$1(directory, { recursive: true, force: true });
+    }
+}
+async function pushDeletion({ remote, ref, expectedSha, readRef }, directory, timeout) {
+    try {
+        await gitAuthenticated(remote, directory, [
+            "push",
+            repositoryUrl(remote),
+            `:${ref}`,
+            `--force-with-lease=${ref}:${expectedSha}`,
+        ], timeout);
+        return "deleted";
+    }
+    catch {
+        const current = await readRef();
+        if (current === undefined)
+            return "already-absent";
+        if (current !== expectedSha)
+            return "lease-rejected";
+        throw new Error("Lease-protected branch deletion failed; credentials were not included in output");
+    }
 }
 
 function payload(value, description) {
@@ -36068,8 +36150,6 @@ function sameCandidate(left, right) {
         left.merged === right.merged);
 }
 
-const execFileAsync$2 = promisify(execFile);
-const GIT_TIMEOUT_MS = 30_000;
 class OctokitCleanupApi {
     client;
     owner;
@@ -36208,41 +36288,16 @@ class OctokitCleanupApi {
         }
     }
     async deleteRef(ref, expectedSha) {
-        const fullRef = `refs/${ref}`;
-        const credential = Buffer.from(`x-access-token:${this.token}`).toString("base64");
-        setSecret(credential);
-        const environment = sanitizedChildEnvironment();
-        const directory = await mkdtemp(join(tmpdir(), "prek-autoupdate-git-"));
-        try {
-            await execFileAsync$2("git", hardenedGitArguments(["init", "--quiet", directory]), {
-                env: environment,
-                timeout: GIT_TIMEOUT_MS,
-            });
-            try {
-                await execFileAsync$2("git", hardenedGitArguments([
-                    "-C",
-                    directory,
-                    "-c",
-                    `http.${this.serverUrl}/.extraheader=AUTHORIZATION: basic ${credential}`,
-                    "push",
-                    `${this.serverUrl}/${this.owner}/${this.repo}.git`,
-                    `--force-with-lease=${fullRef}:${expectedSha}`,
-                    `:${fullRef}`,
-                ]), { env: environment, timeout: GIT_TIMEOUT_MS });
-                return "deleted";
-            }
-            catch (error) {
-                const current = await this.getRefSha(ref);
-                if (current === undefined)
-                    return "already-absent";
-                if (current !== expectedSha)
-                    return "lease-rejected";
-                throw new Error("Lease-protected branch deletion failed; credentials were not included in output", { cause: error });
-            }
-        }
-        finally {
-            await rm$1(directory, { recursive: true, force: true });
-        }
+        return await deleteBranch({
+            remote: {
+                serverUrl: this.serverUrl,
+                token: this.token,
+                repositoryFullName: `${this.owner}/${this.repo}`,
+            },
+            ref: `refs/${ref}`,
+            expectedSha,
+            readRef: () => this.getRefSha(ref),
+        });
     }
     async restoreRef(ref, sha) {
         try {
@@ -36597,7 +36652,6 @@ const SUPPORTED_EVENTS = new Set([
     "schedule",
     "workflow_dispatch",
 ]);
-const execFileAsync$1 = promisify(execFile);
 function parseInputs() {
     const token = getInput("token", { required: true });
     setSecret(token);
@@ -36697,7 +36751,7 @@ async function resolveContext(client, inputs) {
         }
         baseBranch = branch;
     }
-    const baseSha = await git$1(workspace, ["rev-parse", "HEAD"]);
+    const baseSha = await git(workspace, ["rev-parse", "HEAD"]);
     const identity = await resolveAuthenticatedIdentity(client, inputs.token, inputs.authorLogin);
     return {
         eventName,
@@ -36714,7 +36768,7 @@ async function resolveContext(client, inputs) {
 }
 /** Validate checkout requirements needed only by the update phase. */
 async function validateCheckout(context) {
-    const status = await git$1(context.workspace, [
+    const status = await git(context.workspace, [
         "status",
         "--porcelain=v1",
         "--untracked-files=all",
@@ -36722,7 +36776,7 @@ async function validateCheckout(context) {
     if (status !== "") {
         throw new Error("The caller checkout must be clean before running prek-autoupdate");
     }
-    const remoteUrl = await git$1(context.workspace, [
+    const remoteUrl = await git(context.workspace, [
         "remote",
         "get-url",
         "origin",
@@ -36784,27 +36838,6 @@ async function resolveAuthenticatedIdentity(client, token, fallbackLogin) {
             (error.status === 401 ||
                 error.status === 403)) {
             return { authenticatedAsUser: false, login: fallbackLogin };
-        }
-        throw error;
-    }
-}
-async function git$1(workspace, arguments_) {
-    const { stdout } = await execFileAsync$1("git", hardenedGitArguments(["-C", workspace, ...arguments_]), {
-        encoding: "utf8",
-        env: sanitizedChildEnvironment(),
-    });
-    return stdout.trim();
-}
-async function gitOptional(workspace, arguments_) {
-    try {
-        return await git$1(workspace, arguments_);
-    }
-    catch (error) {
-        if (typeof error === "object" &&
-            error !== null &&
-            "code" in error &&
-            error.code === 1) {
-            return "";
         }
         throw error;
     }
@@ -40844,10 +40877,11 @@ async function fetchObservedUpdateCommit(execution, worktree, remote) {
     if (remote.sha === undefined) {
         throw new Error("Expected an observed update branch revision");
     }
-    await gitAuthenticated(execution, worktree, [
+    const destination = gitRemote(execution);
+    await gitAuthenticated(destination, worktree, [
         "fetch",
         "--no-tags",
-        repositoryUrl(execution),
+        repositoryUrl(destination),
         `refs/heads/${execution.inputs.updateBranch}`,
     ]);
     const fetched = await git(worktree, ["rev-parse", "FETCH_HEAD"]);
@@ -40976,21 +41010,23 @@ async function ensureOwnershipLabel(execution) {
         throw error;
     }
 }
-async function observeRemoteState(execution) {
-    let sha;
+async function readUpdateBranch(execution) {
     try {
         const response = await execution.client.rest.git.getRef({
             owner: execution.context.owner,
             repo: execution.context.repository,
             ref: `heads/${execution.inputs.updateBranch}`,
         });
-        sha = response.data.object.sha;
+        return response.data.object.sha;
     }
     catch (error) {
-        if (!isNotFound(error)) {
-            throw error;
-        }
+        if (isNotFound(error))
+            return undefined;
+        throw error;
     }
+}
+async function observeRemoteState(execution) {
+    const sha = await readUpdateBranch(execution);
     const pulls = await execution.client.paginate(execution.client.rest.pulls.list, {
         owner: execution.context.owner,
         repo: execution.context.repository,
@@ -41062,9 +41098,10 @@ function makeBody(output, workspace) {
 }
 async function pushUpdate(execution, worktree, expectedSha) {
     const ref = `refs/heads/${execution.inputs.updateBranch}`;
-    await gitAuthenticated(execution, worktree, [
+    const destination = gitRemote(execution);
+    await gitAuthenticated(destination, worktree, [
         "push",
-        repositoryUrl(execution),
+        repositoryUrl(destination),
         `HEAD:${ref}`,
         `--force-with-lease=${ref}:${expectedSha ?? ""}`,
     ]);
@@ -41091,7 +41128,9 @@ async function closeUnneededPullRequest(execution, remote) {
         throw new Error("GitHub returned an unexpected pull request after close");
     }
     try {
-        await deleteBranch(execution, remote.sha);
+        if ((await deleteUpdateBranch(execution, remote.sha)) === "already-absent") {
+            throw new Error("The update branch was already absent at deletion");
+        }
     }
     catch (error) {
         const closeEtag = typeof response.headers?.etag === "string"
@@ -41223,22 +41262,28 @@ async function rollbackCreatedPullRequest(execution, pullNumber, pushedSha, labe
     catch (closeError) {
         throw new Error(`Created pull request #${pullNumber}, but applying or proving its ownership failed; closing it also failed, so its branch was preserved`, { cause: new AggregateError([labelError, closeError]) });
     }
+    let deletion;
     try {
-        await deleteBranch(execution, pushedSha);
+        deletion = await deleteUpdateBranch(execution, pushedSha);
     }
     catch (rollbackError) {
         throw new Error(`Created pull request #${pullNumber} was closed after ownership setup failed, but lease-protected branch rollback also failed; the branch was preserved`, { cause: new AggregateError([labelError, rollbackError]) });
     }
-    throw new Error(`Applying or proving pull request ownership failed; pull request #${pullNumber} was closed and its branch was lease-rolled back`, { cause: labelError });
+    throw new Error(deletion === "already-absent"
+        ? `Applying or proving pull request ownership failed; pull request #${pullNumber} was closed and its branch was already absent`
+        : `Applying or proving pull request ownership failed; pull request #${pullNumber} was closed and its branch was lease-rolled back`, { cause: labelError });
 }
 async function rollbackNewBranch(execution, pushedSha, createError) {
+    let deletion;
     try {
-        await deleteBranch(execution, pushedSha);
+        deletion = await deleteUpdateBranch(execution, pushedSha);
     }
     catch (rollbackError) {
         throw new Error("Pull request creation definitely failed, but lease-protected branch rollback failed; the branch was preserved", { cause: new AggregateError([createError, rollbackError]) });
     }
-    throw new Error("Pull request creation failed; the newly pushed branch was lease-rolled back", { cause: createError });
+    throw new Error(deletion === "already-absent"
+        ? "Pull request creation failed; the newly pushed branch was already absent"
+        : "Pull request creation failed; the newly pushed branch was lease-rolled back", { cause: createError });
 }
 async function rollbackExistingPush(execution, remote, newSha, proofError) {
     if (remote.sha === undefined) {
@@ -41247,10 +41292,11 @@ async function rollbackExistingPush(execution, remote, newSha, proofError) {
         });
     }
     const ref = `refs/heads/${execution.inputs.updateBranch}`;
+    const destination = gitRemote(execution);
     try {
-        await gitAuthenticated(execution, execution.context.workspace, [
+        await gitAuthenticated(destination, execution.context.workspace, [
             "push",
-            repositoryUrl(execution),
+            repositoryUrl(destination),
             `${remote.sha}:${ref}`,
             `--force-with-lease=${ref}:${newSha}`,
         ]);
@@ -41262,14 +41308,18 @@ async function rollbackExistingPush(execution, remote, newSha, proofError) {
         cause: proofError,
     });
 }
-async function deleteBranch(execution, expectedSha) {
-    const ref = `refs/heads/${execution.inputs.updateBranch}`;
-    await gitAuthenticated(execution, execution.context.workspace, [
-        "push",
-        repositoryUrl(execution),
-        `:${ref}`,
-        `--force-with-lease=${ref}:${expectedSha}`,
-    ]);
+async function deleteUpdateBranch(execution, expectedSha) {
+    const outcome = await deleteBranch({
+        remote: gitRemote(execution),
+        ref: `refs/heads/${execution.inputs.updateBranch}`,
+        expectedSha,
+        readRef: () => readUpdateBranch(execution),
+        workspace: execution.context.workspace,
+    });
+    if (outcome === "lease-rejected") {
+        throw new Error("Lease-protected branch deletion rejected because the branch moved");
+    }
+    return outcome;
 }
 function isDefiniteCreateFailure(error) {
     if (typeof error !== "object" ||
@@ -41287,45 +41337,12 @@ function isNotFound(error) {
         "status" in error &&
         error.status === 404);
 }
-async function git(workspace, arguments_) {
-    const { stdout } = await execFileAsync("git", hardenedGitArguments(["-C", workspace, ...arguments_]), {
-        encoding: "utf8",
-        env: sanitizedChildEnvironment(),
-    });
-    return stdout.trim();
-}
-async function gitAuthenticated(execution, workspace, arguments_) {
-    const credential = Buffer.from(`x-access-token:${execution.inputs.token}`).toString("base64");
-    setSecret(credential);
-    try {
-        const { stdout } = await execFileAsync("git", hardenedGitArguments([
-            "-c",
-            `http.${execution.context.serverUrl}/.extraheader=AUTHORIZATION: basic ${credential}`,
-            "-C",
-            workspace,
-            ...arguments_,
-        ]), { encoding: "utf8", env: sanitizedChildEnvironment() });
-        return stdout.trim();
-    }
-    catch {
-        throw new Error("Authenticated git operation failed; credentials were not included in output");
-    }
-}
-function repositoryUrl(execution) {
-    return `${execution.context.serverUrl}/${execution.context.repositoryFullName}.git`;
-}
-async function gitExit(workspace, arguments_) {
-    try {
-        await git(workspace, arguments_);
-        return 0;
-    }
-    catch (error) {
-        const exit = error;
-        if (typeof exit.code === "number") {
-            return exit.code;
-        }
-        throw error;
-    }
+function gitRemote(execution) {
+    return {
+        serverUrl: execution.context.serverUrl,
+        token: execution.inputs.token,
+        repositoryFullName: execution.context.repositoryFullName,
+    };
 }
 
 /** Return the version banner shown at the start of each action run. */

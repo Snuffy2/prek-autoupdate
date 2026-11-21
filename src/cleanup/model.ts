@@ -1,3 +1,5 @@
+import type { DeleteRefOutcome } from "../git.js";
+
 export type Payload = Record<string, unknown>;
 
 export interface PullComparisonSnapshot {
@@ -31,7 +33,7 @@ export interface BranchDeletion {
   readonly candidates: readonly ClosedPullCandidate[];
 }
 
-export type DeleteRefOutcome = "already-absent" | "deleted" | "lease-rejected";
+export type { DeleteRefOutcome } from "../git.js";
 
 export interface CleanupApi {
   listPulls(state: "closed" | "open"): Promise<Payload[]>;

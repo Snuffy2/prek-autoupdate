@@ -11,10 +11,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import {
-  hardenedGitArguments,
-  sanitizedChildEnvironment,
-} from "../../src/environment.js";
+import { sanitizedChildEnvironment } from "../../src/environment.js";
 
 const ORIGINAL_ENVIRONMENT = { ...process.env };
 
@@ -122,18 +119,5 @@ describe("sanitizedChildEnvironment", () => {
     } finally {
       rmSync(temporaryDirectory, { force: true, recursive: true });
     }
-  });
-});
-
-describe("hardenedGitArguments", () => {
-  it("disables hooks and credential helpers before caller arguments", () => {
-    expect(hardenedGitArguments(["status", "--short"])).toEqual([
-      "-c",
-      "core.hooksPath=/dev/null",
-      "-c",
-      "credential.helper=",
-      "status",
-      "--short",
-    ]);
   });
 });

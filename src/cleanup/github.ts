@@ -1,20 +1,7 @@
-import * as core from "@actions/core";
-import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { promisify } from "node:util";
-
 import type { GitHubClient } from "../contracts.js";
-import {
-  hardenedGitArguments,
-  sanitizedChildEnvironment,
-} from "../environment.js";
+import { deleteBranch } from "../git.js";
 import type { CleanupApi, DeleteRefOutcome, Payload } from "./model.js";
 import { payload } from "./payload.js";
-
-const execFileAsync = promisify(execFile);
-const GIT_TIMEOUT_MS = 30_000;
 
 export class OctokitCleanupApi implements CleanupApi {
   public constructor(
@@ -178,50 +165,16 @@ export class OctokitCleanupApi implements CleanupApi {
     ref: string,
     expectedSha: string,
   ): Promise<DeleteRefOutcome> {
-    const fullRef = `refs/${ref}`;
-    const credential = Buffer.from(`x-access-token:${this.token}`).toString(
-      "base64",
-    );
-    core.setSecret(credential);
-    const environment = sanitizedChildEnvironment();
-    const directory = await mkdtemp(join(tmpdir(), "prek-autoupdate-git-"));
-    try {
-      await execFileAsync(
-        "git",
-        hardenedGitArguments(["init", "--quiet", directory]),
-        {
-          env: environment,
-          timeout: GIT_TIMEOUT_MS,
-        },
-      );
-      try {
-        await execFileAsync(
-          "git",
-          hardenedGitArguments([
-            "-C",
-            directory,
-            "-c",
-            `http.${this.serverUrl}/.extraheader=AUTHORIZATION: basic ${credential}`,
-            "push",
-            `${this.serverUrl}/${this.owner}/${this.repo}.git`,
-            `--force-with-lease=${fullRef}:${expectedSha}`,
-            `:${fullRef}`,
-          ]),
-          { env: environment, timeout: GIT_TIMEOUT_MS },
-        );
-        return "deleted";
-      } catch (error: unknown) {
-        const current = await this.getRefSha(ref);
-        if (current === undefined) return "already-absent";
-        if (current !== expectedSha) return "lease-rejected";
-        throw new Error(
-          "Lease-protected branch deletion failed; credentials were not included in output",
-          { cause: error },
-        );
-      }
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
+    return await deleteBranch({
+      remote: {
+        serverUrl: this.serverUrl,
+        token: this.token,
+        repositoryFullName: `${this.owner}/${this.repo}`,
+      },
+      ref: `refs/${ref}`,
+      expectedSha,
+      readRef: () => this.getRefSha(ref),
+    });
   }
 
   public async restoreRef(ref: string, sha: string): Promise<void> {
