@@ -1,9 +1,25 @@
-import type { GitHubClient } from "../contracts.js";
-import { deleteBranch } from "../git.js";
-import type { CleanupApi, DeleteRefOutcome, Payload } from "./model.js";
-import { payload } from "./payload.js";
+import type { GitHubClient } from "./contracts.js";
+import { deleteBranch, type DeleteRefOutcome } from "./git.js";
 
-export class OctokitCleanupApi implements CleanupApi {
+export type Payload = Record<string, unknown>;
+
+export interface GitHubApi {
+  listPulls(state: "closed" | "open"): Promise<Payload[]>;
+  getPull(number: number): Promise<Payload>;
+  findPull(number: number): Promise<Payload | undefined>;
+  closePull(number: number): Promise<Payload>;
+  reopenPull(number: number): Promise<Payload>;
+  compareFiles(baseSha: string, headSha: string): Promise<Payload[]>;
+  getTreeEntries(
+    paths: ReadonlySet<string>,
+    ref: string,
+  ): Promise<ReadonlyMap<string, string | undefined> | undefined>;
+  getRefSha(ref: string): Promise<string | undefined>;
+  deleteRef(ref: string, expectedSha: string): Promise<DeleteRefOutcome>;
+  restoreRef(ref: string, sha: string): Promise<void>;
+}
+
+export class OctokitGitHubApi implements GitHubApi {
   public constructor(
     private readonly client: GitHubClient,
     private readonly owner: string,
@@ -36,6 +52,15 @@ export class OctokitCleanupApi implements CleanupApi {
       pull_number: number,
     });
     return payload(response.data, "pull request object");
+  }
+
+  public async findPull(number: number): Promise<Payload | undefined> {
+    try {
+      return await this.getPull(number);
+    } catch (error: unknown) {
+      if (isStatus(error, 404) || isStatus(error, 410)) return undefined;
+      throw error;
+    }
   }
 
   public async closePull(number: number): Promise<Payload> {
@@ -200,4 +225,11 @@ function isStatus(error: unknown, status: number): boolean {
     "status" in error &&
     (error as { readonly status?: unknown }).status === status
   );
+}
+
+export function payload(value: unknown, description: string): Payload {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`Expected ${description}`);
+  }
+  return value as Payload;
 }

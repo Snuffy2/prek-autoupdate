@@ -1,7 +1,3 @@
-import type { DeleteRefOutcome } from "../git.js";
-
-export type Payload = Record<string, unknown>;
-
 export interface PullComparisonSnapshot {
   readonly headSha: string;
   readonly headRef: string;
@@ -31,21 +27,4 @@ export interface ClosedPullCandidate {
 export interface BranchDeletion {
   readonly expectedSha: string;
   readonly candidates: readonly ClosedPullCandidate[];
-}
-
-export type { DeleteRefOutcome } from "../git.js";
-
-export interface CleanupApi {
-  listPulls(state: "closed" | "open"): Promise<Payload[]>;
-  getPull(number: number): Promise<Payload>;
-  closePull(number: number): Promise<Payload>;
-  reopenPull(number: number): Promise<Payload>;
-  compareFiles(baseSha: string, headSha: string): Promise<Payload[]>;
-  getTreeEntries(
-    paths: ReadonlySet<string>,
-    ref: string,
-  ): Promise<ReadonlyMap<string, string | undefined> | undefined>;
-  getRefSha(ref: string): Promise<string | undefined>;
-  deleteRef(ref: string, expectedSha: string): Promise<DeleteRefOutcome>;
-  restoreRef(ref: string, sha: string): Promise<void>;
 }

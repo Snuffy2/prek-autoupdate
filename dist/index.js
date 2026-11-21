@@ -36032,12 +36032,194 @@ async function pushDeletion({ remote, ref, expectedSha, readRef }, directory, ti
     }
 }
 
+class OctokitGitHubApi {
+    client;
+    owner;
+    repo;
+    token;
+    serverUrl;
+    constructor(client, owner, repo, token, serverUrl) {
+        this.client = client;
+        this.owner = owner;
+        this.repo = repo;
+        this.token = token;
+        this.serverUrl = serverUrl;
+    }
+    async listPulls(state) {
+        const pulls = [];
+        for await (const response of this.client.paginate.iterator(this.client.rest.pulls.list, {
+            owner: this.owner,
+            repo: this.repo,
+            state,
+            per_page: 100,
+        })) {
+            for (const item of response.data)
+                pulls.push(payload(item, "pull request object"));
+        }
+        return pulls;
+    }
+    async getPull(number) {
+        const response = await this.client.rest.pulls.get({
+            owner: this.owner,
+            repo: this.repo,
+            pull_number: number,
+        });
+        return payload(response.data, "pull request object");
+    }
+    async findPull(number) {
+        try {
+            return await this.getPull(number);
+        }
+        catch (error) {
+            if (isStatus(error, 404) || isStatus(error, 410))
+                return undefined;
+            throw error;
+        }
+    }
+    async closePull(number) {
+        const response = await this.client.rest.pulls.update({
+            owner: this.owner,
+            repo: this.repo,
+            pull_number: number,
+            state: "closed",
+        });
+        return payload(response.data, "pull request object");
+    }
+    async reopenPull(number) {
+        await this.client.rest.pulls.update({
+            owner: this.owner,
+            repo: this.repo,
+            pull_number: number,
+            state: "open",
+        });
+        const reopened = await this.getPull(number);
+        if (reopened.number !== number || reopened.state !== "open")
+            throw new TypeError("Reopen response did not match requested pull");
+        return reopened;
+    }
+    async compareFiles(baseSha, headSha) {
+        let data;
+        let finalCommit;
+        for await (const response of this.client.paginate.iterator(this.client.rest.repos.compareCommitsWithBasehead, {
+            owner: this.owner,
+            repo: this.repo,
+            basehead: `${baseSha}...${headSha}`,
+            per_page: 100,
+        })) {
+            const page = payload(response.data, "comparison object");
+            data ??= page;
+            if (!Array.isArray(page.commits) || page.commits.length === 0)
+                throw new TypeError("Comparison response did not match immutable revisions");
+            finalCommit = payload(page.commits.at(-1), "comparison head commit");
+        }
+        if (data === undefined)
+            throw new TypeError("Expected comparison response");
+        const base = payload(data.base_commit, "comparison base commit");
+        const commits = data.commits;
+        if (base.sha !== baseSha ||
+            !Array.isArray(commits) ||
+            finalCommit?.sha !== headSha) {
+            throw new TypeError("Comparison response did not match immutable revisions");
+        }
+        if (!Array.isArray(data.files))
+            throw new TypeError("Expected comparison file list");
+        const changedFiles = data.changed_files;
+        if (data.files.length === 300 &&
+            (typeof changedFiles !== "number" ||
+                !Number.isInteger(changedFiles) ||
+                changedFiles < 0 ||
+                changedFiles > data.files.length))
+            throw new TypeError("Comparison file list exceeded GitHub's 300-file limit");
+        return data.files.map((file) => payload(file, "comparison file"));
+    }
+    async getTreeEntries(paths, ref) {
+        const response = await this.client.rest.git.getTree({
+            owner: this.owner,
+            repo: this.repo,
+            tree_sha: ref,
+            recursive: "1",
+        });
+        const data = payload(response.data, "Git tree object");
+        if (typeof data.truncated !== "boolean")
+            throw new TypeError("Expected Git tree truncated flag");
+        if (data.truncated)
+            return undefined;
+        if (!Array.isArray(data.tree))
+            throw new TypeError("Expected Git tree list");
+        const entries = new Map();
+        for (const path of paths)
+            entries.set(path, undefined);
+        for (const raw of data.tree) {
+            const item = payload(raw, "Git tree entry");
+            if (typeof item.path !== "string" || !paths.has(item.path))
+                continue;
+            if (typeof item.mode !== "string" ||
+                typeof item.type !== "string" ||
+                typeof item.sha !== "string") {
+                throw new TypeError("Expected a complete Git tree entry");
+            }
+            entries.set(item.path, `${item.mode}\0${item.type}\0${item.sha}`);
+        }
+        return entries;
+    }
+    async getRefSha(ref) {
+        try {
+            const response = await this.client.rest.git.getRef({
+                owner: this.owner,
+                repo: this.repo,
+                ref,
+            });
+            if (typeof response.data.object.sha !== "string")
+                throw new TypeError("Expected ref object SHA");
+            return response.data.object.sha;
+        }
+        catch (error) {
+            if (isStatus(error, 404))
+                return undefined;
+            throw error;
+        }
+    }
+    async deleteRef(ref, expectedSha) {
+        return await deleteBranch({
+            remote: {
+                serverUrl: this.serverUrl,
+                token: this.token,
+                repositoryFullName: `${this.owner}/${this.repo}`,
+            },
+            ref: `refs/${ref}`,
+            expectedSha,
+            readRef: () => this.getRefSha(ref),
+        });
+    }
+    async restoreRef(ref, sha) {
+        try {
+            await this.client.rest.git.createRef({
+                owner: this.owner,
+                repo: this.repo,
+                ref: `refs/${ref}`,
+                sha,
+            });
+        }
+        catch (error) {
+            if (isStatus(error, 422) && (await this.getRefSha(ref)) !== undefined)
+                return;
+            throw error;
+        }
+    }
+}
+function isStatus(error, status) {
+    return (error !== null &&
+        typeof error === "object" &&
+        "status" in error &&
+        error.status === status);
+}
 function payload(value, description) {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
         throw new TypeError(`Expected ${description}`);
     }
     return value;
 }
+
 function pullNumber(pull) {
     const value = pull.number;
     if (typeof value === "number" && Number.isInteger(value) && value > 0)
@@ -36150,180 +36332,8 @@ function sameCandidate(left, right) {
         left.merged === right.merged);
 }
 
-class OctokitCleanupApi {
-    client;
-    owner;
-    repo;
-    token;
-    serverUrl;
-    constructor(client, owner, repo, token, serverUrl) {
-        this.client = client;
-        this.owner = owner;
-        this.repo = repo;
-        this.token = token;
-        this.serverUrl = serverUrl;
-    }
-    async listPulls(state) {
-        const pulls = [];
-        for await (const response of this.client.paginate.iterator(this.client.rest.pulls.list, {
-            owner: this.owner,
-            repo: this.repo,
-            state,
-            per_page: 100,
-        })) {
-            for (const item of response.data)
-                pulls.push(payload(item, "pull request object"));
-        }
-        return pulls;
-    }
-    async getPull(number) {
-        const response = await this.client.rest.pulls.get({
-            owner: this.owner,
-            repo: this.repo,
-            pull_number: number,
-        });
-        return payload(response.data, "pull request object");
-    }
-    async closePull(number) {
-        const response = await this.client.rest.pulls.update({
-            owner: this.owner,
-            repo: this.repo,
-            pull_number: number,
-            state: "closed",
-        });
-        return payload(response.data, "pull request object");
-    }
-    async reopenPull(number) {
-        await this.client.rest.pulls.update({
-            owner: this.owner,
-            repo: this.repo,
-            pull_number: number,
-            state: "open",
-        });
-        const reopened = await this.getPull(number);
-        if (reopened.number !== number || reopened.state !== "open")
-            throw new TypeError("Reopen response did not match requested pull");
-        return reopened;
-    }
-    async compareFiles(baseSha, headSha) {
-        let data;
-        let finalCommit;
-        for await (const response of this.client.paginate.iterator(this.client.rest.repos.compareCommitsWithBasehead, {
-            owner: this.owner,
-            repo: this.repo,
-            basehead: `${baseSha}...${headSha}`,
-            per_page: 100,
-        })) {
-            const page = payload(response.data, "comparison object");
-            data ??= page;
-            if (!Array.isArray(page.commits) || page.commits.length === 0)
-                throw new TypeError("Comparison response did not match immutable revisions");
-            finalCommit = payload(page.commits.at(-1), "comparison head commit");
-        }
-        if (data === undefined)
-            throw new TypeError("Expected comparison response");
-        const base = payload(data.base_commit, "comparison base commit");
-        const commits = data.commits;
-        if (base.sha !== baseSha ||
-            !Array.isArray(commits) ||
-            finalCommit?.sha !== headSha) {
-            throw new TypeError("Comparison response did not match immutable revisions");
-        }
-        if (!Array.isArray(data.files))
-            throw new TypeError("Expected comparison file list");
-        const changedFiles = data.changed_files;
-        if (data.files.length === 300 &&
-            (typeof changedFiles !== "number" ||
-                !Number.isInteger(changedFiles) ||
-                changedFiles < 0 ||
-                changedFiles > data.files.length))
-            throw new TypeError("Comparison file list exceeded GitHub's 300-file limit");
-        return data.files.map((file) => payload(file, "comparison file"));
-    }
-    async getTreeEntries(paths, ref) {
-        const response = await this.client.rest.git.getTree({
-            owner: this.owner,
-            repo: this.repo,
-            tree_sha: ref,
-            recursive: "1",
-        });
-        const data = payload(response.data, "Git tree object");
-        if (typeof data.truncated !== "boolean")
-            throw new TypeError("Expected Git tree truncated flag");
-        if (data.truncated)
-            return undefined;
-        if (!Array.isArray(data.tree))
-            throw new TypeError("Expected Git tree list");
-        const entries = new Map();
-        for (const path of paths)
-            entries.set(path, undefined);
-        for (const raw of data.tree) {
-            const item = payload(raw, "Git tree entry");
-            if (typeof item.path !== "string" || !paths.has(item.path))
-                continue;
-            if (typeof item.mode !== "string" ||
-                typeof item.type !== "string" ||
-                typeof item.sha !== "string") {
-                throw new TypeError("Expected a complete Git tree entry");
-            }
-            entries.set(item.path, `${item.mode}\0${item.type}\0${item.sha}`);
-        }
-        return entries;
-    }
-    async getRefSha(ref) {
-        try {
-            const response = await this.client.rest.git.getRef({
-                owner: this.owner,
-                repo: this.repo,
-                ref,
-            });
-            if (typeof response.data.object.sha !== "string")
-                throw new TypeError("Expected ref object SHA");
-            return response.data.object.sha;
-        }
-        catch (error) {
-            if (isStatus$1(error, 404))
-                return undefined;
-            throw error;
-        }
-    }
-    async deleteRef(ref, expectedSha) {
-        return await deleteBranch({
-            remote: {
-                serverUrl: this.serverUrl,
-                token: this.token,
-                repositoryFullName: `${this.owner}/${this.repo}`,
-            },
-            ref: `refs/${ref}`,
-            expectedSha,
-            readRef: () => this.getRefSha(ref),
-        });
-    }
-    async restoreRef(ref, sha) {
-        try {
-            await this.client.rest.git.createRef({
-                owner: this.owner,
-                repo: this.repo,
-                ref: `refs/${ref}`,
-                sha,
-            });
-        }
-        catch (error) {
-            if (isStatus$1(error, 422) && (await this.getRefSha(ref)) !== undefined)
-                return;
-            throw error;
-        }
-    }
-}
-function isStatus$1(error, status) {
-    return (error !== null &&
-        typeof error === "object" &&
-        "status" in error &&
-        error.status === status);
-}
-
 async function cleanupUpdateBranches(execution, options) {
-    const api = new OctokitCleanupApi(execution.client, execution.context.owner, execution.context.repository, execution.inputs.token, execution.context.serverUrl);
+    const api = new OctokitGitHubApi(execution.client, execution.context.owner, execution.context.repository, execution.inputs.token, execution.context.serverUrl);
     return cleanupWithApi(api, execution, options);
 }
 async function cleanupWithApi(api, execution, options) {
@@ -36507,16 +36517,8 @@ async function reopenAndProtect(api, pulls, branch, protectedBranches, result, p
         const index = result.closedPullRequests.indexOf(identity.number);
         if (index >= 0)
             result.closedPullRequests.splice(index, 1);
-        let current;
-        try {
-            current = await api.getPull(identity.number);
-        }
-        catch (error) {
-            if (isStatus(error, 404) || isStatus(error, 410))
-                continue;
-            throw error;
-        }
-        if (canCompensate(current, identity, policy)) {
+        const current = await api.findPull(identity.number);
+        if (current !== undefined && canCompensate(current, identity, policy)) {
             const reopened = await api.reopenPull(identity.number);
             if (reopened.state !== "open" ||
                 pullNumber(reopened) !== identity.number ||
@@ -36528,12 +36530,6 @@ async function reopenAndProtect(api, pulls, branch, protectedBranches, result, p
         }
     }
     protectedBranches.add(branch);
-}
-function isStatus(error, status) {
-    return (error !== null &&
-        typeof error === "object" &&
-        "status" in error &&
-        error.status === status);
 }
 function canCompensate(pull, identity, policy) {
     const current = closeIdentity(pull);

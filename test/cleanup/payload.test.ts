@@ -4,11 +4,12 @@ import {
   closeIdentity,
   closedDeletionIdentity,
   headRef,
-  payload,
   pullChangedFiles,
   pullNumber,
   sameRepoHeadRef,
 } from "../../src/cleanup/payload.js";
+
+import { payload } from "../../src/github.js";
 
 describe("cleanup payload validation", () => {
   it.each([null, [], "pull", 1])("rejects non-object payload %j", (value) => {

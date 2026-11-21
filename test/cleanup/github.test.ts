@@ -1,132 +1,142 @@
-import { describe, expect, it, vi } from "vitest";
+import { getOctokit } from "@actions/github";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { describe, expect, it } from "vitest";
 
 import type { GitHubClient } from "../../src/contracts.js";
-import { OctokitCleanupApi } from "../../src/cleanup/github.js";
+import { OctokitGitHubApi } from "../../src/github.js";
 
-function client(overrides: Record<string, unknown> = {}): GitHubClient {
-  const rest = {
-    pulls: {
-      list: vi.fn(),
-      get: vi.fn(),
-      update: vi.fn(),
+const apiUrl = "https://api.example.test";
+const repositoryPath = "/repos/owner/repo";
+
+function client(
+  respond: (url: URL, request: RequestInit | undefined) => Response,
+): GitHubClient {
+  return getOctokit("test-token", {
+    baseUrl: apiUrl,
+    request: {
+      fetch: async (url: string, request?: RequestInit) =>
+        respond(new URL(url), request),
     },
-    repos: { compareCommitsWithBasehead: vi.fn() },
-    git: { getTree: vi.fn(), getRef: vi.fn(), createRef: vi.fn() },
-  };
-  return {
-    rest,
-    paginate: {
-      iterator: vi.fn(),
-    },
-    ...overrides,
-  } as unknown as GitHubClient;
+  });
 }
 
-describe("OctokitCleanupApi evidence adapters", () => {
-  it("collects every pagination page", async () => {
-    const github = client();
-    vi.mocked(github.paginate.iterator).mockReturnValue(
-      (async function* () {
-        yield { data: [{ number: 1 }] } as never;
-        yield { data: [{ number: 2 }] } as never;
-      })() as never,
-    );
-    const api = new OctokitCleanupApi(
-      github,
-      "owner",
-      "repo",
-      "token",
-      "https://github.com",
-    );
+function adapter(
+  respond: Parameters<typeof client>[0],
+  serverUrl = "https://github.com",
+): OctokitGitHubApi {
+  return new OctokitGitHubApi(
+    client(respond),
+    "owner",
+    "repo",
+    "test-token",
+    serverUrl,
+  );
+}
+
+function jsonPage(data: unknown, next?: string): Response {
+  return Response.json(
+    data,
+    next === undefined
+      ? {}
+      : {
+          headers: { link: `<${apiUrl}${next}>; rel="next"` },
+        },
+  );
+}
+
+function failed(status: number): Response {
+  return Response.json({ message: `HTTP ${status}` }, { status });
+}
+
+describe("Octokit GitHub adapter", () => {
+  it("returns closed pulls from every linked page, even if a page is short", async () => {
+    const path = `${repositoryPath}/pulls`;
+    const api = adapter((url) => {
+      if (url.pathname !== path || url.searchParams.get("state") !== "closed")
+        return failed(404);
+      switch (url.searchParams.get("page")) {
+        case "2":
+          return jsonPage([], `${path}?state=closed&page=3`);
+        case "3":
+          return jsonPage([{ number: 3 }]);
+        default:
+          return jsonPage([{ number: 1 }], `${path}?state=closed&page=2`);
+      }
+    });
+
     await expect(api.listPulls("closed")).resolves.toEqual([
       { number: 1 },
-      { number: 2 },
+      { number: 3 },
     ]);
-    expect(github.paginate.iterator).toHaveBeenCalledWith(
-      github.rest.pulls.list,
-      expect.objectContaining({ state: "closed", per_page: 100 }),
-    );
   });
 
-  it("rejects malformed objects from pagination", async () => {
-    const github = client();
-    vi.mocked(github.paginate.iterator).mockReturnValue(
-      (async function* () {
-        yield { data: [null] } as never;
-      })() as never,
+  it("rejects malformed pull objects on a later page", async () => {
+    const path = `${repositoryPath}/pulls`;
+    const api = adapter((url) =>
+      url.searchParams.has("page")
+        ? jsonPage([null])
+        : jsonPage([{ number: 1 }], `${path}?page=2`),
     );
-    const api = new OctokitCleanupApi(
-      github,
-      "owner",
-      "repo",
-      "token",
-      "https://github.com",
-    );
+
     await expect(api.listPulls("open")).rejects.toThrow(
       "Expected pull request object",
     );
   });
 
-  it("requires immutable comparison endpoints and a file list", async () => {
-    const github = client();
-    vi.mocked(github.paginate.iterator).mockReturnValue(
-      (async function* () {
-        yield {
-          data: {
-            base_commit: { sha: "base" },
-            commits: [{ sha: "wrong" }],
-            files: [],
-          },
-        } as never;
-      })() as never,
-    );
-    const api = new OctokitCleanupApi(
-      github,
-      "owner",
-      "repo",
-      "token",
-      "https://github.com",
-    );
-    await expect(api.compareFiles("base", "head")).rejects.toThrow(
-      "immutable revisions",
-    );
-  });
+  it.each([
+    ["a different head", "base", "wrong", []],
+    ["a different base", "wrong", "head", []],
+    ["no file list", "base", "head", undefined],
+  ])(
+    "rejects comparison evidence with %s",
+    async (_name, base, head, files) => {
+      const api = adapter(() =>
+        jsonPage({
+          url: `${apiUrl}${repositoryPath}/compare/base...head`,
+          base_commit: { sha: base },
+          commits: [{ sha: head }],
+          files,
+        }),
+      );
 
-  it("validates the final commit page while retaining only first-page files", async () => {
-    const github = client();
-    vi.mocked(github.paginate.iterator).mockReturnValue(
-      (async function* () {
-        yield {
-          data: {
-            base_commit: { sha: "base" },
-            commits: [{ sha: "middle" }],
-            files: [{ filename: "first" }],
-            changed_files: 1,
-            total_commits: 2,
-          },
-        } as never;
-        yield {
-          data: {
-            commits: [{ sha: "head" }],
-            files: [{ filename: "must-not-be-flattened" }],
-          },
-        } as never;
-      })() as never,
-    );
-    const api = new OctokitCleanupApi(
-      github,
-      "owner",
-      "repo",
-      "token",
-      "https://github.com",
-    );
+      await expect(api.compareFiles("base", "head")).rejects.toThrow(
+        files === undefined
+          ? "Expected comparison file list"
+          : "immutable revisions",
+      );
+    },
+  );
+
+  it("validates the final linked comparison page and uses first-page files", async () => {
+    const path = `${repositoryPath}/compare/base...head`;
+    const api = adapter((url) => {
+      if (decodeURIComponent(url.pathname) !== path) return failed(404);
+      if (url.searchParams.get("page") === "2") {
+        return jsonPage({
+          url: `${apiUrl}${path}`,
+          commits: [{ sha: "head" }],
+          files: [{ filename: "must-not-be-flattened" }],
+        });
+      }
+      return jsonPage(
+        {
+          url: `${apiUrl}${path}`,
+          base_commit: { sha: "base" },
+          commits: [{ sha: "middle" }],
+          files: [{ filename: "first" }],
+          total_commits: 2,
+        },
+        `${path}?page=2`,
+      );
+    });
+
     await expect(api.compareFiles("base", "head")).resolves.toEqual([
       { filename: "first" },
     ]);
-    expect(github.paginate.iterator).toHaveBeenCalledWith(
-      github.rest.repos.compareCommitsWithBasehead,
-      expect.objectContaining({ basehead: "base...head", per_page: 100 }),
-    );
   });
 
   it.each([
@@ -134,97 +144,81 @@ describe("OctokitCleanupApi evidence adapters", () => {
     ["non-numeric", "301"],
     ["larger than returned files", 301],
   ])(
-    "fails closed when a capped comparison has %s changed_files",
+    "rejects a capped comparison with %s changed_files",
     async (_name, changedFiles) => {
-      const github = client();
-      vi.mocked(github.paginate.iterator).mockReturnValue(
-        (async function* () {
-          yield {
-            data: {
-              base_commit: { sha: "base" },
-              commits: [{ sha: "head" }],
-              files: Array.from({ length: 300 }, (_, index) => ({
-                filename: `${index}`,
-              })),
-              ...(changedFiles === undefined
-                ? {}
-                : { changed_files: changedFiles }),
-            },
-          } as never;
-        })() as never,
+      const api = adapter(() =>
+        jsonPage({
+          url: `${apiUrl}${repositoryPath}/compare/base...head`,
+          base_commit: { sha: "base" },
+          commits: [{ sha: "head" }],
+          files: Array.from({ length: 300 }, (_, index) => ({
+            filename: `${index}`,
+          })),
+          changed_files: changedFiles,
+        }),
       );
-      const api = new OctokitCleanupApi(
-        github,
-        "owner",
-        "repo",
-        "token",
-        "https://github.com",
-      );
+
       await expect(api.compareFiles("base", "head")).rejects.toThrow(
         "300-file limit",
       );
     },
   );
 
-  it("reopens a pull and returns an authoritative refreshed payload", async () => {
-    const github = client();
-    vi.mocked(github.rest.pulls.update).mockResolvedValue({
-      data: { number: 7, state: "closed" },
-    } as never);
-    vi.mocked(github.rest.pulls.get).mockResolvedValue({
-      data: { number: 7, state: "open" },
-    } as never);
-    const api = new OctokitCleanupApi(
-      github,
-      "owner",
-      "repo",
-      "token",
-      "https://github.com",
-    );
+  it("reopens the selected pull and returns its authoritative refreshed payload", async () => {
+    const pulls = new Map([
+      [7, "closed"],
+      [8, "closed"],
+    ]);
+    const api = adapter((url, request) => {
+      const number = Number(url.pathname.split("/").at(-1));
+      if (!pulls.has(number)) return failed(404);
+      if (request?.method === "PATCH") {
+        const body = JSON.parse(String(request.body)) as Record<
+          string,
+          unknown
+        >;
+        if (body.state !== "open") return failed(422);
+        pulls.set(number, "open");
+        return jsonPage({ number, state: "closed" });
+      }
+      return jsonPage({ number, state: pulls.get(number) });
+    });
+
     await expect(api.reopenPull(7)).resolves.toEqual({
       number: 7,
       state: "open",
     });
-    expect(github.rest.pulls.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        pull_number: 7,
-        state: "open",
-      }),
+    expect(pulls.get(7)).toBe("open");
+    expect(pulls.get(8)).toBe("closed");
+  });
+
+  it.each([
+    { number: 7, state: "closed" },
+    { number: 8, state: "open" },
+  ])("rejects a reopened pull that refreshes as %j", async (refreshed) => {
+    const api = adapter(() => jsonPage(refreshed));
+
+    await expect(api.reopenPull(7)).rejects.toThrow(
+      "Reopen response did not match requested pull",
     );
   });
 
   it("returns undefined for a truncated tree", async () => {
-    const github = client();
-    vi.mocked(github.rest.git.getTree).mockResolvedValue({
-      data: { truncated: true, tree: [] },
-    } as never);
-    const api = new OctokitCleanupApi(
-      github,
-      "owner",
-      "repo",
-      "token",
-      "https://github.com",
-    );
+    const api = adapter(() => jsonPage({ truncated: true, tree: [] }));
+
     await expect(
       api.getTreeEntries(new Set(["a"]), "head"),
     ).resolves.toBeUndefined();
   });
 
-  it("preserves explicit missing paths and records complete tree identities", async () => {
-    const github = client();
-    vi.mocked(github.rest.git.getTree).mockResolvedValue({
-      data: {
+  it("preserves explicit missing paths and complete tree identities", async () => {
+    const api = adapter(() =>
+      jsonPage({
         truncated: false,
         tree: [{ path: "a", mode: "100644", type: "blob", sha: "id" }],
-      },
-    } as never);
-    const api = new OctokitCleanupApi(
-      github,
-      "owner",
-      "repo",
-      "token",
-      "https://github.com",
+      }),
     );
+
     await expect(
       api.getTreeEntries(new Set(["a", "missing"]), "head"),
     ).resolves.toEqual(
@@ -235,83 +229,149 @@ describe("OctokitCleanupApi evidence adapters", () => {
     );
   });
 
-  it("maps a missing ref to undefined but propagates other errors", async () => {
-    const github = client();
-    vi.mocked(github.rest.git.getRef)
-      .mockRejectedValueOnce({ status: 404 })
-      .mockRejectedValueOnce(new Error("timeout"));
-    const api = new OctokitCleanupApi(
-      github,
-      "owner",
-      "repo",
-      "token",
-      "https://github.com",
+  it("rejects a relevant tree entry without a complete identity", async () => {
+    const api = adapter(() =>
+      jsonPage({
+        truncated: false,
+        tree: [{ path: "a", mode: "100644", type: "blob" }],
+      }),
     );
+
+    await expect(api.getTreeEntries(new Set(["a"]), "head")).rejects.toThrow(
+      "Expected a complete Git tree entry",
+    );
+  });
+
+  it("maps a missing ref to undefined and propagates other API errors", async () => {
+    const api = adapter((url) =>
+      failed(decodeURIComponent(url.pathname).endsWith("/missing") ? 404 : 503),
+    );
+
     await expect(api.getRefSha("heads/missing")).resolves.toBeUndefined();
-    await expect(api.getRefSha("heads/branch")).rejects.toThrow("timeout");
-  });
-
-  it("restores a ref with the requested full ref and revision", async () => {
-    const github = client();
-    vi.mocked(github.rest.git.createRef).mockResolvedValue({
-      data: { ref: "refs/heads/branch", object: { sha: "head" } },
-    } as never);
-    const api = new OctokitCleanupApi(
-      github,
-      "owner",
-      "repo",
-      "token",
-      "https://github.com",
-    );
-
-    await expect(
-      api.restoreRef("heads/branch", "head"),
-    ).resolves.toBeUndefined();
-    expect(github.rest.git.createRef).toHaveBeenCalledWith({
-      owner: "owner",
-      repo: "repo",
-      ref: "refs/heads/branch",
-      sha: "head",
+    await expect(api.getRefSha("heads/branch")).rejects.toMatchObject({
+      status: 503,
     });
   });
 
-  it("accepts a create conflict only when a fresh read finds the ref", async () => {
-    const github = client();
-    vi.mocked(github.rest.git.createRef).mockRejectedValue({ status: 422 });
-    vi.mocked(github.rest.git.getRef).mockResolvedValue({
-      data: { object: { sha: "concurrent" } },
-    } as never);
-    const api = new OctokitCleanupApi(
-      github,
-      "owner",
-      "repo",
-      "token",
-      "https://github.com",
+  it.each([404, 410])(
+    "distinguishes a vanished pull (%i) from a required lookup",
+    async (status) => {
+      const api = adapter(() => failed(status));
+
+      await expect(api.findPull(7)).resolves.toBeUndefined();
+      await expect(api.getPull(7)).rejects.toMatchObject({ status });
+    },
+  );
+
+  it("propagates transient errors from optional pull lookups", async () => {
+    const api = adapter(() => failed(503));
+
+    await expect(api.findPull(7)).rejects.toMatchObject({ status: 503 });
+  });
+
+  it("restores a ref at the requested revision without overwriting existing refs", async () => {
+    const refs = new Map([["refs/heads/concurrent", "new"]]);
+    const api = adapter((url, request) => {
+      if (
+        url.pathname === `${repositoryPath}/git/refs` &&
+        request?.method === "POST"
+      ) {
+        const body = JSON.parse(String(request.body)) as {
+          ref: string;
+          sha: string;
+        };
+        if (!body.ref.startsWith("refs/heads/") || refs.has(body.ref))
+          return failed(422);
+        refs.set(body.ref, body.sha);
+        return jsonPage({ ref: body.ref, object: { sha: body.sha } });
+      }
+      const ref = decodeURIComponent(
+        url.pathname.slice(`${repositoryPath}/git/ref/`.length),
+      );
+      const sha = refs.get(`refs/${ref}`);
+      return sha === undefined ? failed(404) : jsonPage({ object: { sha } });
+    });
+
+    await api.restoreRef("heads/missing", "head");
+    await api.restoreRef("heads/concurrent", "head");
+
+    expect(refs.get("refs/heads/missing")).toBe("head");
+    expect(refs.get("refs/heads/concurrent")).toBe("new");
+  });
+
+  it("propagates a restore validation error when the ref is still absent", async () => {
+    const api = adapter((_url, request) =>
+      failed(request?.method === "POST" ? 422 : 404),
     );
 
-    await expect(
-      api.restoreRef("heads/branch", "head"),
-    ).resolves.toBeUndefined();
-    expect(github.rest.git.getRef).toHaveBeenCalledWith({
-      owner: "owner",
-      repo: "repo",
-      ref: "heads/branch",
+    await expect(api.restoreRef("heads/branch", "head")).rejects.toMatchObject({
+      status: 422,
     });
   });
 
-  it("propagates create conflicts when the ref is still absent", async () => {
-    const github = client();
-    const conflict = { status: 422 };
-    vi.mocked(github.rest.git.createRef).mockRejectedValue(conflict);
-    vi.mocked(github.rest.git.getRef).mockRejectedValue({ status: 404 });
-    const api = new OctokitCleanupApi(
-      github,
-      "owner",
-      "repo",
-      "token",
-      "https://github.com",
-    );
+  it("lease-deletes only the expected revision in a real remote repository", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prek-github-adapter-"));
+    const remote = join(directory, "owner", "repo.git");
+    const workspace = join(directory, "work");
+    const ref = "refs/heads/update";
+    const run = (...args: string[]): string =>
+      execFileSync("git", args, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
 
-    await expect(api.restoreRef("heads/branch", "head")).rejects.toBe(conflict);
+    try {
+      await mkdir(join(directory, "owner"));
+      run("init", "--bare", remote);
+      run("init", workspace);
+      const commit = (): string => {
+        run(
+          "-C",
+          workspace,
+          "-c",
+          "user.name=Test",
+          "-c",
+          "user.email=test@example.invalid",
+          "-c",
+          "commit.gpgsign=false",
+          "-c",
+          "core.hooksPath=/dev/null",
+          "commit",
+          "--allow-empty",
+          "-m",
+          "Update",
+        );
+        return run("-C", workspace, "rev-parse", "HEAD");
+      };
+      const older = commit();
+      const newer = commit();
+      run("-C", workspace, "push", remote, `HEAD:${ref}`);
+
+      const readRemote = (): string | undefined => {
+        const listing = run("ls-remote", remote, ref);
+        return listing === "" ? undefined : listing.split("\t")[0];
+      };
+      const api = adapter(() => {
+        const sha = readRemote();
+        return sha === undefined ? failed(404) : jsonPage({ object: { sha } });
+      }, pathToFileURL(directory).href);
+
+      await expect(api.deleteRef("heads/update", older)).resolves.toBe(
+        "lease-rejected",
+      );
+      expect(readRemote()).toBe(newer);
+
+      await expect(api.deleteRef("heads/update", newer)).resolves.toBe(
+        "deleted",
+      );
+      expect(readRemote()).toBeUndefined();
+
+      await expect(api.deleteRef("heads/update", newer)).resolves.toBe(
+        "already-absent",
+      );
+      expect(readRemote()).toBeUndefined();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

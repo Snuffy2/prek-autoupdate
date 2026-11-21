@@ -1,20 +1,10 @@
+import type { Payload } from "../github.js";
 import {
   isOwnedPull,
   isSameRepository,
   type OwnershipPolicy,
 } from "../ownership.js";
-import type {
-  ClosedPullCandidate,
-  CompensatablePull,
-  Payload,
-} from "./model.js";
-
-export function payload(value: unknown, description: string): Payload {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new TypeError(`Expected ${description}`);
-  }
-  return value as Payload;
-}
+import type { ClosedPullCandidate, CompensatablePull } from "./model.js";
 
 export function pullNumber(pull: Payload): number {
   const value = pull.number;
