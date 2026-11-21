@@ -1,4 +1,5 @@
 import * as core from "@actions/core";
+import { getOctokit } from "@actions/github";
 import { execFile } from "node:child_process";
 import {
   access,
@@ -42,7 +43,7 @@ vi.mock("../../src/environment.js", async (importOriginal) => {
 import { cleanupWithApi } from "../../src/cleanup/index.js";
 import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
 import { deleteBranch } from "../../src/git.js";
-import type { NewPull } from "../../src/github.js";
+import { OctokitGitHubApi, type NewPull } from "../../src/github.js";
 import { InMemoryGitHub } from "../support/in-memory-github.js";
 import { BODY_MARKER } from "../../src/ownership.js";
 import { runUpdate } from "../../src/update/index.js";
@@ -309,82 +310,63 @@ describe("update publication races", () => {
 
   it("enables auto-merge after proving the exact created pull revision", async () => {
     const harness = await makeHarness();
-    const execution: ActionExecution = {
-      ...harness.execution,
-      inputs: { ...harness.execution.inputs, autoMerge: true },
-    };
-    harness.graphql.mockImplementation(
-      async (_document: string, variables: Record<string, unknown>) => {
-        const headRefOid = await remoteSha(harness.remote);
-        const enabling = "expectedHeadOid" in variables;
-        const pullRequest = autoMergePull(headRefOid, enabling);
-        return enabling
-          ? {
-              enablePullRequestAutoMerge: {
-                pullRequest: {
-                  id: pullRequest.id,
-                  autoMergeRequest: pullRequest.autoMergeRequest,
-                },
-              },
-            }
-          : { repository: { pullRequest } };
-      },
-    );
 
-    await expect(runUpdate(execution, harness.api)).resolves.toEqual({
+    await expect(runWithAutoMerge(harness)).resolves.toEqual({
       operation: "created",
       pullRequestNumber: 42,
     });
+    expect(harness.api.pulls.get(42)?.body).toContain(BODY_MARKER);
+    expect(harness.api.autoMergeRequests.get(42)).toBe("SQUASH");
+    await expectPublishedPull(harness);
+  });
 
-    expect(harness.api.pulls.get(42)?.body).toContain(
-      "Automated update of `prek` hooks.",
-    );
-    expect(harness.graphql).toHaveBeenCalledWith(
-      expect.any(String),
-      expect.objectContaining({
-        expectedHeadOid: await remoteSha(harness.remote),
-      }),
-    );
+  it("preserves an existing squash auto-merge request", async () => {
+    const harness = await makeHarness({ existing: true });
+    harness.api.autoMergeRequests.set(42, "SQUASH");
+
+    await expect(runWithAutoMerge(harness)).resolves.toEqual({
+      operation: "updated",
+      pullRequestNumber: 42,
+    });
+    expect(harness.api.autoMergeRequests.get(42)).toBe("SQUASH");
+    await expectPublishedPull(harness);
   });
 
   it.each([
-    ["a prefix-only head branch", { headRefName: "chore/prek-old" }],
-    ["a closed pull request", { state: "CLOSED" }],
+    {
+      reason: "a prefix-only head branch",
+      patch: { headRef: "chore/prek-old" },
+    },
+    { reason: "a closed pull request", patch: { state: "closed" } },
+    { reason: "a different pull request number", patch: { number: 43 } },
+    { reason: "a changed head revision", patch: { headSha: "other-revision" } },
+    { reason: "an unowned pull request", patch: { user: { login: "other" } } },
   ])(
-    "preserves the published update without enabling auto-merge on %s",
-    async (_reason, overrides) => {
+    "preserves the published update when it observes $reason",
+    async ({ patch }) => {
       const harness = await makeHarness();
       let publishedSha: string | undefined;
-      let autoMergeEnabled = false;
-      harness.graphql.mockImplementation(
-        async (_document: string, variables: Record<string, unknown>) => {
-          publishedSha = await remoteSha(harness.remote);
-          if ("expectedHeadOid" in variables) autoMergeEnabled = true;
-          return {
-            repository: {
-              pullRequest: { ...autoMergePull(publishedSha), ...overrides },
-            },
-          };
-        },
-      );
+      harness.api.transitions.beforeReadAutoMergePull = async (number) => {
+        publishedSha = await remoteSha(harness.remote);
+        const { headRef, headSha, ...metadata } = patch;
+        const head = harness.api.pulls.get(number)?.head as ReturnType<
+          typeof ownedPull
+        >["head"];
+        harness.api.patchPull(number, {
+          ...metadata,
+          head: { ...head, ref: headRef ?? head.ref, sha: headSha ?? head.sha },
+        });
+      };
 
-      await expect(
-        runUpdate(
-          {
-            ...harness.execution,
-            inputs: { ...harness.execution.inputs, autoMerge: true },
-          },
-          harness.api,
-        ),
-      ).rejects.toMatchObject({
+      await expect(runWithAutoMerge(harness)).rejects.toMatchObject({
         publishedPullRequest: { operation: "created", pullRequestNumber: 42 },
         cause: expect.objectContaining({
           message:
             "Pull request changed before squash auto-merge could be enabled",
         }),
       });
-      expect(autoMergeEnabled).toBe(false);
-      expect(await remoteSha(harness.remote)).toBe(publishedSha);
+      expect(harness.api.autoMergeRequests.get(42)).toBeUndefined();
+      await expectPublishedPull(harness, patch.state ?? "open", publishedSha);
     },
   );
 
@@ -392,32 +374,130 @@ describe("update publication races", () => {
     { existing: false, operation: "created" },
     { existing: true, operation: "updated" },
   ] as const)(
-    "reports the $operation pull when auto-merge fails",
+    "reports and preserves the $operation pull when auto-merge fails",
     async ({ existing, operation }) => {
       const harness = await makeHarness({ existing });
-      const execution: ActionExecution = {
-        ...harness.execution,
-        inputs: { ...harness.execution.inputs, autoMerge: true },
+      harness.api.transitions.beforeEnableAutoMerge = () => {
+        throw new Error("auto-merge rejected");
       };
-      harness.graphql
-        .mockImplementationOnce(async () => ({
-          repository: {
-            pullRequest: autoMergePull(await remoteSha(harness.remote)),
-          },
-        }))
-        .mockRejectedValueOnce(new Error("auto-merge rejected"));
 
-      const error = await runUpdate(execution, harness.api).catch(
-        (caught: unknown) => caught,
-      );
-
-      expect(error).toMatchObject({
+      await expect(runWithAutoMerge(harness)).rejects.toMatchObject({
         publishedPullRequest: { operation, pullRequestNumber: 42 },
+        cause: expect.objectContaining({ message: "auto-merge rejected" }),
       });
+      expect(harness.api.autoMergeRequests.get(42)).toBeUndefined();
+      await expectPublishedPull(harness);
     },
   );
 
-  it("does not attempt auto-merge when the token is not a PAT", async () => {
+  it("disables auto-merge when ownership changes after enabling it", async () => {
+    const harness = await makeHarness();
+    harness.api.transitions.afterEnableAutoMerge = (number) => {
+      harness.api.patchPull(number, { base: { ref: "unexpected-base" } });
+    };
+
+    await expectUnconfirmedAutoMerge(harness);
+    expect(harness.api.autoMergeRequests.get(42)).toBeUndefined();
+    expect(harness.api.pulls.get(42)?.base).toEqual({ ref: "unexpected-base" });
+    expectDisableWarning();
+    await expectPublishedPull(harness);
+  });
+
+  it("traverses ownership label pages before and after enabling auto-merge", async () => {
+    const harness = await makeHarness();
+    useAutoMergeHttp(harness);
+
+    await expect(runWithAutoMerge(harness)).resolves.toEqual({
+      operation: "created",
+      pullRequestNumber: 42,
+    });
+    expect(harness.api.autoMergeRequests.get(42)).toBe("SQUASH");
+    await expectPublishedPull(harness);
+  });
+
+  it.each([
+    {
+      reason: "a null mutation payload",
+      enableData: { enablePullRequestAutoMerge: null },
+    },
+    { reason: "a missing mutation payload", enableData: {} },
+    {
+      reason: "a missing auto-merge request",
+      enableData: {
+        enablePullRequestAutoMerge: {
+          pullRequest: { id: "PR_42", autoMergeRequest: null },
+        },
+      },
+    },
+    {
+      reason: "a mismatched mutation pull request",
+      enableData: {
+        enablePullRequestAutoMerge: {
+          pullRequest: {
+            id: "PR_41",
+            autoMergeRequest: { mergeMethod: "SQUASH" },
+          },
+        },
+      },
+    },
+    { reason: "a mismatched pull on revalidation", revalidatedId: "PR_41" },
+    {
+      reason: "a changed pull number on the last revalidation page",
+      lastPageNumber: 43,
+    },
+  ])(
+    "disables only the published pull's auto-merge after $reason",
+    async (options) => {
+      const harness = await makeHarness();
+      const unrelated = { ...ownedPull(harness.oldSha), number: 41 };
+      harness.api.pulls.set(41, {
+        ...unrelated,
+        head: { ...unrelated.head, ref: "unrelated" },
+      });
+      harness.api.autoMergeRequests.set(41, "SQUASH");
+      useAutoMergeHttp(harness, options);
+
+      await expectUnconfirmedAutoMerge(harness);
+      expect(harness.api.autoMergeRequests.get(42)).toBeUndefined();
+      expect(harness.api.autoMergeRequests.get(41)).toBe("SQUASH");
+      expectDisableWarning();
+      await expectPublishedPull(harness);
+    },
+  );
+
+  it("reports when GitHub does not confirm that auto-merge was disabled", async () => {
+    const harness = await makeHarness();
+    useAutoMergeHttp(harness, {
+      confirmDisable: false,
+    });
+    harness.api.transitions.afterEnableAutoMerge = (number) => {
+      harness.api.patchPull(number, { base: { ref: "unexpected-base" } });
+    };
+
+    await expect(runWithAutoMerge(harness)).rejects.toMatchObject({
+      publishedPullRequest: { operation: "created", pullRequestNumber: 42 },
+      cause: expect.objectContaining({
+        message:
+          "Auto-merge revalidation failed and GitHub did not confirm that the request was disabled",
+        cause: expect.objectContaining({
+          errors: [
+            expect.objectContaining({
+              message: expect.stringContaining(
+                "did not confirm squash auto-merge",
+              ),
+            }),
+            expect.objectContaining({
+              message: "GitHub did not confirm that auto-merge was disabled",
+            }),
+          ],
+        }),
+      }),
+    });
+    expect(harness.api.autoMergeRequests.get(42)).toBe("SQUASH");
+    await expectPublishedPull(harness);
+  });
+
+  it("skips auto-merge when the token did not authenticate as a user", async () => {
     const harness = await makeHarness();
     const execution: ActionExecution = {
       ...harness.execution,
@@ -432,11 +512,11 @@ describe("update publication races", () => {
       operation: "created",
       pullRequestNumber: 42,
     });
-
-    expect(harness.graphql).not.toHaveBeenCalled();
+    expect(harness.api.autoMergeRequests.get(42)).toBeUndefined();
     expect(core.warning).toHaveBeenCalledWith(
       expect.stringMatching(/Skipping auto-merge.*provide a PAT/u),
     );
+    await expectPublishedPull(harness);
   });
 
   it("preserves the pushed branch when create has an ambiguous outcome", async () => {
@@ -1065,10 +1145,8 @@ async function makeHarness(options: HarnessOptions = {}) {
       api.refs.set("heads/main", "DRIFT");
     };
   }
-  const graphql = vi.fn();
-  const client = { graphql } as unknown as GitHubClient;
   const execution = {
-    client,
+    client: {} as GitHubClient,
     context: {
       authenticatedLogin: "github-actions[bot]",
       tokenAuthenticatedAsUser: true,
@@ -1111,7 +1189,6 @@ async function makeHarness(options: HarnessOptions = {}) {
   return {
     api,
     execution: { ...execution, api },
-    graphql,
     log,
     oldSha,
     prek,
@@ -1234,28 +1311,170 @@ function restError(message: string, status: number): Error {
   return Object.assign(new Error(message), { status });
 }
 
-function autoMergePull(headRefOid: string, enabled = false) {
-  return {
-    autoMergeRequest: enabled
-      ? {
-          enabledAt: "2026-08-23T12:00:00Z",
-          mergeMethod: "SQUASH",
+async function expectPublishedPull(
+  { api, remote }: Awaited<ReturnType<typeof makeHarness>>,
+  state = "open",
+  sha?: string,
+): Promise<void> {
+  const pull = api.pulls.get(42);
+  expect(pull).toMatchObject({ state });
+  const revision = await remoteSha(remote);
+  expect(revision).not.toBe("");
+  expect(revision).toBe(sha ?? (pull?.head as { sha: string }).sha);
+}
+
+interface AutoMergeHttpOptions {
+  readonly enableData?: object;
+  readonly revalidatedId?: string;
+  readonly lastPageNumber?: number;
+  readonly confirmDisable?: boolean;
+}
+
+// Run the three auto-merge operations through real Octokit against a simulated
+// GraphQL endpoint backed by the same repository state as the REST operations.
+function useAutoMergeHttp(
+  { api, execution }: Awaited<ReturnType<typeof makeHarness>>,
+  options: AutoMergeHttpOptions = {},
+): void {
+  const getAutoMergePull = api.getAutoMergePull.bind(api);
+  const enableSquashAutoMerge = api.enableSquashAutoMerge.bind(api);
+  const disableAutoMerge = api.disableAutoMerge.bind(api);
+  const client = getOctokit(execution.inputs.token, {
+    request: {
+      fetch: async (url: string, request?: RequestInit): Promise<Response> => {
+        if (new URL(url).pathname !== "/graphql" || request?.method !== "POST")
+          return Response.json(
+            { message: "Unexpected request" },
+            { status: 404 },
+          );
+        const { query, variables } = JSON.parse(String(request.body)) as {
+          query: string;
+          variables: {
+            number: number;
+            pullRequestId: string;
+            expectedHeadOid: string;
+            labelsCursor: string | null;
+          };
+        };
+        const id = variables.pullRequestId;
+        const autoMergeRequest = (mergeMethod: string | undefined) =>
+          mergeMethod === undefined
+            ? null
+            : { mergeMethod, enabledAt: "2026-08-23T12:00:00Z" };
+
+        if (query.includes("enablePullRequestAutoMerge(")) {
+          await enableSquashAutoMerge(id, variables.expectedHeadOid);
+          return Response.json({
+            data: options.enableData ?? {
+              enablePullRequestAutoMerge: {
+                pullRequest: {
+                  id,
+                  autoMergeRequest: autoMergeRequest("SQUASH"),
+                },
+              },
+            },
+          });
         }
-      : null,
-    author: { login: "github-actions[bot]" },
-    baseRefName: "main",
-    body: BODY_MARKER,
-    headRefOid,
-    headRefName: "chore/prek-updates",
-    headRepository: { nameWithOwner: "owner/repo" },
-    id: "PR_node",
-    labels: {
-      nodes: [{ name: "dependencies" }],
-      pageInfo: { hasNextPage: false, endCursor: null },
+        if (query.includes("disablePullRequestAutoMerge(")) {
+          if (options.confirmDisable !== false) await disableAutoMerge(id);
+          return Response.json({
+            data: {
+              disablePullRequestAutoMerge: {
+                pullRequest: {
+                  id,
+                  autoMergeRequest: autoMergeRequest(
+                    api.autoMergeRequests.get(Number(id.slice(3))),
+                  ),
+                },
+              },
+            },
+          });
+        }
+
+        const pull = await getAutoMergePull(variables.number);
+        if (pull === null)
+          return Response.json({ data: { repository: { pullRequest: null } } });
+        const cursor =
+          pull.mergeMethod === undefined ? "before-enable" : "after-enable";
+        const firstPage = variables.labelsCursor === null;
+        if (!firstPage && variables.labelsCursor !== cursor)
+          return Response.json({
+            errors: [{ message: "Invalid label cursor" }],
+          });
+        return Response.json({
+          data: {
+            repository: {
+              pullRequest: {
+                id:
+                  pull.mergeMethod === undefined
+                    ? pull.id
+                    : (options.revalidatedId ?? pull.id),
+                number:
+                  !firstPage && pull.mergeMethod !== undefined
+                    ? (options.lastPageNumber ?? pull.number)
+                    : pull.number,
+                state: pull.state,
+                headRefOid: pull.headSha,
+                author: { login: pull.author },
+                body: pull.body,
+                headRefName: pull.headRef,
+                headRepository: { nameWithOwner: pull.headRepository },
+                baseRefName: pull.baseRef,
+                autoMergeRequest: autoMergeRequest(pull.mergeMethod),
+                labels: {
+                  nodes: firstPage
+                    ? [{ name: "unrelated" }]
+                    : pull.labels.map((name) => ({ name })),
+                  pageInfo: {
+                    hasNextPage: firstPage,
+                    endCursor: firstPage ? cursor : null,
+                  },
+                },
+              },
+            },
+          },
+        });
+      },
     },
-    number: 42,
-    state: "OPEN",
-  };
+  });
+  const production = new OctokitGitHubApi(
+    client,
+    execution.context.owner,
+    execution.context.repository,
+    execution.inputs.token,
+    execution.context.serverUrl,
+  );
+  api.getAutoMergePull = production.getAutoMergePull.bind(production);
+  api.enableSquashAutoMerge = production.enableSquashAutoMerge.bind(production);
+  api.disableAutoMerge = production.disableAutoMerge.bind(production);
+}
+
+function runWithAutoMerge(harness: Awaited<ReturnType<typeof makeHarness>>) {
+  return runUpdate(
+    {
+      ...harness.execution,
+      inputs: { ...harness.execution.inputs, autoMerge: true },
+    },
+    harness.api,
+  );
+}
+
+async function expectUnconfirmedAutoMerge(
+  harness: Awaited<ReturnType<typeof makeHarness>>,
+): Promise<void> {
+  await expect(runWithAutoMerge(harness)).rejects.toMatchObject({
+    publishedPullRequest: { operation: "created", pullRequestNumber: 42 },
+    cause: expect.objectContaining({
+      message:
+        "GitHub did not confirm squash auto-merge for the exact pull-request revision",
+    }),
+  });
+}
+
+function expectDisableWarning(): void {
+  expect(core.warning).toHaveBeenCalledWith(
+    "Disabled an auto-merge request after pull-request ownership revalidation failed",
+  );
 }
 
 function ownedPull(sha: string) {

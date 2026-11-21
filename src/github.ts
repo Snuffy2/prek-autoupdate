@@ -23,6 +23,91 @@ export interface PullResponse {
   readonly etag: string | undefined;
 }
 
+export interface AutoMergePull {
+  readonly id: string;
+  readonly number: number;
+  readonly state: string;
+  readonly headSha: string;
+  readonly author: string | undefined;
+  readonly body: string;
+  readonly headRef: string;
+  readonly headRepository: string | undefined;
+  readonly baseRef: string;
+  readonly labels: readonly string[];
+  readonly mergeMethod: string | undefined;
+}
+
+interface AutoMergePullPage {
+  readonly author: { readonly login: string } | null;
+  readonly baseRefName: string;
+  readonly body: string;
+  readonly headRefName: string;
+  readonly headRepository: { readonly nameWithOwner: string } | null;
+  readonly id: string;
+  readonly headRefOid: string;
+  readonly labels: {
+    readonly nodes: readonly { readonly name: string }[];
+    readonly pageInfo: {
+      readonly hasNextPage: boolean;
+      readonly endCursor: string | null;
+    };
+  };
+  readonly number: number;
+  readonly state: string;
+  readonly autoMergeRequest: {
+    readonly enabledAt: string;
+    readonly mergeMethod: string;
+  } | null;
+}
+
+interface AutoMergeQueryResult {
+  readonly repository: {
+    readonly pullRequest: AutoMergePullPage | null;
+  } | null;
+}
+
+interface AutoMergeMutationResult {
+  readonly enablePullRequestAutoMerge: {
+    readonly pullRequest: {
+      readonly id: string;
+      readonly autoMergeRequest: {
+        readonly enabledAt: string;
+        readonly mergeMethod: string;
+      } | null;
+    } | null;
+  } | null;
+}
+
+interface AutoMergeDisableMutationResult {
+  readonly disablePullRequestAutoMerge: {
+    readonly pullRequest: Pick<
+      AutoMergePullPage,
+      "autoMergeRequest" | "id"
+    > | null;
+  } | null;
+}
+
+const AUTO_MERGE_PULL_REQUEST_QUERY = `query PrekAutoupdatePullRequest($owner: String!, $repository: String!, $number: Int!, $labelsCursor: String) {
+  repository(owner: $owner, name: $repository) {
+    pullRequest(number: $number) {
+      id
+      number
+      author { login }
+      baseRefName
+      body
+      headRefName
+      headRefOid
+      headRepository { nameWithOwner }
+      labels(first: 100, after: $labelsCursor) {
+        nodes { name }
+        pageInfo { hasNextPage endCursor }
+      }
+      state
+      autoMergeRequest { enabledAt mergeMethod }
+    }
+  }
+}`;
+
 export interface GitHubApi {
   listPulls(
     state: "closed" | "open" | "all",
@@ -41,6 +126,10 @@ export interface GitHubApi {
   findPull(number: number): Promise<Payload | undefined>;
   closePull(number: number): Promise<Payload>;
   reopenPull(number: number): Promise<Payload>;
+  getAutoMergePull(number: number): Promise<AutoMergePull | null>;
+  /** Report whether GitHub confirmed the mutation for this pull. */
+  enableSquashAutoMerge(id: string, expectedHeadOid: string): Promise<boolean>;
+  disableAutoMerge(id: string): Promise<void>;
   compareFiles(baseSha: string, headSha: string): Promise<Payload[]>;
   getTreeEntries(
     paths: ReadonlySet<string>,
@@ -164,6 +253,101 @@ export class OctokitGitHubApi implements GitHubApi {
     if (reopened.number !== number || reopened.state !== "open")
       throw new TypeError("Reopen response did not match requested pull");
     return reopened;
+  }
+
+  public async getAutoMergePull(number: number): Promise<AutoMergePull | null> {
+    const first = await this.getAutoMergePullPage(number, null);
+    if (first === null) return null;
+
+    const labels = first.labels.nodes.map((label) => label.name);
+    let current = first;
+    const seenCursors = new Set<string>();
+    while (current.labels.pageInfo.hasNextPage) {
+      const cursor = current.labels.pageInfo.endCursor;
+      if (cursor === null || seenCursors.has(cursor)) {
+        throw new Error(
+          "GitHub returned an invalid pull-request label pagination cursor",
+        );
+      }
+      seenCursors.add(cursor);
+      const next = await this.getAutoMergePullPage(number, cursor);
+      if (next === null || !sameAutoMergePullMetadata(first, next)) {
+        throw new Error(
+          "Pull request metadata changed while reading ownership labels",
+        );
+      }
+      labels.push(...next.labels.nodes.map((label) => label.name));
+      current = next;
+    }
+    return {
+      id: first.id,
+      number: first.number,
+      state: first.state,
+      headSha: first.headRefOid,
+      author: first.author?.login,
+      body: first.body,
+      headRef: first.headRefName,
+      headRepository: first.headRepository?.nameWithOwner,
+      baseRef: first.baseRefName,
+      labels,
+      mergeMethod: first.autoMergeRequest?.mergeMethod,
+    };
+  }
+
+  public async enableSquashAutoMerge(
+    id: string,
+    expectedHeadOid: string,
+  ): Promise<boolean> {
+    const enabled = await this.client.graphql<AutoMergeMutationResult>(
+      `mutation EnablePrekAutoupdateAutoMerge($pullRequestId: ID!, $expectedHeadOid: GitObjectID!) {
+      enablePullRequestAutoMerge(input: {
+        pullRequestId: $pullRequestId
+        mergeMethod: SQUASH
+        expectedHeadOid: $expectedHeadOid
+      }) {
+        pullRequest {
+          id
+          autoMergeRequest { enabledAt mergeMethod }
+        }
+      }
+    }`,
+      { pullRequestId: id, expectedHeadOid },
+    );
+    const result = enabled?.enablePullRequestAutoMerge?.pullRequest;
+    return (
+      result?.id === id && result.autoMergeRequest?.mergeMethod === "SQUASH"
+    );
+  }
+
+  public async disableAutoMerge(pullRequestId: string): Promise<void> {
+    const disabled = await this.client.graphql<AutoMergeDisableMutationResult>(
+      `mutation DisableUnverifiedPrekAutoupdateAutoMerge($pullRequestId: ID!) {
+        disablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId }) {
+          pullRequest {
+            id
+            autoMergeRequest { enabledAt mergeMethod }
+          }
+        }
+      }`,
+      { pullRequestId },
+    );
+    const result = disabled.disablePullRequestAutoMerge?.pullRequest;
+    if (result?.id !== pullRequestId || result.autoMergeRequest !== null) {
+      throw new Error("GitHub did not confirm that auto-merge was disabled");
+    }
+  }
+
+  private async getAutoMergePullPage(
+    number: number,
+    labelsCursor: string | null,
+  ): Promise<AutoMergePullPage | null> {
+    const observed = await this.client.graphql<AutoMergeQueryResult>(
+      AUTO_MERGE_PULL_REQUEST_QUERY,
+      { owner: this.owner, repository: this.repo, number, labelsCursor },
+    );
+    const pull = observed.repository?.pullRequest ?? null;
+    if (pull !== null) assertCompleteAutoMergePullPage(pull);
+    return pull;
   }
 
   public async compareFiles(
@@ -302,6 +486,63 @@ export class OctokitGitHubApi implements GitHubApi {
       throw error;
     }
   }
+}
+
+function assertCompleteAutoMergePullPage(pull: AutoMergePullPage): void {
+  const labels = (pull as unknown as { readonly labels?: unknown }).labels;
+  if (typeof labels !== "object" || labels === null) {
+    throw new Error("GitHub returned a pull request without labels");
+  }
+  const labelPage = labels as {
+    readonly nodes?: unknown;
+    readonly pageInfo?: unknown;
+  };
+  if (
+    !Array.isArray(labelPage.nodes) ||
+    !labelPage.nodes.every(
+      (label: unknown) =>
+        typeof label === "object" &&
+        label !== null &&
+        typeof (label as { readonly name?: unknown }).name === "string",
+    )
+  ) {
+    throw new Error("GitHub returned malformed pull-request labels");
+  }
+  if (typeof labelPage.pageInfo !== "object" || labelPage.pageInfo === null) {
+    throw new Error(
+      "GitHub returned a pull request without label pagination information",
+    );
+  }
+  const pageInfo = labelPage.pageInfo as {
+    readonly hasNextPage?: unknown;
+    readonly endCursor?: unknown;
+  };
+  if (
+    typeof pageInfo.hasNextPage !== "boolean" ||
+    (pageInfo.endCursor !== null && typeof pageInfo.endCursor !== "string")
+  ) {
+    throw new Error("GitHub returned malformed label pagination information");
+  }
+}
+
+function sameAutoMergePullMetadata(
+  left: AutoMergePullPage,
+  right: AutoMergePullPage,
+): boolean {
+  return (
+    left.id === right.id &&
+    left.number === right.number &&
+    left.author?.login === right.author?.login &&
+    left.baseRefName === right.baseRefName &&
+    left.body === right.body &&
+    left.headRefName === right.headRefName &&
+    left.headRefOid === right.headRefOid &&
+    left.headRepository?.nameWithOwner ===
+      right.headRepository?.nameWithOwner &&
+    left.state === right.state &&
+    left.autoMergeRequest?.enabledAt === right.autoMergeRequest?.enabledAt &&
+    left.autoMergeRequest?.mergeMethod === right.autoMergeRequest?.mergeMethod
+  );
 }
 
 export async function ensureLabelExists(

@@ -36032,6 +36032,26 @@ async function pushDeletion({ remote, ref, expectedSha, readRef }, directory, ti
     }
 }
 
+const AUTO_MERGE_PULL_REQUEST_QUERY = `query PrekAutoupdatePullRequest($owner: String!, $repository: String!, $number: Int!, $labelsCursor: String) {
+  repository(owner: $owner, name: $repository) {
+    pullRequest(number: $number) {
+      id
+      number
+      author { login }
+      baseRefName
+      body
+      headRefName
+      headRefOid
+      headRepository { nameWithOwner }
+      labels(first: 100, after: $labelsCursor) {
+        nodes { name }
+        pageInfo { hasNextPage endCursor }
+      }
+      state
+      autoMergeRequest { enabledAt mergeMethod }
+    }
+  }
+}`;
 class OctokitGitHubApi {
     client;
     owner;
@@ -36124,6 +36144,77 @@ class OctokitGitHubApi {
         if (reopened.number !== number || reopened.state !== "open")
             throw new TypeError("Reopen response did not match requested pull");
         return reopened;
+    }
+    async getAutoMergePull(number) {
+        const first = await this.getAutoMergePullPage(number, null);
+        if (first === null)
+            return null;
+        const labels = first.labels.nodes.map((label) => label.name);
+        let current = first;
+        const seenCursors = new Set();
+        while (current.labels.pageInfo.hasNextPage) {
+            const cursor = current.labels.pageInfo.endCursor;
+            if (cursor === null || seenCursors.has(cursor)) {
+                throw new Error("GitHub returned an invalid pull-request label pagination cursor");
+            }
+            seenCursors.add(cursor);
+            const next = await this.getAutoMergePullPage(number, cursor);
+            if (next === null || !sameAutoMergePullMetadata(first, next)) {
+                throw new Error("Pull request metadata changed while reading ownership labels");
+            }
+            labels.push(...next.labels.nodes.map((label) => label.name));
+            current = next;
+        }
+        return {
+            id: first.id,
+            number: first.number,
+            state: first.state,
+            headSha: first.headRefOid,
+            author: first.author?.login,
+            body: first.body,
+            headRef: first.headRefName,
+            headRepository: first.headRepository?.nameWithOwner,
+            baseRef: first.baseRefName,
+            labels,
+            mergeMethod: first.autoMergeRequest?.mergeMethod,
+        };
+    }
+    async enableSquashAutoMerge(id, expectedHeadOid) {
+        const enabled = await this.client.graphql(`mutation EnablePrekAutoupdateAutoMerge($pullRequestId: ID!, $expectedHeadOid: GitObjectID!) {
+      enablePullRequestAutoMerge(input: {
+        pullRequestId: $pullRequestId
+        mergeMethod: SQUASH
+        expectedHeadOid: $expectedHeadOid
+      }) {
+        pullRequest {
+          id
+          autoMergeRequest { enabledAt mergeMethod }
+        }
+      }
+    }`, { pullRequestId: id, expectedHeadOid });
+        const result = enabled?.enablePullRequestAutoMerge?.pullRequest;
+        return (result?.id === id && result.autoMergeRequest?.mergeMethod === "SQUASH");
+    }
+    async disableAutoMerge(pullRequestId) {
+        const disabled = await this.client.graphql(`mutation DisableUnverifiedPrekAutoupdateAutoMerge($pullRequestId: ID!) {
+        disablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId }) {
+          pullRequest {
+            id
+            autoMergeRequest { enabledAt mergeMethod }
+          }
+        }
+      }`, { pullRequestId });
+        const result = disabled.disablePullRequestAutoMerge?.pullRequest;
+        if (result?.id !== pullRequestId || result.autoMergeRequest !== null) {
+            throw new Error("GitHub did not confirm that auto-merge was disabled");
+        }
+    }
+    async getAutoMergePullPage(number, labelsCursor) {
+        const observed = await this.client.graphql(AUTO_MERGE_PULL_REQUEST_QUERY, { owner: this.owner, repository: this.repo, number, labelsCursor });
+        const pull = observed.repository?.pullRequest ?? null;
+        if (pull !== null)
+            assertCompleteAutoMergePullPage(pull);
+        return pull;
     }
     async compareFiles(baseSha, headSha) {
         let data;
@@ -36238,6 +36329,41 @@ class OctokitGitHubApi {
             throw error;
         }
     }
+}
+function assertCompleteAutoMergePullPage(pull) {
+    const labels = pull.labels;
+    if (typeof labels !== "object" || labels === null) {
+        throw new Error("GitHub returned a pull request without labels");
+    }
+    const labelPage = labels;
+    if (!Array.isArray(labelPage.nodes) ||
+        !labelPage.nodes.every((label) => typeof label === "object" &&
+            label !== null &&
+            typeof label.name === "string")) {
+        throw new Error("GitHub returned malformed pull-request labels");
+    }
+    if (typeof labelPage.pageInfo !== "object" || labelPage.pageInfo === null) {
+        throw new Error("GitHub returned a pull request without label pagination information");
+    }
+    const pageInfo = labelPage.pageInfo;
+    if (typeof pageInfo.hasNextPage !== "boolean" ||
+        (pageInfo.endCursor !== null && typeof pageInfo.endCursor !== "string")) {
+        throw new Error("GitHub returned malformed label pagination information");
+    }
+}
+function sameAutoMergePullMetadata(left, right) {
+    return (left.id === right.id &&
+        left.number === right.number &&
+        left.author?.login === right.author?.login &&
+        left.baseRefName === right.baseRefName &&
+        left.body === right.body &&
+        left.headRefName === right.headRefName &&
+        left.headRefOid === right.headRefOid &&
+        left.headRepository?.nameWithOwner ===
+            right.headRepository?.nameWithOwner &&
+        left.state === right.state &&
+        left.autoMergeRequest?.enabledAt === right.autoMergeRequest?.enabledAt &&
+        left.autoMergeRequest?.mergeMethod === right.autoMergeRequest?.mergeMethod);
 }
 async function ensureLabelExists(lookup, create) {
     try {
@@ -40570,7 +40696,7 @@ async function runUpdate(execution, api = new OctokitGitHubApi(execution.client,
             catch (error) {
                 await rollbackCreatedPullRequest(api, execution, pullNumber, newSha, error);
             }
-            await enableAutoMergeForPublishedPull(execution, "created", pullNumber, newSha);
+            await enableAutoMergeForPublishedPull(api, execution, "created", pullNumber, newSha);
             return { operation: "created", pullRequestNumber: pullNumber };
         }
         try {
@@ -40587,7 +40713,7 @@ async function runUpdate(execution, api = new OctokitGitHubApi(execution.client,
             });
             const updated = pullFromData(response.data);
             if (isExactUpdatedPull(execution, updated, remote.ownedPullRequest.number, newSha, body)) {
-                await enableAutoMergeForPublishedPull(execution, "updated", remote.ownedPullRequest.number, newSha);
+                await enableAutoMergeForPublishedPull(api, execution, "updated", remote.ownedPullRequest.number, newSha);
                 return {
                     operation: "updated",
                     pullRequestNumber: remote.ownedPullRequest.number,
@@ -40605,7 +40731,7 @@ async function runUpdate(execution, api = new OctokitGitHubApi(execution.client,
         try {
             verified = pullFromData(await api.getPull(remote.ownedPullRequest.number));
             if (isExactUpdatedPull(execution, verified, remote.ownedPullRequest.number, newSha, body)) {
-                await enableAutoMergeForPublishedPull(execution, "updated", remote.ownedPullRequest.number, newSha);
+                await enableAutoMergeForPublishedPull(api, execution, "updated", remote.ownedPullRequest.number, newSha);
                 return {
                     operation: "updated",
                     pullRequestNumber: remote.ownedPullRequest.number,
@@ -40646,27 +40772,7 @@ async function runUpdate(execution, api = new OctokitGitHubApi(execution.client,
         reportCleanupFailures(updateFailed, updateError, cleanupErrors);
     }
 }
-const AUTO_MERGE_PULL_REQUEST_QUERY = `query PrekAutoupdatePullRequest($owner: String!, $repository: String!, $number: Int!, $labelsCursor: String) {
-  repository(owner: $owner, name: $repository) {
-    pullRequest(number: $number) {
-      id
-      number
-      author { login }
-      baseRefName
-      body
-      headRefName
-      headRefOid
-      headRepository { nameWithOwner }
-      labels(first: 100, after: $labelsCursor) {
-        nodes { name }
-        pageInfo { hasNextPage endCursor }
-      }
-      state
-      autoMergeRequest { enabledAt mergeMethod }
-    }
-  }
-}`;
-async function enableAutoMergeIfRequested(execution, pullNumber, expectedHeadOid) {
+async function enableAutoMergeIfRequested(api, execution, pullNumber, expectedHeadOid) {
     if (!execution.inputs.autoMerge) {
         return;
     }
@@ -40674,48 +40780,34 @@ async function enableAutoMergeIfRequested(execution, pullNumber, expectedHeadOid
         warning("Skipping auto-merge because the configured token did not authenticate with GET /user; provide a PAT through the token input");
         return;
     }
-    await enablePullRequestAutoMerge(execution, pullNumber, expectedHeadOid);
+    await enablePullRequestAutoMerge(api, execution, pullNumber, expectedHeadOid);
 }
-async function enableAutoMergeForPublishedPull(execution, operation, pullNumber, expectedHeadOid) {
+async function enableAutoMergeForPublishedPull(api, execution, operation, pullNumber, expectedHeadOid) {
     try {
-        await enableAutoMergeIfRequested(execution, pullNumber, expectedHeadOid);
+        await enableAutoMergeIfRequested(api, execution, pullNumber, expectedHeadOid);
     }
     catch (error) {
         throw new PublishedPullRequestError(operation, pullNumber, error);
     }
 }
 /** Enable squash auto-merge only for the exact pull-request revision published. */
-async function enablePullRequestAutoMerge(execution, pullNumber, expectedHeadOid) {
-    const pull = await fetchAutoMergePullRequest(execution, pullNumber);
+async function enablePullRequestAutoMerge(api, execution, pullNumber, expectedHeadOid) {
+    const pull = await api.getAutoMergePull(pullNumber);
     if (pull === null ||
-        pull === undefined ||
         !isOwnedAutoMergePull(execution, pull, pullNumber, expectedHeadOid)) {
         throw new Error("Pull request changed before squash auto-merge could be enabled");
     }
-    if (pull.autoMergeRequest?.mergeMethod === "SQUASH") {
+    if (pull.mergeMethod === "SQUASH") {
         info(`Squash auto-merge is already enabled for pull request #${pullNumber}.`);
         return;
     }
-    const enabled = await execution.client.graphql(`mutation EnablePrekAutoupdateAutoMerge($pullRequestId: ID!, $expectedHeadOid: GitObjectID!) {
-      enablePullRequestAutoMerge(input: {
-        pullRequestId: $pullRequestId
-        mergeMethod: SQUASH
-        expectedHeadOid: $expectedHeadOid
-      }) {
-        pullRequest {
-          id
-          autoMergeRequest { enabledAt mergeMethod }
-        }
-      }
-    }`, { pullRequestId: pull.id, expectedHeadOid });
-    const result = enabled?.enablePullRequestAutoMerge?.pullRequest;
+    const enabled = await api.enableSquashAutoMerge(pull.id, expectedHeadOid);
     let confirmed = false;
-    if (result?.id === pull.id &&
-        result.autoMergeRequest?.mergeMethod === "SQUASH") {
+    if (enabled) {
         try {
-            const completeResult = await fetchAutoMergePullRequest(execution, pullNumber);
+            const completeResult = await api.getAutoMergePull(pullNumber);
             confirmed =
-                completeResult !== null &&
+                completeResult?.id === pull.id &&
                     isOwnedAutoMergePull(execution, completeResult, pullNumber, expectedHeadOid);
         }
         catch {
@@ -40725,7 +40817,8 @@ async function enablePullRequestAutoMerge(execution, pullNumber, expectedHeadOid
     if (!confirmed) {
         const validationError = new Error("GitHub did not confirm squash auto-merge for the exact pull-request revision");
         try {
-            await disableUnverifiedAutoMerge(execution, pull.id);
+            await api.disableAutoMerge(pull.id);
+            warning("Disabled an auto-merge request after pull-request ownership revalidation failed");
         }
         catch (disableError) {
             throw new Error("Auto-merge revalidation failed and GitHub did not confirm that the request was disabled", { cause: new AggregateError([validationError, disableError]) });
@@ -40734,110 +40827,11 @@ async function enablePullRequestAutoMerge(execution, pullNumber, expectedHeadOid
     }
     info(`Enabled squash auto-merge for pull request #${pullNumber}.`);
 }
-async function fetchAutoMergePullRequestPage(execution, pullNumber, labelsCursor) {
-    const observed = await execution.client.graphql(AUTO_MERGE_PULL_REQUEST_QUERY, {
-        owner: execution.context.owner,
-        repository: execution.context.repository,
-        number: pullNumber,
-        labelsCursor,
-    });
-    const pull = observed.repository?.pullRequest ?? null;
-    if (pull !== null) {
-        assertCompleteAutoMergePullRequestPage(pull);
-    }
-    return pull;
-}
-async function fetchAutoMergePullRequest(execution, pullNumber) {
-    const first = await fetchAutoMergePullRequestPage(execution, pullNumber, null);
-    if (first === null) {
-        return null;
-    }
-    return completeAutoMergePullRequest(execution, pullNumber, first);
-}
-async function completeAutoMergePullRequest(execution, pullNumber, first) {
-    const labels = [...first.labels.nodes];
-    let current = first;
-    const seenCursors = new Set();
-    while (current.labels.pageInfo.hasNextPage) {
-        const cursor = current.labels.pageInfo.endCursor;
-        if (cursor === null || seenCursors.has(cursor)) {
-            throw new Error("GitHub returned an invalid pull-request label pagination cursor");
-        }
-        seenCursors.add(cursor);
-        const next = await fetchAutoMergePullRequestPage(execution, pullNumber, cursor);
-        if (next === null || !sameAutoMergePullMetadata(first, next)) {
-            throw new Error("Pull request metadata changed while reading ownership labels");
-        }
-        labels.push(...next.labels.nodes);
-        current = next;
-    }
-    return {
-        ...current,
-        labels: { ...current.labels, nodes: labels },
-    };
-}
-function assertCompleteAutoMergePullRequestPage(pull) {
-    const labels = pull.labels;
-    if (typeof labels !== "object" || labels === null) {
-        throw new Error("GitHub returned a pull request without labels");
-    }
-    const labelPage = labels;
-    if (!Array.isArray(labelPage.nodes) ||
-        !labelPage.nodes.every((label) => typeof label === "object" &&
-            label !== null &&
-            typeof label.name === "string")) {
-        throw new Error("GitHub returned malformed pull-request labels");
-    }
-    if (typeof labelPage.pageInfo !== "object" || labelPage.pageInfo === null) {
-        throw new Error("GitHub returned a pull request without label pagination information");
-    }
-    const pageInfo = labelPage.pageInfo;
-    if (typeof pageInfo.hasNextPage !== "boolean" ||
-        (pageInfo.endCursor !== null && typeof pageInfo.endCursor !== "string")) {
-        throw new Error("GitHub returned malformed label pagination information");
-    }
-}
-function sameAutoMergePullMetadata(left, right) {
-    return (left.id === right.id &&
-        left.number === right.number &&
-        left.author?.login === right.author?.login &&
-        left.baseRefName === right.baseRefName &&
-        left.body === right.body &&
-        left.headRefName === right.headRefName &&
-        left.headRefOid === right.headRefOid &&
-        left.headRepository?.nameWithOwner ===
-            right.headRepository?.nameWithOwner &&
-        left.state === right.state &&
-        left.autoMergeRequest?.enabledAt === right.autoMergeRequest?.enabledAt &&
-        left.autoMergeRequest?.mergeMethod === right.autoMergeRequest?.mergeMethod);
-}
-async function disableUnverifiedAutoMerge(execution, pullRequestId) {
-    const disabled = await execution.client.graphql(`mutation DisableUnverifiedPrekAutoupdateAutoMerge($pullRequestId: ID!) {
-        disablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId }) {
-          pullRequest {
-            id
-            autoMergeRequest { enabledAt mergeMethod }
-          }
-        }
-      }`, { pullRequestId });
-    const result = disabled.disablePullRequestAutoMerge?.pullRequest;
-    if (result?.id !== pullRequestId || result.autoMergeRequest !== null) {
-        throw new Error("GitHub did not confirm that auto-merge was disabled");
-    }
-    warning("Disabled an auto-merge request after pull-request ownership revalidation failed");
-}
 function isOwnedAutoMergePull(execution, pull, pullNumber, expectedHeadOid) {
     return (pull.number === pullNumber &&
         pull.state === "OPEN" &&
-        pull.headRefOid === expectedHeadOid &&
-        isOwnedPull({
-            author: pull.author?.login,
-            body: pull.body,
-            headRef: pull.headRefName,
-            headRepository: pull.headRepository?.nameWithOwner,
-            baseRef: pull.baseRefName,
-            labels: pull.labels.nodes.map((label) => label.name),
-        }, ownershipPolicy(execution), "exact-update-branch"));
+        pull.headSha === expectedHeadOid &&
+        isOwnedPull(pull, ownershipPolicy(execution), "exact-update-branch"));
 }
 function reportCleanupFailures(updateFailed, updateError, cleanupErrors) {
     if (cleanupErrors.length === 0) {

@@ -1,6 +1,7 @@
 import type { DeleteRefOutcome } from "../../src/git.js";
 import {
   ensureLabelExists,
+  type AutoMergePull,
   type GitHubApi,
   type NewPull,
   type Payload,
@@ -28,6 +29,9 @@ interface Transitions {
   beforeReadPull?: Transition<number>;
   afterReadPull?: Transition<Payload | undefined>;
   afterClosePull?: Transition<number>;
+  beforeReadAutoMergePull?: Transition<number>;
+  beforeEnableAutoMerge?: Transition<number>;
+  afterEnableAutoMerge?: Transition<number>;
   beforeReopenPull?: Transition<number>;
   afterCompare?: Transition<{ baseSha: string; headSha: string }>;
   afterReadRef?: Transition<string>;
@@ -38,6 +42,7 @@ interface Transitions {
 
 /** Repository state and external changes that can occur at an API boundary. */
 export class InMemoryGitHub implements GitHubApi {
+  public readonly autoMergeRequests = new Map<number, string>();
   public readonly pulls = new Map<number, Payload>();
   public readonly labels = new Map<string, string>();
   public readonly pullEtags = new Map<number, string>();
@@ -179,6 +184,62 @@ export class InMemoryGitHub implements GitHubApi {
     const pull = structuredClone(this.pulls.get(number));
     await this.transitions.afterReadPull?.(pull);
     return pull;
+  }
+
+  public async getAutoMergePull(number: number): Promise<AutoMergePull | null> {
+    await this.transitions.beforeReadAutoMergePull?.(number);
+    const pull = this.pulls.get(number);
+    if (pull === undefined) return null;
+
+    const head = pull.head as {
+      ref: string;
+      sha: string;
+      repo?: { full_name: string };
+    };
+    return {
+      id: `PR_${number}`,
+      number: pull.number as number,
+      state: String(pull.state).toUpperCase(),
+      headSha: head.sha,
+      author: (pull.user as { login: string } | null)?.login,
+      body: pull.body as string,
+      headRef: head.ref,
+      headRepository: head.repo?.full_name,
+      baseRef: (pull.base as { ref: string }).ref,
+      labels: (pull.labels as { name: string }[]).map(({ name }) => name),
+      mergeMethod: this.autoMergeRequests.get(number),
+    };
+  }
+
+  public async enableSquashAutoMerge(
+    id: string,
+    expectedHeadOid: string,
+  ): Promise<boolean> {
+    const number = this.autoMergePullNumber(id);
+    await this.transitions.beforeEnableAutoMerge?.(number);
+    const pull = this.requirePull(number);
+    if (
+      pull.state !== "open" ||
+      (pull.head as { sha: string }).sha !== expectedHeadOid
+    )
+      throw new Error("Auto-merge requires an open pull at the expected head");
+    if (this.autoMergeRequests.has(number))
+      throw new Error("Auto-merge is already enabled");
+    this.autoMergeRequests.set(number, "SQUASH");
+    await this.transitions.afterEnableAutoMerge?.(number);
+    return true;
+  }
+
+  public async disableAutoMerge(id: string): Promise<void> {
+    const number = this.autoMergePullNumber(id);
+    this.autoMergeRequests.delete(number);
+  }
+
+  private autoMergePullNumber(id: string): number {
+    const number = Number(id.slice("PR_".length));
+    if (id !== `PR_${number}` || !this.pulls.has(number))
+      throw new Error(`Pull ${id} not found`);
+    return number;
   }
 
   public async closePull(number: number): Promise<Payload> {
