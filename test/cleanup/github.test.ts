@@ -4,10 +4,37 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import type * as fsPromises from "node:fs/promises";
 import type { GitHubClient } from "../../src/contracts.js";
 import { OctokitGitHubApi } from "../../src/github.js";
+
+const cleanupFault = vi.hoisted(() => ({
+  enabled: false,
+  injected: false,
+  path: undefined as string | undefined,
+}));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof fsPromises>();
+  return {
+    ...actual,
+    rm: async (...arguments_: Parameters<typeof actual.rm>) => {
+      const [path] = arguments_;
+      const pathText = String(path);
+      if (cleanupFault.enabled && pathText.includes("/prek-autoupdate-git-")) {
+        cleanupFault.enabled = false;
+        cleanupFault.injected = true;
+        cleanupFault.path = pathText;
+        throw Object.assign(new Error("injected temporary directory failure"), {
+          code: "EBUSY",
+        });
+      }
+      return await actual.rm(...arguments_);
+    },
+  };
+});
 
 const apiUrl = "https://api.example.test";
 const repositoryPath = "/repos/owner/repo";
@@ -139,30 +166,20 @@ describe("Octokit GitHub adapter", () => {
     ]);
   });
 
-  it.each([
-    ["missing", undefined],
-    ["non-numeric", "301"],
-    ["larger than returned files", 301],
-  ])(
-    "rejects a capped comparison with %s changed_files",
-    async (_name, changedFiles) => {
-      const api = adapter(() =>
-        jsonPage({
-          url: `${apiUrl}${repositoryPath}/compare/base...head`,
-          base_commit: { sha: "base" },
-          commits: [{ sha: "head" }],
-          files: Array.from({ length: 300 }, (_, index) => ({
-            filename: `${index}`,
-          })),
-          changed_files: changedFiles,
-        }),
-      );
+  it("returns GitHub's exact 300-file comparison without a changed_files field", async () => {
+    const api = adapter(() =>
+      jsonPage({
+        url: `${apiUrl}${repositoryPath}/compare/base...head`,
+        base_commit: { sha: "base" },
+        commits: [{ sha: "head" }],
+        files: Array.from({ length: 300 }, (_, index) => ({
+          filename: `${index}`,
+        })),
+      }),
+    );
 
-      await expect(api.compareFiles("base", "head")).rejects.toThrow(
-        "300-file limit",
-      );
-    },
-  );
+    await expect(api.compareFiles("base", "head")).resolves.toHaveLength(300);
+  });
 
   it("reopens the selected pull and returns its authoritative refreshed payload", async () => {
     const pulls = new Map([
@@ -344,6 +361,11 @@ describe("Octokit GitHub adapter", () => {
     const run = (...args: string[]): string =>
       execFileSync("git", args, {
         encoding: "utf8",
+        env: {
+          ...process.env,
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+        },
         stdio: ["ignore", "pipe", "pipe"],
       }).trim();
 
@@ -388,9 +410,11 @@ describe("Octokit GitHub adapter", () => {
       );
       expect(readRemote()).toBe(newer);
 
+      cleanupFault.enabled = true;
       await expect(api.deleteRef("heads/update", newer)).resolves.toBe(
         "deleted",
       );
+      expect(cleanupFault.injected).toBe(true);
       expect(readRemote()).toBeUndefined();
 
       await expect(api.deleteRef("heads/update", newer)).resolves.toBe(
@@ -398,6 +422,12 @@ describe("Octokit GitHub adapter", () => {
       );
       expect(readRemote()).toBeUndefined();
     } finally {
+      cleanupFault.enabled = false;
+      if (cleanupFault.path !== undefined) {
+        await rm(cleanupFault.path, { recursive: true, force: true });
+        cleanupFault.path = undefined;
+      }
+      cleanupFault.injected = false;
       await rm(directory, { recursive: true, force: true });
     }
   });

@@ -43,6 +43,7 @@ vi.mock("../../src/environment.js", async (importOriginal) => {
 import { cleanupWithApi } from "../../src/cleanup/index.js";
 import {
   PublishedPullRequestError,
+  PublishedUpdateError,
   type ActionExecution,
   type GitHubClient,
 } from "../../src/contracts.js";
@@ -151,7 +152,7 @@ describe("update publication races", () => {
     expect(await readdir(scratch)).toEqual([]);
   });
 
-  it.each([
+  it.for([
     { scenario: "a path containing a newline", scratchName: "worktree\ntmp" },
     {
       scenario: "legacy Git",
@@ -171,9 +172,20 @@ describe("update publication races", () => {
     },
   ])(
     "preserves a registered worktree after persistent removal failure with $scenario",
-    async ({ scratchName, inspectionFails, legacyGit, ambiguousPath }) => {
+    async (
+      { scratchName, inspectionFails, legacyGit, ambiguousPath },
+      context,
+    ) => {
       const { execution, initial, workspace } =
         await makeWorktreeHarness(scratchName);
+      if (
+        scratchName.includes("\n") &&
+        !(await supportsNulWorktreeListing(workspace))
+      ) {
+        context.skip(
+          "the installed Git lacks NUL-delimited worktree listing, which is required to inspect newline paths safely",
+        );
+      }
       process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "always";
       if (inspectionFails) {
         process.env.TEST_GIT_FAIL_WORKTREE_LIST = "1";
@@ -337,6 +349,40 @@ describe("update publication races", () => {
     expect(await remoteSha(harness.remote)).toBe(movedSha);
   });
 
+  it("preserves the pushed branch when a different open pull uses it", async () => {
+    const harness = await makeHarness();
+    harness.api.transitions.beforeCreatePull = async (request) => {
+      await seedConcurrentPull(harness, request, 77);
+      harness.api.patchPull(77, {
+        body: "human-authored pull",
+        title: "Human pull",
+        user: { login: "another-actor" },
+      });
+      throw restError("already exists", 422);
+    };
+
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
+      /pull request #77 already uses update branch .*branch was preserved/u,
+    );
+    expect(await remoteSha(harness.remote)).not.toBe("");
+    expect(harness.api.pulls.get(77)).toMatchObject({
+      state: "open",
+      user: { login: "another-actor" },
+    });
+  });
+
+  it("restores an observed closed-owner branch after definite create failure", async () => {
+    const harness = await makeHarness({ existing: true, closedExisting: true });
+    harness.api.transitions.beforeCreatePull = () => {
+      throw restError("bad request", 422);
+    };
+
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
+      /creation failed.*branch was lease-rolled back/u,
+    );
+    expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
+  });
+
   it("recovers an exact concurrent pull even when create reports 422", async () => {
     const harness = await makeHarness();
     harness.api.transitions.beforeCreatePull = async (request) => {
@@ -378,6 +424,33 @@ describe("update publication races", () => {
     expect(harness.api.autoMergeRequests.get(42)).toBe("SQUASH");
     await expectPublishedPull(harness);
   });
+
+  it.each([
+    ["disabled", undefined],
+    ["changed to another method", "REBASE"],
+  ])(
+    "reports when a fresh auto-merge read shows it was $0",
+    async (_reason, observedMethod) => {
+      const harness = await makeHarness();
+      const disable = vi.spyOn(harness.api, "disableAutoMerge");
+      harness.api.transitions.afterEnableAutoMerge = (number) => {
+        if (observedMethod === undefined)
+          harness.api.autoMergeRequests.delete(number);
+        else harness.api.autoMergeRequests.set(number, observedMethod);
+      };
+
+      await expect(runWithAutoMerge(harness)).rejects.toMatchObject({
+        publishedPullRequest: { operation: "created", pullRequestNumber: 42 },
+        cause: expect.objectContaining({
+          message:
+            "GitHub did not confirm squash auto-merge for the exact pull-request revision",
+        }),
+      });
+      expect(disable).not.toHaveBeenCalled();
+      expect(harness.api.autoMergeRequests.get(42)).toBe(observedMethod);
+      await expectPublishedPull(harness);
+    },
+  );
 
   it.each([
     {
@@ -480,6 +553,48 @@ describe("update publication races", () => {
       expect(harness.api.pulls.get(43)?.state).toBe("closed");
     },
   );
+
+  it("preserves a successful publication result when worktree cleanup fails", async () => {
+    const harness = await makeHarness();
+    process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "always";
+
+    const error = await runWithAutoMerge(harness).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(PublishedUpdateError);
+    expect(error).toMatchObject({
+      publishedPullRequest: { operation: "created", pullRequestNumber: 42 },
+      cause: expect.objectContaining({
+        errors: [expect.objectContaining({ message: expect.any(String) })],
+      }),
+    });
+    await expectPublishedPull(harness);
+  });
+
+  it("preserves a published error result when worktree cleanup also fails", async () => {
+    const harness = await makeHarness();
+    harness.api.transitions.beforeEnableAutoMerge = () => {
+      throw new Error("auto-merge rejected");
+    };
+    process.env.TEST_GIT_FAIL_WORKTREE_REMOVE = "always";
+
+    const error = await runWithAutoMerge(harness).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(PublishedUpdateError);
+    expect(error).toMatchObject({
+      publishedPullRequest: { operation: "created", pullRequestNumber: 42 },
+      cause: expect.objectContaining({
+        errors: [
+          expect.any(PublishedPullRequestError),
+          expect.objectContaining({ message: expect.any(String) }),
+        ],
+      }),
+    });
+    await expectPublishedPull(harness);
+  });
 
   it("disables auto-merge when ownership changes after enabling it", async () => {
     const harness = await makeHarness();
@@ -1066,6 +1181,29 @@ describe("no-change close compensation", () => {
     expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
   });
 
+  it("does not reopen a later close event using the first close ETag", async () => {
+    const harness = await makeHarness({ existing: true, noChange: true });
+    process.env.TEST_GIT_FAIL_PUSH = "1";
+    harness.api.transitions.beforeUpdatePull = ({ number, changes }) => {
+      if ("state" in changes && changes.state === "open") {
+        harness.api.patchPull(number, {
+          state: "closed",
+          closed_at: "2026-07-28T00:00:02Z",
+          updated_at: "2026-07-28T00:00:02Z",
+        });
+      }
+    };
+
+    await expect(runUpdate(harness.execution, harness.api)).rejects.toThrow(
+      /was not reopened/u,
+    );
+    expect(harness.api.pulls.get(42)).toMatchObject({
+      state: "closed",
+      closed_at: "2026-07-28T00:00:02Z",
+    });
+    expect(await remoteSha(harness.remote)).toBe(harness.oldSha);
+  });
+
   it.each([
     ["changed timestamp", { updated_at: "2026-07-28T00:00:02Z" }],
     ["changed closed_at", { closed_at: "2026-07-28T00:00:02Z" }],
@@ -1377,18 +1515,55 @@ async function pushes(log: string): Promise<string[]> {
 }
 
 async function worktrees(workspace: string): Promise<string[]> {
-  const result = await exec("git", [
-    "-C",
-    workspace,
-    "worktree",
-    "list",
-    "--porcelain",
-    "-z",
-  ]);
-  return result.stdout
-    .split("\0")
-    .filter((entry) => entry.startsWith("worktree "))
-    .map((entry) => entry.slice("worktree ".length));
+  const listing = await listWorktrees(workspace);
+  return listing.paths;
+}
+
+async function supportsNulWorktreeListing(workspace: string): Promise<boolean> {
+  return (await listWorktrees(workspace)).nulDelimited;
+}
+
+async function listWorktrees(
+  workspace: string,
+): Promise<{ paths: string[]; nulDelimited: boolean }> {
+  const args = ["-C", workspace, "worktree", "list", "--porcelain"];
+  try {
+    const result = await exec("git", [...args, "-z"]);
+    return {
+      paths: result.stdout
+        .split("\0")
+        .filter((entry) => entry.startsWith("worktree "))
+        .map((entry) => entry.slice("worktree ".length)),
+      nulDelimited: true,
+    };
+  } catch (error) {
+    if (!isUnsupportedWorktreeListZ(error)) throw error;
+    const result = await exec("git", args);
+    const lines = result.stdout.split("\n");
+    if (lines.some((line) => line.startsWith('worktree "'))) {
+      throw new Error(
+        "Git worktree list without -z cannot safely represent quoted or newline-containing paths",
+        { cause: error },
+      );
+    }
+    return {
+      paths: lines
+        .filter((line) => line.startsWith("worktree "))
+        .map((line) => line.slice("worktree ".length)),
+      nulDelimited: false,
+    };
+  }
+}
+
+function isUnsupportedWorktreeListZ(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const candidate = error as { code?: unknown; stderr?: unknown };
+  return (
+    candidate.code === 129 &&
+    typeof candidate.stderr === "string" &&
+    /^error: unknown switch `z'\r?\n/u.test(candidate.stderr) &&
+    /(?:usage:|or:) git worktree list/mu.test(candidate.stderr)
+  );
 }
 
 async function remoteSha(remote: string): Promise<string> {

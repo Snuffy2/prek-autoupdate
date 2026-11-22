@@ -127,7 +127,17 @@ export async function deleteBranch(
     await runGit(["init", "--quiet", directory], CLEANUP_TIMEOUT_MS);
     return await pushDeletion(deletion, directory, CLEANUP_TIMEOUT_MS);
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    try {
+      await rm(directory, { recursive: true, force: true });
+    } catch {
+      try {
+        core.warning(
+          "Temporary Git directory cleanup failed; credentials were not included in output",
+        );
+      } catch {
+        // Reporting a cleanup failure must not replace the Git operation result.
+      }
+    }
   }
 }
 

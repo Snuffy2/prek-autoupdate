@@ -211,28 +211,31 @@ describe("cleanupUpdateBranches safety behavior", () => {
     },
   );
 
-  it("preserves a reused branch when closed pulls yield conflicting revision evidence", async () => {
-    const github = seed(
-      closed(),
-      closed({
-        number: 2,
-        head: { ref: branch, sha: "other", repo: { full_name: repository } },
-      }),
-    );
-    github.transitions.afterReadRef = (ref) => {
-      if (ref !== headRef) return;
-      if (github.refs.get(ref) === "head") github.refs.set(ref, "other");
-      else {
-        github.refs.set(ref, "head");
-        delete github.transitions.afterReadRef;
-      }
-    };
+  it.each(["head", "other"] as const)(
+    "preserves a reused branch when conflicting evidence leaves it at %s",
+    async (finalRevision) => {
+      const github = seed(
+        closed(),
+        closed({
+          number: 2,
+          head: { ref: branch, sha: "other", repo: { full_name: repository } },
+        }),
+      );
+      github.transitions.afterReadRef = (ref) => {
+        if (ref !== headRef) return;
+        if (github.refs.get(ref) === "head") github.refs.set(ref, "other");
+        else {
+          if (finalRevision === "head") github.refs.set(ref, "head");
+          delete github.transitions.afterReadRef;
+        }
+      };
 
-    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
-      unchanged,
-    );
-    expect(github.refs.get(headRef)).toBe("head");
-  });
+      await expect(
+        cleanupWithApi(github, execution, defaults),
+      ).resolves.toEqual(unchanged);
+      expect(github.refs.get(headRef)).toBe(finalRevision);
+    },
+  );
 
   it("closes a zero-change obsolete pull with a stable snapshot", async () => {
     const github = zeroChange();
@@ -247,7 +250,9 @@ describe("cleanupUpdateBranches safety behavior", () => {
 
   it("reopens the exact close when the branch revision no longer matches", async () => {
     const github = zeroChange();
-    github.refs.set(headRef, "moved");
+    github.transitions.afterClosePull = () => {
+      github.refs.set(headRef, "moved");
+    };
 
     await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
       unchanged,
@@ -289,6 +294,19 @@ describe("cleanupUpdateBranches safety behavior", () => {
       expect(github.pulls.get(1)?.state).toBe("open");
     },
   );
+
+  it("skips an over-limit comparison truncated to 300 files", async () => {
+    const github = seed(pull({ changed_files: 301 }));
+    github.comparisons.set(
+      "base...head",
+      Array.from({ length: 300 }, (_, index) => ({ filename: `${index}` })),
+    );
+
+    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.pulls.get(1)?.state).toBe("open");
+  });
 
   it.each([
     ["matching", "closed", "old-id", [1]],
@@ -516,9 +534,13 @@ describe("cleanupUpdateBranches safety behavior", () => {
 
   it("blocks deletion when a pull opens after the closed candidate is checked", async () => {
     const github = seed(closed());
+    let deleted = false;
     github.transitions.afterReadPull = (snapshot) => {
       if (snapshot?.state === "closed")
         github.pulls.set(9, pull({ number: 9 }));
+    };
+    github.transitions.afterDeleteRef = () => {
+      deleted = true;
     };
 
     await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
@@ -526,6 +548,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
     );
     expect(github.refs.get(headRef)).toBe("head");
     expect(github.pulls.get(9)?.state).toBe("open");
+    expect(deleted).toBe(false);
   });
 
   function openAfterDeletion(): InMemoryGitHub {

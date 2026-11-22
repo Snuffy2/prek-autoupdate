@@ -50,6 +50,7 @@ export class InMemoryGitHub implements GitHubApi {
   public readonly comparisons = new Map<string, readonly Payload[]>();
   public readonly trees = new Map<string, TreeEntries | undefined>();
   public readonly transitions: Transitions = {};
+  private pullRevision = 0;
 
   public constructor(
     pulls: readonly (Payload & { number: number })[] = [],
@@ -62,6 +63,7 @@ export class InMemoryGitHub implements GitHubApi {
 
   public patchPull(number: number, patch: Payload): void {
     this.pulls.set(number, { ...this.requirePull(number), ...patch });
+    this.pullEtags.set(number, `"pull-${number}-${++this.pullRevision}"`);
   }
 
   public async listPulls(
@@ -108,13 +110,19 @@ export class InMemoryGitHub implements GitHubApi {
       updated_at: "2026-01-01T00:00:00Z",
       closed_at: null,
     });
+    this.pullEtags.set(number, `"pull-${number}-${++this.pullRevision}"`);
     return number;
   }
 
   public async getPullWithEtag(number: number): Promise<PullResponse> {
+    await this.transitions.beforeReadPull?.(number);
+    const data = structuredClone(this.pulls.get(number));
+    const etag = this.pullEtags.get(number);
+    await this.transitions.afterReadPull?.(data);
+    if (data === undefined) throw new Error(`Pull #${number} not found`);
     return {
-      data: await this.getPull(number),
-      etag: this.pullEtags.get(number),
+      data,
+      etag,
     };
   }
 
@@ -129,17 +137,24 @@ export class InMemoryGitHub implements GitHubApi {
     }
 
     let data: Payload;
-    let etag = this.pullEtags.get(number);
+    let etag: string | undefined;
     if ("state" in changes && changes.state === "closed") {
-      etag = '"close"';
-      this.pullEtags.set(number, etag);
-      data = await this.closePull(number);
+      const closedAt = "2026-01-01T00:01:00Z";
+      this.patchPull(number, {
+        state: "closed",
+        closed_at: closedAt,
+        updated_at: closedAt,
+      });
+      etag = this.pullEtags.get(number);
+      data = structuredClone(this.requirePull(number));
+      await this.transitions.afterClosePull?.(number);
     } else {
       this.patchPull(
         number,
         "state" in changes ? { ...changes, closed_at: null } : { ...changes },
       );
       data = structuredClone(this.requirePull(number));
+      etag = this.pullEtags.get(number);
     }
     const response = { data, etag };
     await this.transitions.afterUpdatePull?.(response);

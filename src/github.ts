@@ -387,17 +387,6 @@ export class OctokitGitHubApi implements GitHubApi {
     }
     if (!Array.isArray(data.files))
       throw new TypeError("Expected comparison file list");
-    const changedFiles = data.changed_files;
-    if (
-      data.files.length === 300 &&
-      (typeof changedFiles !== "number" ||
-        !Number.isInteger(changedFiles) ||
-        changedFiles < 0 ||
-        changedFiles > data.files.length)
-    )
-      throw new TypeError(
-        "Comparison file list exceeded GitHub's 300-file limit",
-      );
     return data.files.map((file) => payload(file, "comparison file"));
   }
 

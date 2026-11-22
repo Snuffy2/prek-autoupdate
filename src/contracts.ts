@@ -57,6 +57,20 @@ export class PublishedPullRequestError extends Error {
   }
 }
 
+/** Preserve a safely published pull when later update cleanup also fails. */
+export class PublishedUpdateError extends Error {
+  readonly publishedPullRequest: UpdateResult;
+
+  constructor(result: UpdateResult, cause: unknown) {
+    super(
+      `The update result was published, but cleanup also failed: ${String(cause)}`,
+      { cause },
+    );
+    this.name = "PublishedUpdateError";
+    this.publishedPullRequest = result;
+  }
+}
+
 export interface CleanupOptions {
   readonly keepPullRequestNumber?: number;
   readonly keepLatestOpenPullRequest: boolean;

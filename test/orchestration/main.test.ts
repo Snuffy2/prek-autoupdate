@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanupUpdateBranches } from "../../src/cleanup/index.js";
 import {
   PublishedPullRequestError,
+  PublishedUpdateError,
   type ActionContext,
   type ActionInputs,
 } from "../../src/contracts.js";
@@ -189,6 +190,42 @@ describe("runAction", () => {
     );
     expect(core.setFailed).toHaveBeenCalledWith(
       expect.stringContaining("auto-merge failed"),
+    );
+  });
+
+  it("keeps the exact published result through an update and cleanup failure", async () => {
+    const result = { operation: "updated" as const, pullRequestNumber: 41 };
+    vi.mocked(runUpdate).mockRejectedValue(
+      new PublishedUpdateError(
+        result,
+        new AggregateError(
+          [
+            new Error("auto-merge failed"),
+            new Error("worktree cleanup failed"),
+          ],
+          "Update failed and cleanup also failed",
+        ),
+      ),
+    );
+    vi.mocked(cleanupUpdateBranches).mockRejectedValue(
+      new Error("action cleanup failed"),
+    );
+
+    await runAction();
+
+    expect(cleanupUpdateBranches).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        keepPullRequestNumber: 41,
+        keepLatestOpenPullRequest: false,
+      }),
+    );
+    expect(core.setOutput).toHaveBeenCalledWith("pull-request-number", "41");
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining("auto-merge failed"),
+    );
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining("action cleanup failed"),
     );
   });
 

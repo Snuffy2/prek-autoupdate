@@ -36009,7 +36009,17 @@ async function deleteBranch(deletion) {
         return await pushDeletion(deletion, directory, CLEANUP_TIMEOUT_MS);
     }
     finally {
-        await rm$1(directory, { recursive: true, force: true });
+        try {
+            await rm$1(directory, { recursive: true, force: true });
+        }
+        catch {
+            try {
+                warning("Temporary Git directory cleanup failed; credentials were not included in output");
+            }
+            catch {
+                // Reporting a cleanup failure must not replace the Git operation result.
+            }
+        }
     }
 }
 async function pushDeletion({ remote, ref, expectedSha, readRef }, directory, timeout) {
@@ -36242,13 +36252,6 @@ class OctokitGitHubApi {
         }
         if (!Array.isArray(data.files))
             throw new TypeError("Expected comparison file list");
-        const changedFiles = data.changed_files;
-        if (data.files.length === 300 &&
-            (typeof changedFiles !== "number" ||
-                !Number.isInteger(changedFiles) ||
-                changedFiles < 0 ||
-                changedFiles > data.files.length))
-            throw new TypeError("Comparison file list exceeded GitHub's 300-file limit");
         return data.files.map((file) => payload(file, "comparison file"));
     }
     async getTreeEntries(paths, ref) {
@@ -36834,6 +36837,15 @@ class PublishedPullRequestError extends Error {
         super(`Pull request #${pullRequestNumber} was ${operation}, but post-publication setup failed: ${String(cause)}`, { cause });
         this.name = "PublishedPullRequestError";
         this.publishedPullRequest = { operation, pullRequestNumber };
+    }
+}
+/** Preserve a safely published pull when later update cleanup also fails. */
+class PublishedUpdateError extends Error {
+    publishedPullRequest;
+    constructor(result, cause) {
+        super(`The update result was published, but cleanup also failed: ${String(cause)}`, { cause });
+        this.name = "PublishedUpdateError";
+        this.publishedPullRequest = result;
     }
 }
 
@@ -40529,8 +40541,15 @@ async function verifySha256(archive, checksumContents, asset) {
 /** Publish a prepared commit and verify its pull request before post-publication setup. */
 async function publishUpdate(api, execution, remote, { worktree, sha: newSha, body }) {
     const original = remote.ownedPullRequest;
+    if (remote.sha !== undefined) {
+        try {
+            await fetchObservedUpdateCommit(execution, worktree.path, remote);
+        }
+        catch (error) {
+            throw new Error("Could not prove the observed update branch revision is locally available before publication", { cause: error });
+        }
+    }
     if (original !== undefined) {
-        await fetchObservedUpdateCommit(execution, worktree.path, remote);
         await proveCurrentOwnership(api, execution, remote);
     }
     await proveBase(api, execution);
@@ -40538,16 +40557,16 @@ async function publishUpdate(api, execution, remote, { worktree, sha: newSha, bo
     const operation = original === undefined ? "created" : "updated";
     let pullNumber;
     if (original === undefined) {
-        pullNumber = await publishNewPull(api, execution, newSha, body);
+        pullNumber = await publishNewPull(api, execution, remote, worktree.path, newSha, body);
     }
     else {
         pullNumber = original.number;
-        await publishExistingPull(api, execution, remote, pullNumber, newSha, body);
+        await publishExistingPull(api, execution, remote, worktree.path, pullNumber, newSha, body);
     }
     await enableAutoMergeForPublishedPull(api, execution, operation, pullNumber, newSha);
     return { operation, pullRequestNumber: pullNumber };
 }
-async function publishNewPull(api, execution, newSha, body) {
+async function publishNewPull(api, execution, remote, worktree, newSha, body) {
     let pullNumber;
     try {
         pullNumber = await api.createPull({
@@ -40569,7 +40588,17 @@ async function publishNewPull(api, execution, newSha, body) {
             pullNumber = recovered;
         }
         else if (isDefiniteCreateFailure(error)) {
-            await rollbackNewBranch(api, execution, newSha, error);
+            let conflict;
+            try {
+                conflict = await findOpenPullOnUpdateBranch(api, execution);
+            }
+            catch (inspectionError) {
+                throw new Error("Pull request creation failed; open pull requests on the update branch could not be checked, so the branch was preserved", { cause: new AggregateError([error, inspectionError]) });
+            }
+            if (conflict !== undefined) {
+                throw new Error(`Pull request creation failed; pull request #${conflict.number} already uses update branch ${execution.inputs.updateBranch}, so the branch was preserved`, { cause: error });
+            }
+            await rollbackNewBranch(api, execution, remote, worktree, newSha, error);
         }
         else {
             throw new Error("Pull request creation had an ambiguous outcome; the lease-protected update branch was preserved for inspection", {
@@ -40592,12 +40621,22 @@ async function publishNewPull(api, execution, newSha, body) {
     }
     return pullNumber;
 }
-async function publishExistingPull(api, execution, remote, pullNumber, newSha, body) {
+async function findOpenPullOnUpdateBranch(api, execution) {
+    const pulls = await api.listPulls("open", {
+        head: `${execution.context.owner}:${execution.inputs.updateBranch}`,
+    });
+    return pulls
+        .map((pull) => pullFromData(pull))
+        .find((pull) => pull.state === "open" &&
+        pull.headRef === execution.inputs.updateBranch &&
+        isSameRepository(pull.headRepository, execution.context.repositoryFullName));
+}
+async function publishExistingPull(api, execution, remote, worktree, pullNumber, newSha, body) {
     try {
         await provePublishedOwnership(api, execution, remote, newSha);
     }
     catch (error) {
-        await rollbackExistingPush(execution, remote, newSha, error);
+        await rollbackExistingPush(execution, remote, worktree, newSha, error);
     }
     let pullUpdateError;
     try {
@@ -40632,7 +40671,7 @@ async function publishExistingPull(api, execution, remote, pullNumber, newSha, b
     }
     const verificationError = new Error("Fresh pull request verification was not exact");
     if (isExactOriginalMetadataPull(execution, verified, remote, newSha)) {
-        return await rollbackExistingPush(execution, remote, newSha, new AggregateError([pullUpdateError, verificationError]));
+        return await rollbackExistingPush(execution, remote, worktree, newSha, new AggregateError([pullUpdateError, verificationError]));
     }
     throw new Error("Pull request metadata outcome is ambiguous; the lease-protected new branch was preserved", { cause: new AggregateError([pullUpdateError, verificationError]) });
 }
@@ -40667,12 +40706,14 @@ async function enablePullRequestAutoMerge(api, execution, pullNumber, expectedHe
     }
     const enabled = await api.enableSquashAutoMerge(pull.id, expectedHeadOid);
     let confirmed = false;
+    let observedDifferentMethod = false;
     if (enabled) {
         try {
             const completeResult = await api.getAutoMergePull(pullNumber);
-            confirmed =
-                completeResult?.id === pull.id &&
-                    isOwnedAutoMergePull(execution, completeResult, pullNumber, expectedHeadOid);
+            const exactPull = completeResult?.id === pull.id &&
+                isOwnedAutoMergePull(execution, completeResult, pullNumber, expectedHeadOid);
+            confirmed = exactPull && completeResult?.mergeMethod === "SQUASH";
+            observedDifferentMethod = exactPull && !confirmed;
         }
         catch {
             confirmed = false;
@@ -40680,6 +40721,9 @@ async function enablePullRequestAutoMerge(api, execution, pullNumber, expectedHe
     }
     if (!confirmed) {
         const validationError = new Error("GitHub did not confirm squash auto-merge for the exact pull-request revision");
+        if (observedDifferentMethod) {
+            throw validationError;
+        }
         try {
             await api.disableAutoMerge(pull.id);
             warning("Disabled an auto-merge request after pull-request ownership revalidation failed");
@@ -40939,7 +40983,10 @@ async function rollbackCreatedPullRequest(api, execution, pullNumber, pushedSha,
         ? `Applying or proving pull request ownership failed; pull request #${pullNumber} was closed and its branch was already absent`
         : `Applying or proving pull request ownership failed; pull request #${pullNumber} was closed and its branch was lease-rolled back`, { cause: labelError });
 }
-async function rollbackNewBranch(api, execution, pushedSha, createError) {
+async function rollbackNewBranch(api, execution, remote, worktree, pushedSha, createError) {
+    if (remote.sha !== undefined) {
+        await rollbackExistingPush(execution, remote, worktree, pushedSha, createError, "Pull request creation failed");
+    }
     let deletion;
     try {
         deletion = await deleteUpdateBranch(api, execution, pushedSha);
@@ -40951,7 +40998,7 @@ async function rollbackNewBranch(api, execution, pushedSha, createError) {
         ? "Pull request creation failed; the newly pushed branch was already absent"
         : "Pull request creation failed; the newly pushed branch was lease-rolled back", { cause: createError });
 }
-async function rollbackExistingPush(execution, remote, newSha, proofError) {
+async function rollbackExistingPush(execution, remote, worktree, newSha, proofError, failureLabel = "Post-push ownership proof failed") {
     if (remote.sha === undefined) {
         throw new Error("Cannot roll back an existing branch without its observed revision", {
             cause: proofError,
@@ -40960,7 +41007,7 @@ async function rollbackExistingPush(execution, remote, newSha, proofError) {
     const ref = `refs/heads/${execution.inputs.updateBranch}`;
     const destination = gitRemote(execution);
     try {
-        await gitAuthenticated(destination, execution.context.workspace, [
+        await gitAuthenticated(destination, worktree, [
             "push",
             repositoryUrl(destination),
             `${remote.sha}:${ref}`,
@@ -40968,9 +41015,9 @@ async function rollbackExistingPush(execution, remote, newSha, proofError) {
         ]);
     }
     catch (rollbackError) {
-        throw new Error("Post-push ownership proof failed and lease rollback also failed; the pushed branch was preserved", { cause: new AggregateError([proofError, rollbackError]) });
+        throw new Error(`${failureLabel} and lease rollback also failed; the pushed branch was preserved`, { cause: new AggregateError([proofError, rollbackError]) });
     }
-    throw new Error("Post-push ownership proof failed; the branch was lease-rolled back", {
+    throw new Error(`${failureLabel}; the branch was lease-rolled back`, {
         cause: proofError,
     });
 }
@@ -41138,6 +41185,7 @@ async function runUpdate(execution, api = new OctokitGitHubApi(execution.client,
     let installation;
     let updateFailed = false;
     let updateError;
+    let updateResult;
     try {
         await detachedWorktree.add();
         installation = await installPrek();
@@ -41155,7 +41203,8 @@ async function runUpdate(execution, api = new OctokitGitHubApi(execution.client,
         }
         const changed = diffStatus === 1;
         if (!changed) {
-            return await closeUnneededPullRequest(api, execution, remote);
+            updateResult = await closeUnneededPullRequest(api, execution, remote);
+            return updateResult;
         }
         await git(worktree, [
             "-c",
@@ -41168,11 +41217,12 @@ async function runUpdate(execution, api = new OctokitGitHubApi(execution.client,
         ]);
         const newSha = await git(worktree, ["rev-parse", "HEAD"]);
         const body = makeBody(output, execution.context.workspace);
-        return await publishUpdate(api, execution, remote, {
+        updateResult = await publishUpdate(api, execution, remote, {
             worktree: detachedWorktree,
             sha: newSha,
             body,
         });
+        return updateResult;
     }
     catch (error) {
         updateFailed = true;
@@ -41193,12 +41243,24 @@ async function runUpdate(execution, api = new OctokitGitHubApi(execution.client,
         catch (error) {
             cleanupErrors.push(error);
         }
-        reportCleanupFailures(updateFailed, updateError, cleanupErrors);
+        reportCleanupFailures(updateFailed, updateError, updateResult, cleanupErrors);
     }
 }
-function reportCleanupFailures(updateFailed, updateError, cleanupErrors) {
+function reportCleanupFailures(updateFailed, updateError, updateResult, cleanupErrors) {
     if (cleanupErrors.length === 0) {
         return;
+    }
+    const result = updateError instanceof PublishedPullRequestError
+        ? updateError.publishedPullRequest
+        : updateResult;
+    const causes = updateFailed
+        ? [updateError, ...cleanupErrors]
+        : [...cleanupErrors];
+    if (result?.pullRequestNumber !== undefined &&
+        (result.operation === "created" || result.operation === "updated")) {
+        throw new PublishedUpdateError(result, new AggregateError(causes, updateFailed
+            ? "Update failed and cleanup also failed"
+            : "Update operation completed but cleanup failed", { cause: updateFailed ? updateError : cleanupErrors[0] }));
     }
     if (updateFailed) {
         throw new AggregateError([updateError, ...cleanupErrors], "Update failed and cleanup also failed", { cause: updateError });
@@ -41342,6 +41404,9 @@ async function runAction(now = new Date()) {
         if (error instanceof PublishedPullRequestError) {
             updateResult = error.publishedPullRequest;
         }
+        else if (error instanceof PublishedUpdateError) {
+            updateResult = error.publishedPullRequest;
+        }
         failures.push({ phase: "update", error });
     }
     finally {
@@ -41386,7 +41451,18 @@ async function runAction(now = new Date()) {
     }
 }
 function errorMessage(error) {
-    return error instanceof Error ? error.message : String(error);
+    if (error instanceof AggregateError) {
+        const details = [...error.errors].map((cause) => errorMessage(cause));
+        return details.length === 0
+            ? error.message
+            : `${error.message}: ${details.join("; ")}`;
+    }
+    if (error instanceof Error) {
+        return error.cause === undefined
+            ? error.message
+            : `${error.message}: ${errorMessage(error.cause)}`;
+    }
+    return String(error);
 }
 
 void runAction().catch((error) => {

@@ -2,7 +2,12 @@ import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
 
-import type { ActionExecution, UpdateResult } from "../contracts.js";
+import {
+  PublishedPullRequestError,
+  PublishedUpdateError,
+  type ActionExecution,
+  type UpdateResult,
+} from "../contracts.js";
 import { sanitizedChildEnvironment } from "../environment.js";
 import { git, gitExit } from "../git.js";
 import { OctokitGitHubApi, type GitHubApi } from "../github.js";
@@ -73,6 +78,7 @@ export async function runUpdate(
   let installation: PrekInstallation | undefined;
   let updateFailed = false;
   let updateError: unknown;
+  let updateResult: UpdateResult | undefined;
   try {
     await detachedWorktree.add();
     installation = await installPrek();
@@ -96,7 +102,8 @@ export async function runUpdate(
     }
     const changed = diffStatus === 1;
     if (!changed) {
-      return await closeUnneededPullRequest(api, execution, remote);
+      updateResult = await closeUnneededPullRequest(api, execution, remote);
+      return updateResult;
     }
 
     await git(worktree, [
@@ -110,11 +117,12 @@ export async function runUpdate(
     ]);
     const newSha = await git(worktree, ["rev-parse", "HEAD"]);
     const body = makeBody(output, execution.context.workspace);
-    return await publishUpdate(api, execution, remote, {
+    updateResult = await publishUpdate(api, execution, remote, {
       worktree: detachedWorktree,
       sha: newSha,
       body,
     });
+    return updateResult;
   } catch (error) {
     updateFailed = true;
     updateError = error;
@@ -131,17 +139,45 @@ export async function runUpdate(
     } catch (error) {
       cleanupErrors.push(error);
     }
-    reportCleanupFailures(updateFailed, updateError, cleanupErrors);
+    reportCleanupFailures(
+      updateFailed,
+      updateError,
+      updateResult,
+      cleanupErrors,
+    );
   }
 }
 
 function reportCleanupFailures(
   updateFailed: boolean,
   updateError: unknown,
+  updateResult: UpdateResult | undefined,
   cleanupErrors: readonly unknown[],
 ): void {
   if (cleanupErrors.length === 0) {
     return;
+  }
+  const result =
+    updateError instanceof PublishedPullRequestError
+      ? updateError.publishedPullRequest
+      : updateResult;
+  const causes = updateFailed
+    ? [updateError, ...cleanupErrors]
+    : [...cleanupErrors];
+  if (
+    result?.pullRequestNumber !== undefined &&
+    (result.operation === "created" || result.operation === "updated")
+  ) {
+    throw new PublishedUpdateError(
+      result,
+      new AggregateError(
+        causes,
+        updateFailed
+          ? "Update failed and cleanup also failed"
+          : "Update operation completed but cleanup failed",
+        { cause: updateFailed ? updateError : cleanupErrors[0] },
+      ),
+    );
   }
   if (updateFailed) {
     throw new AggregateError(
