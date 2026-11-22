@@ -7,7 +7,11 @@ import type {
   CleanupResult,
   UpdateResult,
 } from "./contracts.js";
-import { PublishedPullRequestError } from "./contracts.js";
+import {
+  CreatedPullOwnershipError,
+  PublishedPullRequestError,
+  PublishedUpdateError,
+} from "./contracts.js";
 import {
   parseInputs,
   resolveContext,
@@ -27,6 +31,7 @@ export async function runAction(now: Date = new Date()): Promise<void> {
   const client = github.getOctokit(inputs.token);
   const context = await resolveContext(client, inputs);
   const execution: ActionExecution = { client, context, inputs };
+  let unverifiedCreatedPull: number | undefined;
   validateCleanupConfiguration(execution);
 
   const failures: Array<{ readonly phase: string; readonly error: unknown }> =
@@ -47,12 +52,22 @@ export async function runAction(now: Date = new Date()): Promise<void> {
   } catch (error: unknown) {
     if (error instanceof PublishedPullRequestError) {
       updateResult = error.publishedPullRequest;
+    } else if (error instanceof PublishedUpdateError) {
+      updateResult = error.publishedPullRequest;
+    }
+    const updateCause = error instanceof AggregateError ? error.cause : error;
+    if (updateCause instanceof CreatedPullOwnershipError) {
+      unverifiedCreatedPull = updateCause.pullRequestNumber;
     }
     failures.push({ phase: "update", error });
   } finally {
     try {
       cleanupResult = await cleanupUpdateBranches(execution, {
-        keepPullRequestNumber: updateResult.pullRequestNumber,
+        keepPullRequestNumber:
+          unverifiedCreatedPull ?? updateResult.pullRequestNumber,
+        ...(unverifiedCreatedPull === undefined
+          ? {}
+          : { keepBranch: inputs.updateBranch }),
         keepLatestOpenPullRequest: updateResult.pullRequestNumber === undefined,
         closeStalePullRequests: context.eventName !== "push",
         closeObsoletePullRequests: context.eventName === "push",
@@ -106,5 +121,16 @@ export async function runAction(now: Date = new Date()): Promise<void> {
 }
 
 export function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  if (error instanceof AggregateError) {
+    const details = [...error.errors].map((cause) => errorMessage(cause));
+    return details.length === 0
+      ? error.message
+      : `${error.message}: ${details.join("; ")}`;
+  }
+  if (error instanceof Error) {
+    return error.cause === undefined
+      ? error.message
+      : `${error.message}: ${errorMessage(error.cause)}`;
+  }
+  return String(error);
 }

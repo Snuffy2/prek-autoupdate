@@ -1,18 +1,17 @@
 import { describe, expect, it } from "vitest";
 
+import { cleanupWithApi } from "../../src/cleanup/index.js";
 import type { ActionExecution, CleanupOptions } from "../../src/contracts.js";
-import {
-  cleanupWithApi,
-  type CleanupApi,
-  type DeleteRefOutcome,
-  type Payload,
-} from "../../src/cleanup/index.js";
+import type { Payload } from "../../src/github.js";
+import { InMemoryGitHub } from "../support/in-memory-github.js";
 
 const branch = "prek-autoupdate";
 const repository = "owner/repo";
 const marker = "Automated update of `prek` hooks.";
 
-function pull(overrides: Payload = {}): Payload {
+type TestPull = Payload & { number: number };
+
+function pull(overrides: Partial<TestPull> = {}): TestPull {
   return {
     number: 1,
     state: "open",
@@ -29,7 +28,7 @@ function pull(overrides: Payload = {}): Payload {
   };
 }
 
-function closed(overrides: Payload = {}): Payload {
+function closed(overrides: Partial<TestPull> = {}): TestPull {
   return pull({
     state: "closed",
     updated_at: "2026-01-01T00:01:00Z",
@@ -38,7 +37,7 @@ function closed(overrides: Payload = {}): Payload {
   });
 }
 
-const execution = {
+const execution: Pick<ActionExecution, "context" | "inputs"> = {
   context: {
     eventName: "schedule",
     owner: "owner",
@@ -54,6 +53,7 @@ const execution = {
   inputs: {
     token: "token",
     autoMerge: false,
+    authorLogin: "",
     cooldownDays: "7",
     updateDay: 1,
     updateBranch: branch,
@@ -63,7 +63,7 @@ const execution = {
     prTitle: "update",
     addPaths: [],
   },
-} as unknown as ActionExecution;
+};
 
 const defaults: CleanupOptions = {
   keepLatestOpenPullRequest: false,
@@ -73,583 +73,542 @@ const defaults: CleanupOptions = {
   deleteMergedBranches: true,
 };
 
-class FakeApi implements CleanupApi {
-  public open: Payload[] = [];
-  public closed: Payload[] = [];
-  public details = new Map<
-    number,
-    Array<Payload | Error | { status: number }>
-  >();
-  public refs = new Map<string, string>();
-  public refValues = new Map<string, Array<string | undefined>>();
-  public comparisons: Payload[] = [];
-  public trees = new Map<
-    string,
-    ReadonlyMap<string, string | undefined> | undefined
-  >();
-  public closedNumbers: number[] = [];
-  public reopenedNumbers: number[] = [];
-  public deleted: Array<[string, string]> = [];
-  public deleteOutcome: DeleteRefOutcome = "deleted";
-  public listOpenValues: Payload[][] = [];
-  public reopenError?: Error;
-  public restoreErrors: unknown[] = [];
-  public restoreConflictSha?: string;
+const headRef = `heads/${branch}`;
+const obsolete = {
+  ...defaults,
+  closeObsoletePullRequests: true,
+  closeStalePullRequests: false,
+};
+const unchanged = { closedPullRequests: [], deletedBranches: [] };
 
-  async listPulls(state: "closed" | "open"): Promise<Payload[]> {
-    if (state === "open" && this.listOpenValues.length > 0)
-      return this.listOpenValues.shift()!;
-    return state === "open" ? this.open : this.closed;
-  }
-  async getPull(number: number): Promise<Payload> {
-    const values = this.details.get(number);
-    if (values === undefined || values.length === 0)
-      throw new Error(`No detail for ${number}`);
-    const value = values.length === 1 ? values[0]! : values.shift()!;
-    if (value instanceof Error || "status" in value) throw value;
-    return value;
-  }
-  async closePull(number: number): Promise<Payload> {
-    this.closedNumbers.push(number);
-    const values = this.details.get(number);
-    if (values === undefined || values.length === 0)
-      throw new Error(`No close for ${number}`);
-    const value = values.length === 1 ? values[0]! : values.shift()!;
-    if (value instanceof Error || "status" in value) throw value;
-    return value;
-  }
-  async reopenPull(number: number): Promise<Payload> {
-    if (this.reopenError !== undefined) throw this.reopenError;
-    this.reopenedNumbers.push(number);
-    const values = this.details.get(number);
-    if (values === undefined || values.length === 0)
-      throw new Error(`No reopened pull for ${number}`);
-    const current = values.length === 1 ? values[0]! : values.shift()!;
-    if (current instanceof Error || "status" in current) throw current;
-    return { ...current, number, state: "open" };
-  }
-  async compareFiles(): Promise<Payload[]> {
-    return this.comparisons;
-  }
-  async getTreeEntries(
-    _paths: ReadonlySet<string>,
-    ref: string,
-  ): Promise<ReadonlyMap<string, string | undefined> | undefined> {
-    return this.trees.get(ref);
-  }
-  async getRefSha(ref: string): Promise<string | undefined> {
-    const values = this.refValues.get(ref);
-    if (values !== undefined && values.length > 0) return values.shift();
-    return this.refs.get(ref);
-  }
-  async deleteRef(ref: string, expected: string): Promise<DeleteRefOutcome> {
-    this.deleted.push([ref, expected]);
-    if (this.deleteOutcome === "deleted") this.refs.delete(ref);
-    return this.deleteOutcome;
-  }
-  async restoreRef(ref: string, sha: string): Promise<void> {
-    const error = this.restoreErrors.shift();
-    if (error !== undefined) {
-      if (
-        error !== null &&
-        typeof error === "object" &&
-        "status" in error &&
-        error.status === 422 &&
-        this.restoreConflictSha !== undefined
-      )
-        this.refs.set(ref, this.restoreConflictSha);
-      if (
-        error !== null &&
-        typeof error === "object" &&
-        "status" in error &&
-        error.status === 422 &&
-        this.refs.has(ref)
-      )
-        return;
-      throw error;
-    }
-    this.refs.set(ref, sha);
-  }
+function seed(...pulls: TestPull[]): InMemoryGitHub {
+  const github = new InMemoryGitHub(pulls);
+  github.refs.set("heads/main", "base");
+  github.refs.set(headRef, "head");
+  return github;
+}
+
+function zeroChange(): InMemoryGitHub {
+  return seed(pull({ changed_files: 0 }));
+}
+
+function compare(
+  github: InMemoryGitHub,
+  files: Payload[],
+  head: ReadonlyMap<string, string> | undefined,
+  base: ReadonlyMap<string, string> | undefined,
+): void {
+  github.comparisons.set("base...head", files);
+  github.trees.set("head", head);
+  github.trees.set("base", base);
 }
 
 describe("cleanupUpdateBranches safety behavior", () => {
-  it("closes a stale owned pull only after ownership refresh", async () => {
-    const api = new FakeApi();
-    api.open = [pull()];
-    api.details.set(1, [pull(), closed()]);
-    const result = await cleanupWithApi(api, execution, defaults);
-    expect(result.closedPullRequests).toEqual([1]);
-    expect(api.closedNumbers).toEqual([1]);
+  it("keeps an explicitly protected branch even when its closed pull is eligible for deletion", async () => {
+    const github = seed(closed());
+
+    await expect(
+      cleanupWithApi(github, execution, { ...defaults, keepBranch: branch }),
+    ).resolves.toEqual(unchanged);
+    expect(github.refs.get(headRef)).toBe("head");
   });
 
-  it("fails closed when refreshed ownership is lost", async () => {
-    const api = new FakeApi();
-    api.open = [pull()];
-    api.details.set(1, [pull({ labels: [] })]);
-    const result = await cleanupWithApi(api, execution, defaults);
-    expect(result.closedPullRequests).toEqual([]);
-    expect(api.closedNumbers).toEqual([]);
-  });
+  it("closes a stale owned pull and retains its ref", async () => {
+    const github = seed(pull());
 
-  it("requires authenticated author, marker, label, same repo, and prefix", async () => {
-    const api = new FakeApi();
-    api.open = [
-      pull({ number: 1, user: { login: "other" } }),
-      pull({ number: 2, body: "other" }),
-      pull({ number: 3, labels: [] }),
-      pull({
-        number: 4,
-        head: { ref: branch, sha: "head", repo: { full_name: "fork/repo" } },
-      }),
-      pull({
-        number: 5,
-        head: { ref: "unowned", sha: "head", repo: { full_name: repository } },
-      }),
-    ];
-    const result = await cleanupWithApi(api, execution, defaults);
-    expect(result).toEqual({ closedPullRequests: [], deletedBranches: [] });
-  });
-
-  it("preserves matching open and closed pulls targeting another base", async () => {
-    const api = new FakeApi();
-    api.open = [pull({ base: { ref: "release" } })];
-    api.closed = [closed({ number: 2, base: { ref: "release" } })];
-    api.refs.set(`heads/${branch}`, "head");
-
-    const result = await cleanupWithApi(api, execution, defaults);
-
-    expect(result).toEqual({ closedPullRequests: [], deletedBranches: [] });
-    expect(api.closedNumbers).toEqual([]);
-    expect(api.deleted).toEqual([]);
-  });
-
-  it("does not delete a closed branch whose current SHA differs", async () => {
-    const api = new FakeApi();
-    api.closed = [closed()];
-    api.refs.set(`heads/${branch}`, "moved");
-    const result = await cleanupWithApi(api, execution, defaults);
-    expect(result.deletedBranches).toEqual([]);
-    expect(api.deleted).toEqual([]);
-  });
-
-  it("revalidates exact closed evidence and shared open branches before deletion", async () => {
-    const api = new FakeApi();
-    const candidate = closed();
-    api.closed = [candidate];
-    api.open = [pull({ number: 9, labels: [], user: { login: "human" } })];
-    api.refs.set(`heads/${branch}`, "head");
-    api.details.set(1, [candidate]);
-    const result = await cleanupWithApi(api, execution, defaults);
-    expect(result.deletedBranches).toEqual([]);
-    expect(api.deleted).toEqual([]);
-  });
-
-  it("deletes with the exact queued SHA after all evidence remains stable", async () => {
-    const api = new FakeApi();
-    const candidate = closed();
-    api.closed = [candidate];
-    api.refs.set(`heads/${branch}`, "head");
-    api.details.set(1, [candidate]);
-    const result = await cleanupWithApi(api, execution, defaults);
-    expect(result.deletedBranches).toEqual([branch]);
-    expect(api.deleted).toEqual([[`heads/${branch}`, "head"]]);
-  });
-
-  it("fails closed on conflicting SHA evidence for a reused branch", async () => {
-    const api = new FakeApi();
-    api.closed = [
-      closed({ number: 1 }),
-      closed({
-        number: 2,
-        head: { ref: branch, sha: "other", repo: { full_name: repository } },
-      }),
-    ];
-    api.refValues.set(`heads/${branch}`, ["head", "other"]);
-    const result = await cleanupWithApi(api, execution, defaults);
-    expect(result.deletedBranches).toEqual([]);
-  });
-
-  it("closes a zero-change obsolete pull only while snapshot stays immutable", async () => {
-    const api = new FakeApi();
-    const options = { ...defaults, closeObsoletePullRequests: true };
-    api.open = [pull({ changed_files: 0 })];
-    api.refs.set("heads/main", "base");
-    api.refs.set(`heads/${branch}`, "head");
-    api.details.set(1, [
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-    ]);
-    const result = await cleanupWithApi(api, execution, options);
-    expect(result.closedPullRequests).toEqual([1]);
-  });
-
-  it("compensates only the exact close event including closed_at", async () => {
-    const api = new FakeApi();
-    const options = { ...defaults, closeObsoletePullRequests: true };
-    api.open = [pull({ changed_files: 0 })];
-    api.refs.set("heads/main", "base");
-    api.refs.set(`heads/${branch}`, "moved");
-    api.details.set(1, [
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-    ]);
-    await cleanupWithApi(api, execution, options);
-    expect(api.reopenedNumbers).toEqual([1]);
-
-    const changedClose = new FakeApi();
-    changedClose.open = [pull({ changed_files: 0 })];
-    changedClose.refs.set("heads/main", "base");
-    changedClose.refs.set(`heads/${branch}`, "moved");
-    changedClose.details.set(1, [
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      closed({ changed_files: 0, closed_at: "later", updated_at: "later" }),
-    ]);
-    await cleanupWithApi(changedClose, execution, options);
-    expect(changedClose.reopenedNumbers).toEqual([]);
-  });
-
-  it("requires complete file count and identical tree identities for obsolete pulls", async () => {
-    const api = new FakeApi();
-    api.open = [pull()];
-    api.refs.set("heads/main", "base");
-    api.comparisons = [{ filename: "a" }];
-    api.trees.set("head", new Map([["a", "100644\0blob\0same"]]));
-    api.trees.set("base", new Map([["a", "100644\0blob\0different"]]));
-    api.details.set(1, [pull(), pull()]);
-    const result = await cleanupWithApi(api, execution, {
-      ...defaults,
-      closeObsoletePullRequests: true,
-      closeStalePullRequests: false,
+    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual({
+      closedPullRequests: [1],
+      deletedBranches: [],
     });
-    expect(result.closedPullRequests).toEqual([]);
+    expect(github.pulls.get(1)?.state).toBe("closed");
+    expect(github.refs.get(headRef)).toBe("head");
+  });
+
+  it("preserves an open pull that loses its label after listing", async () => {
+    const github = seed(pull());
+    github.transitions.afterListPulls = (state) => {
+      if (state === "open") github.patchPull(1, { labels: [] });
+    };
+
+    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.pulls.get(1)).toMatchObject({ state: "open", labels: [] });
+    expect(github.refs.get(headRef)).toBe("head");
+  });
+
+  it.each([
+    ["another author", { user: { login: "other" } }, branch],
+    ["a missing body marker", { body: "other" }, branch],
+    ["a missing ownership label", { labels: [] }, branch],
+    [
+      "a fork head",
+      { head: { ref: branch, sha: "head", repo: { full_name: "fork/repo" } } },
+      branch,
+    ],
+    ["another base branch", { base: { ref: "release" } }, branch],
+    [
+      "a head outside the update namespace",
+      {
+        head: { ref: "unowned", sha: "head", repo: { full_name: repository } },
+      },
+      "unowned",
+    ],
+  ] satisfies [string, Payload, string][])(
+    "preserves open and closed pull requests and refs with %s",
+    async (_reason, overrides, headBranch) => {
+      for (const candidate of [pull(overrides), closed(overrides)]) {
+        const github = new InMemoryGitHub([candidate]);
+        const ref = `heads/${headBranch}`;
+        github.refs.set(ref, "head");
+
+        await expect(
+          cleanupWithApi(github, execution, defaults),
+        ).resolves.toEqual(unchanged);
+        expect(github.pulls.get(1)).toEqual(candidate);
+        expect(github.refs.get(ref)).toBe("head");
+      }
+    },
+  );
+
+  it("preserves a closed pull's branch when its revision differs", async () => {
+    const github = seed(closed());
+    github.refs.set(headRef, "moved");
+
+    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.refs.get(headRef)).toBe("moved");
+  });
+
+  it("preserves a closed pull's branch shared with an unrelated open pull", async () => {
+    const open = pull({ number: 9, labels: [], user: { login: "human" } });
+    const github = seed(closed(), open);
+
+    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.pulls.get(9)).toEqual(open);
+    expect(github.refs.get(headRef)).toBe("head");
+  });
+
+  it.each([branch, "automation/old"])(
+    "deletes the owned branch %s at the queued revision",
+    async (headBranch) => {
+      const ref = `heads/${headBranch}`;
+      const candidate = closed({
+        head: { ref: headBranch, sha: "head", repo: { full_name: repository } },
+      });
+      const github = new InMemoryGitHub([candidate]);
+      github.refs.set(ref, "head");
+
+      await expect(
+        cleanupWithApi(
+          github,
+          {
+            ...execution,
+            inputs: { ...execution.inputs, branchPrefix: "automation/" },
+          },
+          defaults,
+        ),
+      ).resolves.toEqual({
+        closedPullRequests: [],
+        deletedBranches: [headBranch],
+      });
+      expect(github.refs.has(ref)).toBe(false);
+      expect(github.pulls.get(1)).toEqual(candidate);
+    },
+  );
+
+  it.each(["head", "other"] as const)(
+    "preserves a reused branch when conflicting evidence leaves it at %s",
+    async (finalRevision) => {
+      const github = seed(
+        closed(),
+        closed({
+          number: 2,
+          head: { ref: branch, sha: "other", repo: { full_name: repository } },
+        }),
+      );
+      github.transitions.afterReadRef = (ref) => {
+        if (ref !== headRef) return;
+        if (github.refs.get(ref) === "head") github.refs.set(ref, "other");
+        else {
+          if (finalRevision === "head") github.refs.set(ref, "head");
+          delete github.transitions.afterReadRef;
+        }
+      };
+
+      await expect(
+        cleanupWithApi(github, execution, defaults),
+      ).resolves.toEqual(unchanged);
+      expect(github.refs.get(headRef)).toBe(finalRevision);
+    },
+  );
+
+  it("closes a zero-change obsolete pull with a stable snapshot", async () => {
+    const github = zeroChange();
+
+    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual({
+      closedPullRequests: [1],
+      deletedBranches: [],
+    });
+    expect(github.pulls.get(1)?.state).toBe("closed");
+    expect(github.refs.get(headRef)).toBe("head");
+  });
+
+  it("reopens the exact close when the branch revision no longer matches", async () => {
+    const github = zeroChange();
+    github.transitions.afterClosePull = () => {
+      github.refs.set(headRef, "moved");
+    };
+
+    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.pulls.get(1)).toMatchObject({
+      state: "open",
+      closed_at: null,
+    });
+    expect(github.refs.get(headRef)).toBe("moved");
+  });
+
+  it("preserves a pull with different tree identities despite a complete comparison", async () => {
+    const github = seed(pull());
+    compare(
+      github,
+      [{ filename: "a" }],
+      new Map([["a", "100644\0blob\0same"]]),
+      new Map([["a", "100644\0blob\0different"]]),
+    );
+
+    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.pulls.get(1)?.state).toBe("open");
   });
 
   it.each([
     ["changed-file count", [{ filename: "a" }], 2],
     ["empty comparison", [], 1],
-  ])(
+  ] as const)(
     "preserves when %s evidence is incomplete",
     async (_name, files, count) => {
-      const api = new FakeApi();
-      api.open = [pull({ changed_files: count })];
-      api.refs.set("heads/main", "base");
-      api.comparisons = files;
-      api.details.set(1, [pull({ changed_files: count })]);
-      const result = await cleanupWithApi(api, execution, {
-        ...defaults,
-        closeObsoletePullRequests: true,
-      });
-      expect(result.closedPullRequests).toEqual([]);
+      const github = seed(pull({ changed_files: count }));
+      github.comparisons.set("base...head", files);
+
+      await expect(
+        cleanupWithApi(github, execution, obsolete),
+      ).resolves.toEqual(unchanged);
+      expect(github.pulls.get(1)?.state).toBe("open");
     },
   );
 
-  it("includes both sides of a rename when comparing tree identities", async () => {
-    const api = new FakeApi();
-    api.open = [pull()];
-    api.refs.set("heads/main", "base");
-    api.refs.set(`heads/${branch}`, "head");
-    api.comparisons = [{ filename: "new", previous_filename: "old" }];
-    const identities = new Map([
-      ["new", "100644\0blob\0new-id"],
-      ["old", "100644\0blob\0old-id"],
-    ]);
-    api.trees.set("head", identities);
-    api.trees.set("base", identities);
-    api.details.set(1, [pull(), pull(), pull(), closed(), closed()]);
-    const result = await cleanupWithApi(api, execution, {
-      ...defaults,
-      closeObsoletePullRequests: true,
-    });
-    expect(result.closedPullRequests).toEqual([1]);
+  it("skips an over-limit comparison truncated to 300 files", async () => {
+    const github = seed(pull({ changed_files: 301 }));
+    github.comparisons.set(
+      "base...head",
+      Array.from({ length: 300 }, (_, index) => ({ filename: `${index}` })),
+    );
+
+    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.pulls.get(1)?.state).toBe("open");
   });
 
   it.each([
-    ["truncated head tree", undefined, new Map([["a", "same"]])],
-    ["truncated base tree", new Map([["a", "same"]]), undefined],
-  ])("preserves on %s", async (_name, headTree, baseTree) => {
-    const api = new FakeApi();
-    api.open = [pull()];
-    api.refs.set("heads/main", "base");
-    api.comparisons = [{ filename: "a" }];
-    api.trees.set("head", headTree);
-    api.trees.set("base", baseTree);
-    api.details.set(1, [pull()]);
-    const result = await cleanupWithApi(api, execution, {
-      ...defaults,
-      closeObsoletePullRequests: true,
-    });
-    expect(result.closedPullRequests).toEqual([]);
-  });
-
-  it.each([
-    [
-      "head movement",
-      pull({
-        head: { ref: branch, sha: "new", repo: { full_name: repository } },
-      }),
-    ],
-    ["base movement", pull()],
-  ])(
-    "preserves obsolete pull on %s during comparison",
-    async (kind, refreshed) => {
-      const api = new FakeApi();
-      api.open = [pull()];
-      api.refValues.set(
-        "heads/main",
-        kind === "base movement" ? ["base", "new-base"] : ["base", "base"],
+    ["matching", "closed", "old-id", [1]],
+    ["different", "open", "other-id", []],
+  ] as const)(
+    "handles a rename with %s tree evidence for its old path",
+    async (_name, state, baseOld, closedPullRequests) => {
+      const github = seed(pull());
+      compare(
+        github,
+        [{ filename: "new", previous_filename: "old" }],
+        new Map([
+          ["new", "new-id"],
+          ["old", "old-id"],
+        ]),
+        new Map([
+          ["new", "new-id"],
+          ["old", baseOld],
+        ]),
       );
-      api.comparisons = [{ filename: "a" }];
-      const tree = new Map([["a", "same"]]);
-      api.trees.set("head", tree);
-      api.trees.set("base", tree);
-      api.details.set(1, [pull(), refreshed]);
-      const result = await cleanupWithApi(api, execution, {
-        ...defaults,
-        closeObsoletePullRequests: true,
-        closeStalePullRequests: false,
+
+      await expect(
+        cleanupWithApi(github, execution, obsolete),
+      ).resolves.toEqual({
+        closedPullRequests,
+        deletedBranches: [],
       });
-      expect(result.closedPullRequests).toEqual([]);
-      expect(api.closedNumbers).toEqual([]);
+      expect(github.pulls.get(1)?.state).toBe(state);
     },
   );
 
-  it("reopens an exact close after the base moves post-close", async () => {
-    const api = new FakeApi();
-    api.open = [pull({ changed_files: 0 })];
-    api.refValues.set("heads/main", ["base", "base", "moved"]);
-    api.refs.set(`heads/${branch}`, "head");
-    api.details.set(1, [
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-    ]);
-    await cleanupWithApi(api, execution, {
-      ...defaults,
-      closeObsoletePullRequests: true,
-    });
-    expect(api.reopenedNumbers).toEqual([1]);
+  it.each(["head", "base"])(
+    "preserves when the %s tree is truncated",
+    async (revision) => {
+      const github = seed(pull());
+      const tree = new Map([["a", "same"]]);
+      compare(github, [{ filename: "a" }], tree, tree);
+      github.trees.set(revision, undefined);
+
+      await expect(
+        cleanupWithApi(github, execution, obsolete),
+      ).resolves.toEqual(unchanged);
+      expect(github.pulls.get(1)?.state).toBe("open");
+    },
+  );
+
+  it.each(["head", "base"])(
+    "preserves an obsolete pull when the %s moves during comparison",
+    async (side) => {
+      const github = seed(pull());
+      const tree = new Map([["a", "same"]]);
+      compare(github, [{ filename: "a" }], tree, tree);
+      github.transitions.afterCompare = () => {
+        if (side === "base") github.refs.set("heads/main", "moved");
+        else {
+          github.refs.set(headRef, "moved");
+          github.patchPull(1, {
+            head: {
+              ref: branch,
+              sha: "moved",
+              repo: { full_name: repository },
+            },
+          });
+        }
+      };
+
+      await expect(
+        cleanupWithApi(github, execution, obsolete),
+      ).resolves.toEqual(unchanged);
+      expect(github.pulls.get(1)?.state).toBe("open");
+      expect(github.refs.get(side === "base" ? "heads/main" : headRef)).toBe(
+        "moved",
+      );
+    },
+  );
+
+  it("reopens the exact close after the base moves post-close", async () => {
+    const github = zeroChange();
+    github.transitions.afterClosePull = () => {
+      github.refs.set("heads/main", "moved");
+    };
+
+    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.pulls.get(1)?.state).toBe("open");
+    expect(github.refs.get("heads/main")).toBe("moved");
   });
 
-  it("allows compensation after a new head revision with the same close event", async () => {
-    const api = new FakeApi();
-    api.open = [pull({ changed_files: 0 })];
-    api.refs.set("heads/main", "base");
-    api.refs.set(`heads/${branch}`, "moved");
-    api.details.set(1, [
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      closed({
-        changed_files: 0,
+  it("reopens a pull after a new head revision with the same close event", async () => {
+    const github = zeroChange();
+    github.transitions.afterClosePull = () => {
+      github.refs.set(headRef, "new");
+      github.patchPull(1, {
         head: { ref: branch, sha: "new", repo: { full_name: repository } },
-      }),
-    ]);
-    await cleanupWithApi(api, execution, {
-      ...defaults,
-      closeObsoletePullRequests: true,
+      });
+    };
+
+    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.pulls.get(1)).toMatchObject({
+      state: "open",
+      head: { sha: "new" },
     });
-    expect(api.reopenedNumbers).toEqual([1]);
+    expect(github.refs.get(headRef)).toBe("new");
   });
 
   it.each([
     ["independent reclose", { updated_at: "later", closed_at: "later" }],
+    ["a changed close timestamp alone", { closed_at: "later" }],
     ["moved base", { base: { ref: "release" } }],
     ["lost ownership", { labels: [] }],
   ])("does not compensate after %s", async (_name, override) => {
-    const api = new FakeApi();
-    api.open = [pull({ changed_files: 0 })];
-    api.refs.set("heads/main", "base");
-    api.refs.set(`heads/${branch}`, "moved");
-    api.details.set(1, [
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      closed({ changed_files: 0, ...override }),
-    ]);
-    await cleanupWithApi(api, execution, {
-      ...defaults,
-      closeObsoletePullRequests: true,
-    });
-    expect(api.reopenedNumbers).toEqual([]);
+    const github = zeroChange();
+    github.transitions.afterClosePull = () => {
+      github.refs.set(headRef, "moved");
+      github.patchPull(1, override);
+    };
+
+    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.pulls.get(1)).toMatchObject({ state: "closed", ...override });
+    expect(github.refs.get(headRef)).toBe("moved");
   });
 
-  it("propagates validation errors after compensating an exact close", async () => {
-    const api = new FakeApi();
-    api.open = [pull({ changed_files: 0 })];
-    api.refs.set("heads/main", "base");
-    api.details.set(1, [
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      pull({ state: "closed", changed_files: -1 }),
-      closed({ changed_files: 0 }),
-    ]);
-    await expect(
-      cleanupWithApi(api, execution, {
-        ...defaults,
-        closeObsoletePullRequests: true,
-      }),
-    ).rejects.toThrow("valid changed file count");
-    expect(api.reopenedNumbers).toEqual([1]);
+  function invalidSnapshot(): InMemoryGitHub {
+    const github = zeroChange();
+    github.transitions.afterClosePull = () => {
+      github.patchPull(1, { changed_files: -1 });
+    };
+    github.transitions.afterReadPull = (snapshot) => {
+      if (snapshot?.changed_files === -1)
+        github.patchPull(1, { changed_files: 0 });
+    };
+    return github;
+  }
+
+  it("propagates invalid snapshot evidence after reopening the exact close", async () => {
+    const github = invalidSnapshot();
+
+    await expect(cleanupWithApi(github, execution, obsolete)).rejects.toThrow(
+      "valid changed file count",
+    );
+    expect(github.pulls.get(1)?.state).toBe("open");
   });
 
   it("retains snapshot and compensation errors when reopening fails", async () => {
-    const api = new FakeApi();
+    const github = invalidSnapshot();
     const compensation = new Error("reopen failed");
-    api.reopenError = compensation;
-    api.open = [pull({ changed_files: 0 })];
-    api.refs.set("heads/main", "base");
-    api.details.set(1, [
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      pull({ state: "closed", changed_files: -1 }),
-      closed({ changed_files: 0 }),
-    ]);
-    const failure = await cleanupWithApi(api, execution, {
-      ...defaults,
-      closeObsoletePullRequests: true,
-    }).catch((error: unknown) => error);
-    expect(failure).toBeInstanceOf(AggregateError);
-    expect((failure as AggregateError).errors).toHaveLength(2);
-    expect((failure as AggregateError).errors[0]).toMatchObject({
-      message: expect.stringContaining("valid changed file count"),
-    });
-    expect((failure as AggregateError).errors[1]).toBe(compensation);
-  });
+    github.transitions.beforeReopenPull = () => {
+      throw compensation;
+    };
 
-  it("skips a vanished pull during compensation but propagates transient fetch failures", async () => {
-    const options = { ...defaults, closeObsoletePullRequests: true };
-    const vanished = new FakeApi();
-    vanished.open = [pull({ changed_files: 0 })];
-    vanished.refs.set("heads/main", "base");
-    vanished.refs.set(`heads/${branch}`, "moved");
-    vanished.details.set(1, [
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      { status: 404 },
-    ]);
     await expect(
-      cleanupWithApi(vanished, execution, options),
-    ).resolves.toMatchObject({ closedPullRequests: [] });
-
-    const transient = new FakeApi();
-    const timeout = new Error("pull refresh timed out");
-    transient.open = [pull({ changed_files: 0 })];
-    transient.refs.set("heads/main", "base");
-    transient.refs.set(`heads/${branch}`, "moved");
-    transient.details.set(1, [
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      pull({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      closed({ changed_files: 0 }),
-      timeout,
-    ]);
-    const failure = await cleanupWithApi(transient, execution, options).catch(
-      (error: unknown) => error,
-    );
-    expect(failure).toBeInstanceOf(AggregateError);
-    expect((failure as AggregateError).errors).toEqual([timeout, timeout]);
+      cleanupWithApi(github, execution, obsolete),
+    ).rejects.toMatchObject({
+      errors: [
+        expect.objectContaining({
+          message: expect.stringContaining("valid changed file count"),
+        }),
+        compensation,
+      ],
+    });
+    expect(github.pulls.get(1)?.state).toBe("closed");
   });
 
-  it.each<DeleteRefOutcome>(["already-absent", "lease-rejected"])(
-    "does not claim a %s deletion outcome",
-    async (outcome) => {
-      const api = new FakeApi();
-      const candidate = closed();
-      api.closed = [candidate];
-      api.refs.set(`heads/${branch}`, "head");
-      api.details.set(1, [candidate]);
-      api.deleteOutcome = outcome;
-      const result = await cleanupWithApi(api, execution, defaults);
-      expect(result.deletedBranches).toEqual([]);
+  it("skips a pull that vanishes while checking the branch after a close", async () => {
+    const github = zeroChange();
+    github.transitions.afterClosePull = () => {
+      github.refs.set(headRef, "moved");
+      github.transitions.afterReadRef = (ref) => {
+        if (ref === headRef) github.pulls.delete(1);
+      };
+    };
+
+    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.pulls.has(1)).toBe(false);
+    expect(github.refs.get(headRef)).toBe("moved");
+  });
+
+  it("reports a transient pull refresh failure during compensation", async () => {
+    const github = zeroChange();
+    const timeout = new Error("pull refresh timed out");
+    github.transitions.afterClosePull = () => {
+      github.refs.set(headRef, "moved");
+      github.transitions.afterReadRef = (ref) => {
+        if (ref === headRef) {
+          github.transitions.beforeReadPull = () => {
+            throw timeout;
+          };
+        }
+      };
+    };
+
+    await expect(
+      cleanupWithApi(github, execution, obsolete),
+    ).rejects.toMatchObject({
+      errors: [timeout, timeout],
+    });
+    expect(github.pulls.get(1)?.state).toBe("closed");
+  });
+
+  it.each([
+    ["is removed", undefined],
+    ["moves", "concurrent"],
+  ] as const)(
+    "does not report deletion when the ref %s before the lease takes effect",
+    async (_name, revision) => {
+      const github = seed(closed());
+      github.transitions.beforeDeleteRef = (ref) => {
+        if (revision === undefined) github.refs.delete(ref);
+        else github.refs.set(ref, revision);
+      };
+
+      await expect(
+        cleanupWithApi(github, execution, defaults),
+      ).resolves.toEqual(unchanged);
+      expect(github.refs.get(headRef)).toBe(revision);
     },
   );
 
-  it("blocks deletion when an open pull appears during the final race check", async () => {
-    const api = new FakeApi();
-    const candidate = closed();
-    api.closed = [candidate];
-    api.refs.set(`heads/${branch}`, "head");
-    api.details.set(1, [candidate]);
-    api.listOpenValues = [[], [pull({ number: 9 })]];
-    const result = await cleanupWithApi(api, execution, defaults);
-    expect(result.deletedBranches).toEqual([]);
-    expect(api.deleted).toEqual([]);
+  it("blocks deletion when a pull opens after the closed candidate is checked", async () => {
+    const github = seed(closed());
+    let deleted = false;
+    github.transitions.afterReadPull = (snapshot) => {
+      if (snapshot?.state === "closed")
+        github.pulls.set(9, pull({ number: 9 }));
+    };
+    github.transitions.afterDeleteRef = () => {
+      deleted = true;
+    };
+
+    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.refs.get(headRef)).toBe("head");
+    expect(github.pulls.get(9)?.state).toBe("open");
+    expect(deleted).toBe(false);
   });
 
-  it("restores the leased branch when an open pull appears after deletion", async () => {
-    const api = new FakeApi();
-    const candidate = closed();
-    api.closed = [candidate];
-    api.refs.set(`heads/${branch}`, "head");
-    api.details.set(1, [candidate]);
-    api.listOpenValues = [[], [], [pull({ number: 9 })]];
-    const result = await cleanupWithApi(api, execution, defaults);
-    expect(result.deletedBranches).toEqual([]);
-    expect(api.deleted).toEqual([[`heads/${branch}`, "head"]]);
-    expect(api.refs.get(`heads/${branch}`)).toBe("head");
+  function openAfterDeletion(): InMemoryGitHub {
+    const github = seed(closed());
+    github.transitions.afterDeleteRef = () => {
+      github.pulls.set(9, pull({ number: 9 }));
+    };
+    return github;
+  }
+
+  it("restores the leased revision when a pull opens after deletion", async () => {
+    const github = openAfterDeletion();
+
+    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.refs.get(headRef)).toBe("head");
+    expect(github.pulls.get(9)?.state).toBe("open");
   });
 
-  it("treats a fake restore conflict as benign only after the ref reappears", async () => {
-    const api = new FakeApi();
-    const candidate = closed();
-    api.closed = [candidate];
-    api.refs.set(`heads/${branch}`, "head");
-    api.details.set(1, [candidate]);
-    api.listOpenValues = [[], [], [pull({ number: 9 })]];
-    api.restoreErrors = [{ status: 422 }];
-    api.restoreConflictSha = "concurrent";
+  it("preserves the revision of a ref concurrently recreated during restoration", async () => {
+    const github = openAfterDeletion();
+    github.transitions.beforeRestoreRef = (ref) => {
+      github.refs.set(ref, "concurrent");
+    };
 
-    await expect(cleanupWithApi(api, execution, defaults)).resolves.toEqual({
-      closedPullRequests: [],
-      deletedBranches: [],
-    });
+    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.refs.get(headRef)).toBe("concurrent");
+    expect(github.pulls.get(9)?.state).toBe("open");
   });
 
   it("retains validation and transient restoration failures", async () => {
-    const api = new FakeApi();
-    const candidate = closed();
+    const github = openAfterDeletion();
     const firstRestore = new Error("restore timeout");
     const retryRestore = new Error("restore retry timeout");
-    api.closed = [candidate];
-    api.refs.set(`heads/${branch}`, "head");
-    api.details.set(1, [candidate]);
-    api.listOpenValues = [[], [], [pull({ number: 9 })]];
-    api.restoreErrors = [firstRestore, retryRestore];
+    github.transitions.beforeRestoreRef = () => {
+      github.transitions.beforeRestoreRef = () => {
+        throw retryRestore;
+      };
+      throw firstRestore;
+    };
 
-    const failure = await cleanupWithApi(api, execution, defaults).catch(
-      (error: unknown) => error,
-    );
-    expect(failure).toBeInstanceOf(AggregateError);
-    expect((failure as AggregateError).errors).toEqual([
-      firstRestore,
-      retryRestore,
-    ]);
+    await expect(
+      cleanupWithApi(github, execution, defaults),
+    ).rejects.toMatchObject({
+      errors: [firstRestore, retryRestore],
+    });
+    expect(github.refs.has(headRef)).toBe(false);
+    expect(github.pulls.get(9)?.state).toBe("open");
   });
 
   it.each([
@@ -657,17 +616,19 @@ describe("cleanupUpdateBranches safety behavior", () => {
     ["merge classification", { merged_at: "2026-01-01T00:02:00Z" }],
     ["ownership", { body: "unowned" }],
   ])("blocks closed deletion after changed %s", async (_name, override) => {
-    const api = new FakeApi();
-    api.closed = [closed()];
-    api.refs.set(`heads/${branch}`, "head");
-    api.details.set(1, [closed(override)]);
-    const result = await cleanupWithApi(api, execution, defaults);
-    expect(result.deletedBranches).toEqual([]);
+    const github = seed(closed());
+    github.transitions.afterListPulls = (state) => {
+      if (state === "closed") github.patchPull(1, override);
+    };
+
+    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
+      unchanged,
+    );
+    expect(github.pulls.get(1)).toMatchObject({ state: "closed", ...override });
+    expect(github.refs.get(headRef)).toBe("head");
   });
 
   it("deletes both merged and stale owned branches when enabled", async () => {
-    const api = new FakeApi();
-    const stale = closed();
     const merged = closed({
       number: 2,
       merged_at: "2026-01-01T00:01:00Z",
@@ -677,12 +638,14 @@ describe("cleanupUpdateBranches safety behavior", () => {
         repo: { full_name: repository },
       },
     });
-    api.closed = [stale, merged];
-    api.refs.set(`heads/${branch}`, "head");
-    api.refs.set("heads/prek-autoupdate-2", "head2");
-    api.details.set(1, [stale]);
-    api.details.set(2, [merged]);
-    const result = await cleanupWithApi(api, execution, defaults);
-    expect(result.deletedBranches).toEqual([branch, "prek-autoupdate-2"]);
+    const github = seed(closed(), merged);
+    github.refs.set("heads/prek-autoupdate-2", "head2");
+
+    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual({
+      closedPullRequests: [],
+      deletedBranches: [branch, "prek-autoupdate-2"],
+    });
+    expect([...github.refs]).toEqual([["heads/main", "base"]]);
+    expect(github.pulls.get(2)).toEqual(merged);
   });
 });

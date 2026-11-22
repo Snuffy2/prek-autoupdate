@@ -2,16 +2,13 @@ import type {
   ActionExecution,
   CleanupOptions,
   CleanupResult,
-  GitHubClient,
 } from "../contracts.js";
-import { OctokitCleanupApi } from "./github.js";
+import { ownershipPolicy, type OwnershipPolicy } from "../ownership.js";
+import { OctokitGitHubApi, type GitHubApi, type Payload } from "../github.js";
 import type {
   BranchDeletion,
-  CleanupApi,
   ClosedPullCandidate,
   CompensatablePull,
-  OwnershipPolicy,
-  Payload,
   PullComparisonSnapshot,
 } from "./model.js";
 import {
@@ -28,13 +25,11 @@ import {
   sameRepoHeadRef,
 } from "./payload.js";
 
-const BODY_MARKER = "Automated update of `prek` hooks.";
-
 export async function cleanupUpdateBranches(
   execution: ActionExecution,
   options: CleanupOptions,
 ): Promise<CleanupResult> {
-  const api = new OctokitCleanupApi(
+  const api = new OctokitGitHubApi(
     execution.client,
     execution.context.owner,
     execution.context.repository,
@@ -45,25 +40,15 @@ export async function cleanupUpdateBranches(
 }
 
 export async function cleanupWithApi(
-  api: CleanupApi,
-  execution: Omit<ActionExecution, "client"> & {
-    readonly client?: GitHubClient;
-  },
+  api: GitHubApi,
+  execution: Pick<ActionExecution, "context" | "inputs">,
   options: CleanupOptions,
 ): Promise<CleanupResult> {
   const result = {
     closedPullRequests: [] as number[],
     deletedBranches: [] as string[],
   };
-  const policy: OwnershipPolicy = {
-    repository: execution.context.repositoryFullName,
-    baseBranch: execution.context.baseBranch,
-    branch: execution.inputs.updateBranch,
-    branchPrefix: execution.inputs.branchPrefix,
-    labelName: execution.inputs.label,
-    authorLogin: execution.context.authenticatedLogin,
-    bodyMarker: BODY_MARKER,
-  };
+  const policy = ownershipPolicy(execution);
   const openPulls = await api.listPulls("open");
   const workflowOpen = openPulls.filter((pull) => isWorkflowPull(pull, policy));
   const workflowNumbers = new Set(workflowOpen.map(pullNumber));
@@ -73,6 +58,9 @@ export async function cleanupWithApi(
     policy.repository,
     policy.branchPrefix,
   );
+  if (options.keepBranch !== undefined) {
+    protectedBranches.add(options.keepBranch);
+  }
   const queued = new Map<string, BranchDeletion>();
   const latest = options.keepLatestOpenPullRequest
     ? Math.max(...workflowNumbers, Number.NEGATIVE_INFINITY)
@@ -142,7 +130,7 @@ function collectProtectedBranches(
 }
 
 async function handleStale(
-  api: CleanupApi,
+  api: GitHubApi,
   pull: Payload,
   keep: boolean,
   enabled: boolean,
@@ -202,7 +190,7 @@ function queueDeletion(
 }
 
 async function deleteQueued(
-  api: CleanupApi,
+  api: GitHubApi,
   queued: ReadonlyMap<string, BranchDeletion>,
   protectedBranches: Set<string>,
   result: { deletedBranches: string[] },
@@ -271,7 +259,7 @@ async function deleteQueued(
 }
 
 async function closeObsolete(
-  api: CleanupApi,
+  api: GitHubApi,
   pull: Payload,
   policy: OwnershipPolicy,
   enabled: boolean,
@@ -348,7 +336,7 @@ async function closeObsolete(
 }
 
 async function reopenAndProtect(
-  api: CleanupApi,
+  api: GitHubApi,
   pulls: readonly CompensatablePull[],
   branch: string,
   protectedBranches: Set<string>,
@@ -360,14 +348,8 @@ async function reopenAndProtect(
   )) {
     const index = result.closedPullRequests.indexOf(identity.number);
     if (index >= 0) result.closedPullRequests.splice(index, 1);
-    let current: Payload;
-    try {
-      current = await api.getPull(identity.number);
-    } catch (error: unknown) {
-      if (isStatus(error, 404) || isStatus(error, 410)) continue;
-      throw error;
-    }
-    if (canCompensate(current, identity, policy)) {
+    const current = await api.findPull(identity.number);
+    if (current !== undefined && canCompensate(current, identity, policy)) {
       const reopened = await api.reopenPull(identity.number);
       if (
         reopened.state !== "open" ||
@@ -381,15 +363,6 @@ async function reopenAndProtect(
     }
   }
   protectedBranches.add(branch);
-}
-
-function isStatus(error: unknown, status: number): boolean {
-  return (
-    error !== null &&
-    typeof error === "object" &&
-    "status" in error &&
-    (error as { readonly status?: unknown }).status === status
-  );
 }
 
 function canCompensate(
@@ -425,7 +398,7 @@ function sameCompensation(
 }
 
 async function obsoleteSnapshot(
-  api: CleanupApi,
+  api: GitHubApi,
   pull: Payload,
 ): Promise<PullComparisonSnapshot | undefined> {
   const number = pullNumber(pull);
@@ -462,7 +435,7 @@ async function obsoleteSnapshot(
 }
 
 async function pullMatchesSnapshot(
-  api: CleanupApi,
+  api: GitHubApi,
   number: number,
   snapshot: PullComparisonSnapshot,
   requiredState?: string,
@@ -510,7 +483,7 @@ function mapsEqual(
 }
 
 async function matchingBranchHeadSha(
-  api: CleanupApi,
+  api: GitHubApi,
   pull: Payload,
   repository: string,
 ): Promise<string | undefined> {
@@ -534,14 +507,3 @@ function closedPullStillOwned(
     isWorkflowPull(pull, policy)
   );
 }
-
-export type {
-  BranchDeletion,
-  CleanupApi,
-  ClosedPullCandidate,
-  CompensatablePull,
-  DeleteRefOutcome,
-  OwnershipPolicy,
-  Payload,
-  PullComparisonSnapshot,
-} from "./model.js";

@@ -1,7 +1,5 @@
 import * as core from "@actions/core";
 import * as github from "@actions/github";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 
 import type {
   ActionContext,
@@ -9,17 +7,13 @@ import type {
   GitHubClient,
   SupportedEventName,
 } from "./contracts.js";
-import {
-  hardenedGitArguments,
-  sanitizedChildEnvironment,
-} from "./environment.js";
+import { git, gitOptional } from "./git.js";
 
 const SUPPORTED_EVENTS = new Set<SupportedEventName>([
   "push",
   "schedule",
   "workflow_dispatch",
 ]);
-const execFileAsync = promisify(execFile);
 
 export function parseInputs(): ActionInputs {
   const token = core.getInput("token", { required: true });
@@ -268,40 +262,6 @@ export async function resolveAuthenticatedIdentity(
         (error as { readonly status?: unknown }).status === 403)
     ) {
       return { authenticatedAsUser: false, login: fallbackLogin };
-    }
-    throw error;
-  }
-}
-
-async function git(
-  workspace: string,
-  arguments_: readonly string[],
-): Promise<string> {
-  const { stdout } = await execFileAsync(
-    "git",
-    hardenedGitArguments(["-C", workspace, ...arguments_]),
-    {
-      encoding: "utf8",
-      env: sanitizedChildEnvironment(),
-    },
-  );
-  return stdout.trim();
-}
-
-async function gitOptional(
-  workspace: string,
-  arguments_: readonly string[],
-): Promise<string> {
-  try {
-    return await git(workspace, arguments_);
-  } catch (error: unknown) {
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      (error as { readonly code?: unknown }).code === 1
-    ) {
-      return "";
     }
     throw error;
   }

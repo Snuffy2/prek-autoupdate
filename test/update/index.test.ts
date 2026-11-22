@@ -1,4 +1,4 @@
-import * as core from "@actions/core";
+import type * as core from "@actions/core";
 import { execFile } from "node:child_process";
 import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -18,15 +18,15 @@ vi.mock("@actions/core", async (importOriginal) => {
 vi.mock("../../src/prek/index.js", () => ({ installPrek: prekMocks.install }));
 
 import type { ActionExecution, GitHubClient } from "../../src/contracts.js";
+import { InMemoryGitHub } from "../support/in-memory-github.js";
+import { BODY_MARKER } from "../../src/ownership.js";
 import {
-  BODY_MARKER,
-  createTemporaryRoot,
-  enablePullRequestAutoMerge,
   runUpdate,
   sanitizeOutput,
   validateAddPath,
   validateUpdateConfiguration,
 } from "../../src/update/index.js";
+import { createTemporaryRoot } from "../../src/update/worktree.js";
 
 const exec = promisify(execFile);
 const temporaryDirectories: string[] = [];
@@ -113,295 +113,6 @@ describe("captured output", () => {
     expect(sanitized).not.toContain("\u001B");
     expect(sanitized).not.toContain("\u0000");
     expect(sanitized).toMatch(/\[output truncated\]$/u);
-  });
-
-  it("keeps the exact ownership marker stable", () => {
-    expect(BODY_MARKER).toBe("Automated update of `prek` hooks.");
-  });
-});
-
-describe("pull request auto-merge", () => {
-  it("enables squash auto-merge for the exact observed head revision", async () => {
-    const execution = await makeExecution(["prek.toml"]);
-    let enabled = false;
-    const graphql = vi.fn(
-      async (_document: string, variables: Record<string, unknown>) => {
-        if ("expectedHeadOid" in variables) {
-          enabled = true;
-          return {
-            enablePullRequestAutoMerge: {
-              pullRequest: {
-                id: "PR_node",
-                autoMergeRequest: enabledAutoMergeRequest(),
-              },
-            },
-          };
-        }
-        return {
-          repository: {
-            pullRequest: autoMergePull({
-              autoMergeRequest: enabled ? enabledAutoMergeRequest() : null,
-            }),
-          },
-        };
-      },
-    );
-    const autoMergeExecution = {
-      ...execution,
-      client: { ...execution.client, graphql } as unknown as GitHubClient,
-    };
-
-    await expect(
-      enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
-    ).resolves.toBeUndefined();
-
-    expect(graphql).toHaveBeenCalledWith(expect.any(String), {
-      pullRequestId: "PR_node",
-      expectedHeadOid: "HEAD",
-    });
-  });
-
-  it("does not replace an existing auto-merge request", async () => {
-    const execution = await makeExecution(["prek.toml"]);
-    const graphql = queryOnlyGraphql(
-      autoMergePull({
-        autoMergeRequest: enabledAutoMergeRequest(),
-      }),
-    );
-    const autoMergeExecution = {
-      ...execution,
-      client: { ...execution.client, graphql } as unknown as GitHubClient,
-    };
-
-    await enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD");
-  });
-
-  it.each([
-    ["a missing pull request", null],
-    ["a different pull request number", autoMergePull({ number: 43 })],
-    ["a changed head revision", autoMergePull({ headRefOid: "CHANGED" })],
-    ["an unowned pull request", autoMergePull({ author: { login: "other" } })],
-  ])("rejects %s before mutation", async (_name, pullRequest) => {
-    const execution = await makeExecution(["prek.toml"]);
-    const graphql = queryOnlyGraphql(pullRequest);
-    const autoMergeExecution = {
-      ...execution,
-      client: { ...execution.client, graphql } as unknown as GitHubClient,
-    };
-
-    await expect(
-      enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
-    ).rejects.toThrow(/changed before squash auto-merge/u);
-  });
-
-  it.each([
-    ["a null mutation payload", { enablePullRequestAutoMerge: null }],
-    ["a missing mutation payload", {}],
-    [
-      "a missing auto-merge request",
-      {
-        enablePullRequestAutoMerge: {
-          pullRequest: { id: "PR_node", autoMergeRequest: null },
-        },
-      },
-    ],
-    [
-      "a mismatched mutation pull request",
-      {
-        enablePullRequestAutoMerge: {
-          pullRequest: autoMergePull({
-            id: "different-node",
-            autoMergeRequest: enabledAutoMergeRequest(),
-          }),
-        },
-      },
-    ],
-  ])("disables auto-merge after %s", async (_name, mutation) => {
-    const execution = await makeExecution(["prek.toml"]);
-    const graphql = vi
-      .fn()
-      .mockResolvedValueOnce({
-        repository: { pullRequest: autoMergePull() },
-      })
-      .mockResolvedValueOnce(mutation)
-      .mockResolvedValueOnce({
-        disablePullRequestAutoMerge: {
-          pullRequest: { id: "PR_node", autoMergeRequest: null },
-        },
-      });
-    const autoMergeExecution = {
-      ...execution,
-      client: { ...execution.client, graphql } as unknown as GitHubClient,
-    };
-
-    await expect(
-      enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
-    ).rejects.toThrow(/did not confirm squash auto-merge/u);
-
-    expect(graphql).toHaveBeenCalledWith(expect.any(String), {
-      pullRequestId: "PR_node",
-    });
-    expect(core.warning).toHaveBeenCalledOnce();
-  });
-
-  it("paginates labels before and after enabling auto-merge", async () => {
-    const execution = await makeExecution(["prek.toml"]);
-    const firstPageLabels = Array.from({ length: 100 }, (_, index) => ({
-      name: `label-${index}`,
-    }));
-    const preEnableFirstPage = autoMergePull({
-      labels: {
-        nodes: firstPageLabels,
-        pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
-      },
-    });
-    const preEnableSecondPage = autoMergePull({
-      labels: {
-        nodes: [{ name: "dependencies" }],
-        pageInfo: { hasNextPage: false, endCursor: null },
-      },
-    });
-    const postEnableFirstPage = autoMergePull({
-      autoMergeRequest: enabledAutoMergeRequest(),
-      labels: {
-        nodes: firstPageLabels,
-        pageInfo: { hasNextPage: true, endCursor: "cursor-2" },
-      },
-    });
-    const postEnableSecondPage = autoMergePull({
-      autoMergeRequest: enabledAutoMergeRequest(),
-      labels: {
-        nodes: [{ name: "dependencies" }],
-        pageInfo: { hasNextPage: false, endCursor: null },
-      },
-    });
-    let enabled = false;
-    const graphql = vi.fn(
-      async (_document: string, variables: Record<string, unknown>) => {
-        if ("expectedHeadOid" in variables) {
-          enabled = true;
-          return {
-            enablePullRequestAutoMerge: {
-              pullRequest: {
-                id: "PR_node",
-                autoMergeRequest: enabledAutoMergeRequest(),
-              },
-            },
-          };
-        }
-        const cursor = variables.labelsCursor;
-        if (cursor === null) {
-          return {
-            repository: {
-              pullRequest: enabled ? postEnableFirstPage : preEnableFirstPage,
-            },
-          };
-        }
-        const expectedCursor = enabled ? "cursor-2" : "cursor-1";
-        if (cursor !== expectedCursor) {
-          throw new Error(`unexpected label cursor ${String(cursor)}`);
-        }
-        return {
-          repository: {
-            pullRequest: enabled ? postEnableSecondPage : preEnableSecondPage,
-          },
-        };
-      },
-    );
-    const autoMergeExecution = {
-      ...execution,
-      client: { ...execution.client, graphql } as unknown as GitHubClient,
-    };
-
-    await expect(
-      enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
-    ).resolves.toBeUndefined();
-
-    expect(graphql).toHaveBeenCalledWith(
-      expect.any(String),
-      expect.objectContaining({ labelsCursor: "cursor-1" }),
-    );
-    expect(graphql).toHaveBeenCalledWith(
-      expect.any(String),
-      expect.objectContaining({ labelsCursor: "cursor-2" }),
-    );
-  });
-
-  it("disables auto-merge when post-mutation ownership revalidation fails", async () => {
-    const execution = await makeExecution(["prek.toml"]);
-    const changedPull = autoMergePull({
-      baseRefName: "unexpected-base",
-      autoMergeRequest: enabledAutoMergeRequest(),
-    });
-    const graphql = vi
-      .fn()
-      .mockResolvedValueOnce({
-        repository: { pullRequest: autoMergePull() },
-      })
-      .mockResolvedValueOnce({
-        enablePullRequestAutoMerge: {
-          pullRequest: {
-            id: "PR_node",
-            autoMergeRequest: enabledAutoMergeRequest(),
-          },
-        },
-      })
-      .mockResolvedValueOnce({
-        repository: { pullRequest: changedPull },
-      })
-      .mockResolvedValueOnce({
-        disablePullRequestAutoMerge: {
-          pullRequest: { ...changedPull, autoMergeRequest: null },
-        },
-      });
-    const autoMergeExecution = {
-      ...execution,
-      client: { ...execution.client, graphql } as unknown as GitHubClient,
-    };
-
-    await expect(
-      enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
-    ).rejects.toThrow(/did not confirm squash auto-merge/u);
-
-    expect(graphql).toHaveBeenCalledWith(expect.any(String), {
-      pullRequestId: "PR_node",
-    });
-    expect(core.warning).toHaveBeenCalledOnce();
-  });
-
-  it("fails clearly when rollback of unverified auto-merge is not confirmed", async () => {
-    const execution = await makeExecution(["prek.toml"]);
-    const changedPull = autoMergePull({
-      baseRefName: "unexpected-base",
-      autoMergeRequest: enabledAutoMergeRequest(),
-    });
-    const graphql = vi
-      .fn()
-      .mockResolvedValueOnce({
-        repository: { pullRequest: autoMergePull() },
-      })
-      .mockResolvedValueOnce({
-        enablePullRequestAutoMerge: {
-          pullRequest: {
-            id: "PR_node",
-            autoMergeRequest: enabledAutoMergeRequest(),
-          },
-        },
-      })
-      .mockResolvedValueOnce({
-        repository: { pullRequest: changedPull },
-      })
-      .mockResolvedValueOnce({
-        disablePullRequestAutoMerge: { pullRequest: changedPull },
-      });
-    const autoMergeExecution = {
-      ...execution,
-      client: { ...execution.client, graphql } as unknown as GitHubClient,
-    };
-
-    await expect(
-      enablePullRequestAutoMerge(autoMergeExecution, 42, "HEAD"),
-    ).rejects.toThrow(/did not confirm that the request was disabled/u);
   });
 });
 
@@ -514,53 +225,55 @@ describe("non-mutating update preflight", () => {
 
   it("creates a missing ownership label and completes the update", async () => {
     const execution = await makeExecution(["prek.toml"]);
-    vi.mocked(execution.client.rest.issues.getLabel).mockRejectedValueOnce(
-      Object.assign(new Error("missing"), { status: 404 }),
-    );
+    execution.api.labels.delete("dependencies");
 
-    await expect(runUpdate(execution)).resolves.toEqual({ operation: "none" });
-    expect(execution.client.rest.issues.createLabel).toHaveBeenCalledWith({
-      owner: "owner",
-      repo: "repo",
-      name: "dependencies",
-      color: expect.any(String),
+    await expect(runUpdate(execution, execution.api)).resolves.toEqual({
+      operation: "none",
     });
+    expect(execution.api.labels.has("dependencies")).toBe(true);
   });
 
   it("does not create labels during configuration validation", async () => {
     const execution = await makeExecution([]);
-    vi.mocked(execution.client.rest.issues.getLabel).mockRejectedValueOnce(
-      Object.assign(new Error("missing"), { status: 404 }),
-    );
+    execution.api.labels.delete("dependencies");
+
     await validateUpdateConfiguration(execution);
-    expect(execution.client.rest.issues.createLabel).not.toHaveBeenCalled();
+    expect(execution.api.labels.has("dependencies")).toBe(false);
   });
 
   it("uses an existing label without changing it", async () => {
     const execution = await makeExecution(["prek.toml"]);
-    await expect(runUpdate(execution)).resolves.toEqual({ operation: "none" });
-    expect(execution.client.rest.issues.createLabel).not.toHaveBeenCalled();
+    execution.api.labels.set("dependencies", "ff0000");
+
+    await expect(runUpdate(execution, execution.api)).resolves.toEqual({
+      operation: "none",
+    });
+    expect(execution.api.labels.get("dependencies")).toBe("ff0000");
   });
 
   it("accepts a label created concurrently by another run", async () => {
     const execution = await makeExecution(["prek.toml"]);
-    vi.mocked(execution.client.rest.issues.getLabel).mockRejectedValueOnce(
-      Object.assign(new Error("missing"), { status: 404 }),
-    );
-    vi.mocked(execution.client.rest.issues.createLabel).mockRejectedValueOnce(
-      Object.assign(new Error("already exists"), { status: 422 }),
-    );
-    await expect(runUpdate(execution)).resolves.toEqual({ operation: "none" });
+    execution.api.labels.delete("dependencies");
+    execution.api.transitions.beforeCreateLabel = (name) => {
+      execution.api.labels.set(name, "ff0000");
+    };
+
+    await expect(runUpdate(execution, execution.api)).resolves.toEqual({
+      operation: "none",
+    });
+    expect(execution.api.labels.get("dependencies")).toBe("ff0000");
   });
 
   it.each([403, 500])("propagates label lookup failure %s", async (status) => {
     const execution = await makeExecution(["prek.toml"]);
+    execution.api.labels.delete("dependencies");
     const error = Object.assign(new Error("lookup failed"), { status });
-    vi.mocked(execution.client.rest.issues.getLabel).mockRejectedValueOnce(
-      error,
-    );
-    await expect(runUpdate(execution)).rejects.toBe(error);
-    expect(execution.client.rest.issues.createLabel).not.toHaveBeenCalled();
+    execution.api.transitions.beforeLookupLabel = () => {
+      throw error;
+    };
+
+    await expect(runUpdate(execution, execution.api)).rejects.toBe(error);
+    expect(execution.api.labels.has("dependencies")).toBe(false);
     expect(prekMocks.install).not.toHaveBeenCalled();
   });
 
@@ -568,14 +281,14 @@ describe("non-mutating update preflight", () => {
     "propagates label creation failure %s",
     async (status) => {
       const execution = await makeExecution(["prek.toml"]);
-      vi.mocked(execution.client.rest.issues.getLabel).mockRejectedValue(
-        Object.assign(new Error("missing"), { status: 404 }),
-      );
+      execution.api.labels.delete("dependencies");
       const error = Object.assign(new Error("creation failed"), { status });
-      vi.mocked(execution.client.rest.issues.createLabel).mockRejectedValueOnce(
-        error,
-      );
-      await expect(runUpdate(execution)).rejects.toBe(error);
+      execution.api.transitions.beforeCreateLabel = () => {
+        throw error;
+      };
+
+      await expect(runUpdate(execution, execution.api)).rejects.toBe(error);
+      expect(execution.api.labels.has("dependencies")).toBe(false);
       expect(prekMocks.install).not.toHaveBeenCalled();
     },
   );
@@ -589,7 +302,11 @@ describe("non-mutating update preflight", () => {
         [ownedPull(authenticatedLogin)],
         authenticatedLogin,
       );
-      await expect(runUpdate(execution)).rejects.toThrow(/branch deletion/u);
+      await expect(runUpdate(execution, execution.api)).resolves.toMatchObject({
+        operation: "closed",
+      });
+      expect(execution.api.pulls.get(42)?.state).toBe("closed");
+      expect(execution.api.refs.has("heads/chore/prek-updates")).toBe(false);
     },
   );
 
@@ -597,16 +314,19 @@ describe("non-mutating update preflight", () => {
     const execution = await makeExecution(["prek.toml"], undefined, [
       { ...ownedPull("somebody-else"), state: "closed", labels: [] },
     ]);
-    await expect(
-      validateUpdateConfiguration(execution),
-    ).resolves.toBeUndefined();
+    await expect(runUpdate(execution, execution.api)).resolves.toEqual({
+      operation: "none",
+    });
+    expect(execution.api.pulls.get(42)?.state).toBe("closed");
   });
 
   it("requires the configured ownership label", async () => {
     const execution = await makeExecution(["prek.toml"], "abc123", [
       { ...ownedPull("github-actions[bot]"), labels: [] },
     ]);
-    await expect(runUpdate(execution)).rejects.toThrow(/not owned/u);
+    await expect(runUpdate(execution, execution.api)).rejects.toThrow(
+      /not owned/u,
+    );
   });
 
   it("rejects ambiguous config discovery before running prek", async () => {
@@ -614,17 +334,23 @@ describe("non-mutating update preflight", () => {
       "prek.toml",
       ".pre-commit-config.yaml",
     ]);
-    await expect(runUpdate(execution)).rejects.toThrow(/exactly one/u);
+    await expect(runUpdate(execution, execution.api)).rejects.toThrow(
+      /exactly one/u,
+    );
   });
 
   it("rejects an unassociated update branch before running prek", async () => {
     const execution = await makeExecution(["prek.toml"], "abc123");
-    await expect(runUpdate(execution)).rejects.toThrow(/not owned/u);
+    await expect(runUpdate(execution, execution.api)).rejects.toThrow(
+      /not owned/u,
+    );
   });
 
   it("cleans its detached worktree on no change", async () => {
     const execution = await makeExecution(["prek.toml"]);
-    await expect(runUpdate(execution)).resolves.toEqual({ operation: "none" });
+    await expect(runUpdate(execution, execution.api)).resolves.toEqual({
+      operation: "none",
+    });
     const { stdout: status } = await exec("git", [
       "-C",
       execution.context.workspace,
@@ -659,7 +385,9 @@ describe("non-mutating update preflight", () => {
     });
     const execution = await makeExecution(["prek.toml"]);
 
-    await expect(runUpdate(execution)).resolves.toEqual({ operation: "none" });
+    await expect(runUpdate(execution, execution.api)).resolves.toEqual({
+      operation: "none",
+    });
     await expect(readFile(argumentsFile, "utf8")).resolves.toBe(
       "autoupdate\n--cooldown-days\n7\n",
     );
@@ -672,7 +400,7 @@ describe("non-mutating update preflight", () => {
     });
     const execution = await makeExecution(["prek.toml"]);
 
-    await expect(runUpdate(execution)).rejects.toThrow();
+    await expect(runUpdate(execution, execution.api)).rejects.toThrow();
     expect(prekMocks.cleanup).toHaveBeenCalledOnce();
   });
 
@@ -681,7 +409,7 @@ describe("non-mutating update preflight", () => {
     prekMocks.cleanup.mockRejectedValueOnce(cleanupError);
     const execution = await makeExecution(["prek.toml"]);
 
-    await expect(runUpdate(execution)).rejects.toMatchObject({
+    await expect(runUpdate(execution, execution.api)).rejects.toMatchObject({
       message: "Update operation completed but cleanup failed",
       errors: [cleanupError],
     });
@@ -696,7 +424,9 @@ describe("non-mutating update preflight", () => {
     });
     const execution = await makeExecution(["prek.toml"]);
 
-    const error = await runUpdate(execution).catch((caught: unknown) => caught);
+    const error = await runUpdate(execution, execution.api).catch(
+      (caught: unknown) => caught,
+    );
     expect(error).toMatchObject({
       message: "Update failed and cleanup also failed",
     });
@@ -710,9 +440,9 @@ describe("non-mutating update preflight", () => {
 async function makeExecution(
   files: readonly string[],
   remoteSha?: string,
-  pulls: readonly Record<string, unknown>[] = [],
+  pulls: readonly (Record<string, unknown> & { number: number })[] = [],
   authenticatedLogin = "github-actions[bot]",
-): Promise<ActionExecution> {
+): Promise<ActionExecution & { api: InMemoryGitHub }> {
   const workspace = await mkdtemp(path.join(tmpdir(), "prek-update-test-"));
   temporaryDirectories.push(workspace);
   await exec("git", ["init", "-b", "main", workspace]);
@@ -739,37 +469,15 @@ async function makeExecution(
       ? { ...pull, head: { ...head, sha: baseSha } }
       : pull;
   });
-  const getRef = async ({ ref }: { ref: string }) => {
-    if (ref === "heads/main") {
-      return { data: { object: { sha: baseSha } } };
-    }
-    if (resolvedRemoteSha === undefined) {
-      throw Object.assign(new Error("missing"), { status: 404 });
-    }
-    return { data: { object: { sha: resolvedRemoteSha } } };
-  };
-  const client = {
-    paginate: async () => effectivePulls,
-    rest: {
-      git: { getRef },
-      issues: {
-        getLabel: vi.fn(async () => ({ data: { name: "dependencies" } })),
-        createLabel: vi.fn(async () => ({ data: { name: "dependencies" } })),
-      },
-      pulls: {
-        get: async () => ({ data: effectivePulls[0] }),
-        list: async () => ({ data: [] }),
-        update: async ({ state }: { state?: string }) => ({
-          data: {
-            ...effectivePulls[0],
-            state: state ?? effectivePulls[0]?.state,
-          },
-        }),
-      },
-    },
-  } as unknown as GitHubClient;
+  const api = new InMemoryGitHub(effectivePulls, authenticatedLogin);
+  api.refs.set("heads/main", baseSha);
+  if (resolvedRemoteSha !== undefined) {
+    api.refs.set("heads/chore/prek-updates", resolvedRemoteSha);
+  }
+  api.labels.set("dependencies", "0366d6");
   return {
-    client,
+    api,
+    client: {} as GitHubClient,
     context: {
       authenticatedLogin,
       baseBranch: "main",
@@ -798,7 +506,9 @@ async function makeExecution(
   };
 }
 
-function ownedPull(login: string): Record<string, unknown> {
+function ownedPull(
+  login: string,
+): Record<string, unknown> & { number: number } {
   return {
     base: { ref: "main" },
     body: BODY_MARKER,
@@ -814,82 +524,4 @@ function ownedPull(login: string): Record<string, unknown> {
     updated_at: "2026-07-28T00:00:00Z",
     user: { login },
   };
-}
-
-function autoMergePull(
-  overrides: Partial<{
-    readonly author: { readonly login: string } | null;
-    readonly autoMergeRequest: {
-      readonly enabledAt: string;
-      readonly mergeMethod: string;
-    } | null;
-    readonly baseRefName: string;
-    readonly headRefOid: string;
-    readonly id: string;
-    readonly labels: {
-      readonly nodes: readonly { readonly name: string }[];
-      readonly pageInfo: {
-        readonly hasNextPage: boolean;
-        readonly endCursor: string | null;
-      };
-    };
-    readonly number: number;
-  }> = {},
-): {
-  readonly autoMergeRequest: {
-    readonly enabledAt: string;
-    readonly mergeMethod: string;
-  } | null;
-  readonly author: { readonly login: string } | null;
-  readonly baseRefName: string;
-  readonly body: string;
-  readonly headRefOid: string;
-  readonly headRefName: string;
-  readonly headRepository: { readonly nameWithOwner: string } | null;
-  readonly id: string;
-  readonly labels: {
-    readonly nodes: readonly { readonly name: string }[];
-    readonly pageInfo: {
-      readonly hasNextPage: boolean;
-      readonly endCursor: string | null;
-    };
-  };
-  readonly number: number;
-  readonly state: string;
-} {
-  return {
-    author: { login: "github-actions[bot]" },
-    autoMergeRequest: null,
-    baseRefName: "main",
-    body: BODY_MARKER,
-    headRefOid: "HEAD",
-    headRefName: "chore/prek-updates",
-    headRepository: { nameWithOwner: "owner/repo" },
-    id: "PR_node",
-    labels: {
-      nodes: [{ name: "dependencies" }],
-      pageInfo: { hasNextPage: false, endCursor: null },
-    },
-    number: 42,
-    state: "OPEN",
-    ...overrides,
-  };
-}
-
-function enabledAutoMergeRequest() {
-  return {
-    enabledAt: "2026-08-23T12:00:00Z",
-    mergeMethod: "SQUASH",
-  };
-}
-
-function queryOnlyGraphql(pullRequest: unknown) {
-  return vi.fn(
-    async (_document: string, variables: Record<string, unknown>) => {
-      if ("expectedHeadOid" in variables) {
-        throw new Error("unexpected auto-merge mutation");
-      }
-      return { repository: { pullRequest } };
-    },
-  );
 }

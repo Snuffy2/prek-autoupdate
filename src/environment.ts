@@ -49,19 +49,6 @@ export function sanitizedChildEnvironment(
   };
 }
 
-/** Prefix Git arguments with settings that suppress hooks and credential helpers. */
-export function hardenedGitArguments(
-  arguments_: readonly string[],
-): readonly string[] {
-  return [
-    "-c",
-    "core.hooksPath=/dev/null",
-    "-c",
-    "credential.helper=",
-    ...arguments_,
-  ];
-}
-
 function isBlocked(key: string): boolean {
   return (
     key.startsWith("INPUT_") ||

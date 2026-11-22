@@ -4,7 +4,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { cleanupUpdateBranches } from "../../src/cleanup/index.js";
 import {
+  CreatedPullOwnershipError,
   PublishedPullRequestError,
+  PublishedUpdateError,
   type ActionContext,
   type ActionInputs,
 } from "../../src/contracts.js";
@@ -115,6 +117,33 @@ describe("runAction", () => {
     expect(core.setOutput).toHaveBeenCalledWith("pull-request-number", "42");
   });
 
+  it("protects an unverified creation during cleanup without reporting it as published", async () => {
+    const ownershipError = new CreatedPullOwnershipError(
+      42,
+      new Error("PR changed"),
+    );
+    vi.mocked(runUpdate).mockRejectedValue(
+      new AggregateError(
+        [ownershipError, new Error("Worktree cleanup failed")],
+        "Update and cleanup failed",
+        { cause: ownershipError },
+      ),
+    );
+
+    await runAction();
+
+    expect(cleanupUpdateBranches).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        keepPullRequestNumber: 42,
+        keepBranch: inputs.updateBranch,
+        keepLatestOpenPullRequest: true,
+      }),
+    );
+    expect(core.setOutput).toHaveBeenCalledWith("pull-request-number", "");
+    expect(core.setFailed).toHaveBeenCalled();
+  });
+
   it("runs push reconciliation without updating", async () => {
     vi.mocked(resolveContext).mockResolvedValue({
       ...context,
@@ -189,6 +218,42 @@ describe("runAction", () => {
     );
     expect(core.setFailed).toHaveBeenCalledWith(
       expect.stringContaining("auto-merge failed"),
+    );
+  });
+
+  it("keeps the exact published result through an update and cleanup failure", async () => {
+    const result = { operation: "updated" as const, pullRequestNumber: 41 };
+    vi.mocked(runUpdate).mockRejectedValue(
+      new PublishedUpdateError(
+        result,
+        new AggregateError(
+          [
+            new Error("auto-merge failed"),
+            new Error("worktree cleanup failed"),
+          ],
+          "Update failed and cleanup also failed",
+        ),
+      ),
+    );
+    vi.mocked(cleanupUpdateBranches).mockRejectedValue(
+      new Error("action cleanup failed"),
+    );
+
+    await runAction();
+
+    expect(cleanupUpdateBranches).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        keepPullRequestNumber: 41,
+        keepLatestOpenPullRequest: false,
+      }),
+    );
+    expect(core.setOutput).toHaveBeenCalledWith("pull-request-number", "41");
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining("auto-merge failed"),
+    );
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining("action cleanup failed"),
     );
   });
 

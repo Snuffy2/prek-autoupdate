@@ -4,18 +4,22 @@ import {
   closeIdentity,
   closedDeletionIdentity,
   headRef,
-  payload,
   pullChangedFiles,
   pullNumber,
   sameRepoHeadRef,
 } from "../../src/cleanup/payload.js";
 
+import { payload } from "../../src/github.js";
+
 describe("cleanup payload validation", () => {
-  it.each([null, [], "pull", 1])("rejects non-object payload %j", (value) => {
-    expect(() => payload(value, "pull request object")).toThrow(
-      "Expected pull request object",
-    );
-  });
+  it.each([[null], [[]], ["pull"], [1]])(
+    "rejects non-object payload %j",
+    (value) => {
+      expect(() => payload(value, "pull request object")).toThrow(
+        "Expected pull request object",
+      );
+    },
+  );
 
   it.each([undefined, -1, 1.5, "x", {}, null])(
     "rejects malformed pull numbers %j",
