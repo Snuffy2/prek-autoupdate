@@ -58,6 +58,9 @@ export async function cleanupWithApi(
     policy.repository,
     policy.branchPrefix,
   );
+  if (options.keepBranch !== undefined) {
+    protectedBranches.add(options.keepBranch);
+  }
   const queued = new Map<string, BranchDeletion>();
   const latest = options.keepLatestOpenPullRequest
     ? Math.max(...workflowNumbers, Number.NEGATIVE_INFINITY)

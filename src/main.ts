@@ -8,6 +8,7 @@ import type {
   UpdateResult,
 } from "./contracts.js";
 import {
+  CreatedPullOwnershipError,
   PublishedPullRequestError,
   PublishedUpdateError,
 } from "./contracts.js";
@@ -30,6 +31,7 @@ export async function runAction(now: Date = new Date()): Promise<void> {
   const client = github.getOctokit(inputs.token);
   const context = await resolveContext(client, inputs);
   const execution: ActionExecution = { client, context, inputs };
+  let unverifiedCreatedPull: number | undefined;
   validateCleanupConfiguration(execution);
 
   const failures: Array<{ readonly phase: string; readonly error: unknown }> =
@@ -53,11 +55,19 @@ export async function runAction(now: Date = new Date()): Promise<void> {
     } else if (error instanceof PublishedUpdateError) {
       updateResult = error.publishedPullRequest;
     }
+    const updateCause = error instanceof AggregateError ? error.cause : error;
+    if (updateCause instanceof CreatedPullOwnershipError) {
+      unverifiedCreatedPull = updateCause.pullRequestNumber;
+    }
     failures.push({ phase: "update", error });
   } finally {
     try {
       cleanupResult = await cleanupUpdateBranches(execution, {
-        keepPullRequestNumber: updateResult.pullRequestNumber,
+        keepPullRequestNumber:
+          unverifiedCreatedPull ?? updateResult.pullRequestNumber,
+        ...(unverifiedCreatedPull === undefined
+          ? {}
+          : { keepBranch: inputs.updateBranch }),
         keepLatestOpenPullRequest: updateResult.pullRequestNumber === undefined,
         closeStalePullRequests: context.eventName !== "push",
         closeObsoletePullRequests: context.eventName === "push",

@@ -39,6 +39,20 @@ export interface UpdateResult {
   readonly cleanup?: CleanupResult;
 }
 
+/** A newly created pull whose identity could not be reverified for mutation. */
+export class CreatedPullOwnershipError extends Error {
+  constructor(
+    readonly pullRequestNumber: number,
+    cause: unknown,
+  ) {
+    super(
+      `Could not verify ownership of created pull request #${pullRequestNumber}; the pull request and update branch were preserved for inspection`,
+      { cause },
+    );
+    this.name = "CreatedPullOwnershipError";
+  }
+}
+
 /** Failure after a pull request was safely published and must survive cleanup. */
 export class PublishedPullRequestError extends Error {
   readonly publishedPullRequest: UpdateResult;
@@ -73,6 +87,7 @@ export class PublishedUpdateError extends Error {
 
 export interface CleanupOptions {
   readonly keepPullRequestNumber?: number;
+  readonly keepBranch?: string;
   readonly keepLatestOpenPullRequest: boolean;
   readonly closeStalePullRequests: boolean;
   readonly closeObsoletePullRequests: boolean;

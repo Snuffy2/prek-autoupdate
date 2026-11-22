@@ -1,6 +1,7 @@
 import * as core from "@actions/core";
 
 import {
+  CreatedPullOwnershipError,
   PublishedPullRequestError,
   type ActionExecution,
   type UpdateResult,
@@ -177,9 +178,39 @@ async function publishNewPull(
   }
   try {
     await api.addLabel(pullNumber, execution.inputs.label);
-    await proveCreatedOwnership(api, execution, pullNumber, newSha, body);
-  } catch (error) {
-    await rollbackCreatedPullRequest(api, execution, pullNumber, newSha, error);
+  } catch (labelError) {
+    try {
+      // The label may be absent, so prove the identity of the PR we just created.
+      await proveCreatedOwnership(
+        api,
+        execution,
+        pullNumber,
+        newSha,
+        body,
+        false,
+      );
+    } catch (proofError) {
+      throw new CreatedPullOwnershipError(
+        pullNumber,
+        new AggregateError(
+          [labelError, proofError],
+          "Label application and ownership verification failed",
+          { cause: labelError },
+        ),
+      );
+    }
+    await rollbackCreatedPullRequest(
+      api,
+      execution,
+      pullNumber,
+      newSha,
+      labelError,
+    );
+  }
+  try {
+    await proveCreatedOwnership(api, execution, pullNumber, newSha, body, true);
+  } catch (proofError) {
+    throw new CreatedPullOwnershipError(pullNumber, proofError);
   }
   return pullNumber;
 }
@@ -438,21 +469,29 @@ async function recoverAmbiguousCreatedPull(
   });
   const matches = pulls
     .map((pull) => pullFromData(pull))
-    .filter(
-      (pull) =>
-        pull.author === execution.context.authenticatedLogin &&
-        pull.state === "open" &&
-        pull.body === body &&
-        pull.title === execution.inputs.prTitle &&
-        pull.headRef === execution.inputs.updateBranch &&
-        isSameRepository(
-          pull.headRepository,
-          execution.context.repositoryFullName,
-        ) &&
-        pull.headSha === newSha &&
-        pull.baseRef === execution.context.baseBranch,
-    );
+    .filter((pull) => matchesCreatedPull(execution, pull, newSha, body));
   return matches.length === 1 ? matches[0]?.number : undefined;
+}
+
+function matchesCreatedPull(
+  execution: PublicationContext,
+  pull: PullRequest,
+  newSha: string,
+  body: string,
+): boolean {
+  return (
+    pull.author === execution.context.authenticatedLogin &&
+    pull.state === "open" &&
+    pull.body === body &&
+    pull.title === execution.inputs.prTitle &&
+    pull.headRef === execution.inputs.updateBranch &&
+    isSameRepository(
+      pull.headRepository,
+      execution.context.repositoryFullName,
+    ) &&
+    pull.headSha === newSha &&
+    pull.baseRef === execution.context.baseBranch
+  );
 }
 
 async function proveCreatedOwnership(
@@ -461,15 +500,13 @@ async function proveCreatedOwnership(
   pullNumber: number,
   newSha: string,
   body: string,
+  requireLabel: boolean,
 ): Promise<void> {
   const pull = pullFromData(await api.getPull(pullNumber));
   if (
     pull.number !== pullNumber ||
-    pull.state !== "open" ||
-    !isOwned(execution, pull) ||
-    pull.headSha !== newSha ||
-    pull.title !== execution.inputs.prTitle ||
-    pull.body !== body
+    !matchesCreatedPull(execution, pull, newSha, body) ||
+    (requireLabel && !isOwned(execution, pull))
   ) {
     throw new Error(
       "GitHub did not return the exact owned pull request after creation",

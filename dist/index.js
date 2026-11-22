@@ -36543,6 +36543,9 @@ async function cleanupWithApi(api, execution, options) {
     const workflowOpen = openPulls.filter((pull) => isWorkflowPull(pull, policy));
     const workflowNumbers = new Set(workflowOpen.map(pullNumber));
     const protectedBranches = collectProtectedBranches(openPulls, workflowNumbers, policy.repository, policy.branchPrefix);
+    if (options.keepBranch !== undefined) {
+        protectedBranches.add(options.keepBranch);
+    }
     const queued = new Map();
     const latest = options.keepLatestOpenPullRequest
         ? Math.max(...workflowNumbers, Number.NEGATIVE_INFINITY)
@@ -36830,6 +36833,15 @@ function closedPullStillOwned(pull, candidate, policy) {
         isWorkflowPull(pull, policy));
 }
 
+/** A newly created pull whose identity could not be reverified for mutation. */
+class CreatedPullOwnershipError extends Error {
+    pullRequestNumber;
+    constructor(pullRequestNumber, cause) {
+        super(`Could not verify ownership of created pull request #${pullRequestNumber}; the pull request and update branch were preserved for inspection`, { cause });
+        this.pullRequestNumber = pullRequestNumber;
+        this.name = "CreatedPullOwnershipError";
+    }
+}
 /** Failure after a pull request was safely published and must survive cleanup. */
 class PublishedPullRequestError extends Error {
     publishedPullRequest;
@@ -40614,10 +40626,22 @@ async function publishNewPull(api, execution, remote, worktree, newSha, body) {
     }
     try {
         await api.addLabel(pullNumber, execution.inputs.label);
-        await proveCreatedOwnership(api, execution, pullNumber, newSha, body);
     }
-    catch (error) {
-        await rollbackCreatedPullRequest(api, execution, pullNumber, newSha, error);
+    catch (labelError) {
+        try {
+            // The label may be absent, so prove the identity of the PR we just created.
+            await proveCreatedOwnership(api, execution, pullNumber, newSha, body, false);
+        }
+        catch (proofError) {
+            throw new CreatedPullOwnershipError(pullNumber, new AggregateError([labelError, proofError], "Label application and ownership verification failed", { cause: labelError }));
+        }
+        await rollbackCreatedPullRequest(api, execution, pullNumber, newSha, labelError);
+    }
+    try {
+        await proveCreatedOwnership(api, execution, pullNumber, newSha, body, true);
+    }
+    catch (proofError) {
+        throw new CreatedPullOwnershipError(pullNumber, proofError);
     }
     return pullNumber;
 }
@@ -40769,7 +40793,11 @@ async function recoverAmbiguousCreatedPull(api, execution, newSha, body) {
     });
     const matches = pulls
         .map((pull) => pullFromData(pull))
-        .filter((pull) => pull.author === execution.context.authenticatedLogin &&
+        .filter((pull) => matchesCreatedPull(execution, pull, newSha, body));
+    return matches.length === 1 ? matches[0]?.number : undefined;
+}
+function matchesCreatedPull(execution, pull, newSha, body) {
+    return (pull.author === execution.context.authenticatedLogin &&
         pull.state === "open" &&
         pull.body === body &&
         pull.title === execution.inputs.prTitle &&
@@ -40777,16 +40805,12 @@ async function recoverAmbiguousCreatedPull(api, execution, newSha, body) {
         isSameRepository(pull.headRepository, execution.context.repositoryFullName) &&
         pull.headSha === newSha &&
         pull.baseRef === execution.context.baseBranch);
-    return matches.length === 1 ? matches[0]?.number : undefined;
 }
-async function proveCreatedOwnership(api, execution, pullNumber, newSha, body) {
+async function proveCreatedOwnership(api, execution, pullNumber, newSha, body, requireLabel) {
     const pull = pullFromData(await api.getPull(pullNumber));
     if (pull.number !== pullNumber ||
-        pull.state !== "open" ||
-        !isOwned(execution, pull) ||
-        pull.headSha !== newSha ||
-        pull.title !== execution.inputs.prTitle ||
-        pull.body !== body) {
+        !matchesCreatedPull(execution, pull, newSha, body) ||
+        (requireLabel && !isOwned(execution, pull))) {
         throw new Error("GitHub did not return the exact owned pull request after creation");
     }
 }
@@ -41386,6 +41410,7 @@ async function runAction(now = new Date()) {
     const client = getOctokit(inputs.token);
     const context = await resolveContext(client, inputs);
     const execution = { client, context, inputs };
+    let unverifiedCreatedPull;
     validateCleanupConfiguration(execution);
     const failures = [];
     let updateResult = { operation: "none" };
@@ -41407,12 +41432,19 @@ async function runAction(now = new Date()) {
         else if (error instanceof PublishedUpdateError) {
             updateResult = error.publishedPullRequest;
         }
+        const updateCause = error instanceof AggregateError ? error.cause : error;
+        if (updateCause instanceof CreatedPullOwnershipError) {
+            unverifiedCreatedPull = updateCause.pullRequestNumber;
+        }
         failures.push({ phase: "update", error });
     }
     finally {
         try {
             cleanupResult = await cleanupUpdateBranches(execution, {
-                keepPullRequestNumber: updateResult.pullRequestNumber,
+                keepPullRequestNumber: unverifiedCreatedPull ?? updateResult.pullRequestNumber,
+                ...(unverifiedCreatedPull === undefined
+                    ? {}
+                    : { keepBranch: inputs.updateBranch }),
                 keepLatestOpenPullRequest: updateResult.pullRequestNumber === undefined,
                 closeStalePullRequests: context.eventName !== "push",
                 closeObsoletePullRequests: context.eventName === "push",

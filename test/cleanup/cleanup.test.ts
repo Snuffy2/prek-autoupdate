@@ -104,6 +104,15 @@ function compare(
 }
 
 describe("cleanupUpdateBranches safety behavior", () => {
+  it("keeps an explicitly protected branch even when its closed pull is eligible for deletion", async () => {
+    const github = seed(closed());
+
+    await expect(
+      cleanupWithApi(github, execution, { ...defaults, keepBranch: branch }),
+    ).resolves.toEqual(unchanged);
+    expect(github.refs.get(headRef)).toBe("head");
+  });
+
   it("closes a stale owned pull and retains its ref", async () => {
     const github = seed(pull());
 

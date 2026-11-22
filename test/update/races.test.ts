@@ -1006,6 +1006,28 @@ describe("update publication races", () => {
     await expect(remoteSha(harness.remote)).rejects.toThrow();
   });
 
+  it.each([false, true])(
+    "preserves a changed pull and its branch when label application fails: %s",
+    async (labelFails) => {
+      const harness = await makeHarness();
+      harness.api.transitions.beforeAddLabel = ({ number }) => {
+        harness.api.patchPull(number, { title: "Changed after creation" });
+        if (labelFails) throw new Error("label failed");
+      };
+
+      const error = await runUpdate(harness.execution, harness.api).catch(
+        (caught: unknown) => caught,
+      );
+
+      expect(harness.api.pulls.get(42)).toMatchObject({
+        state: "open",
+        title: "Changed after creation",
+        head: { sha: await remoteSha(harness.remote) },
+      });
+      expect(error).toMatchObject({ pullRequestNumber: 42 });
+    },
+  );
+
   it("accepts an unexpected update response only after an exact fresh GET", async () => {
     const harness = await makeHarness({ existing: true });
     harness.api.patchPull(42, {
