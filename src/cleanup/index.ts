@@ -1,8 +1,4 @@
-import type {
-  ActionExecution,
-  CleanupOptions,
-  CleanupResult,
-} from "../contracts.js";
+import type { ActionExecution, CleanupResult } from "../contracts.js";
 import { ownershipPolicy, type OwnershipPolicy } from "../ownership.js";
 import { OctokitGitHubApi, type GitHubApi, type Payload } from "../github.js";
 import type {
@@ -25,9 +21,14 @@ import {
   sameRepoHeadRef,
 } from "./payload.js";
 
+interface CleanupUpdateFacts {
+  readonly publishedPullRequestNumber?: number;
+  readonly unverifiedCreatedPullRequestNumber?: number;
+}
+
 export async function cleanupUpdateBranches(
   execution: ActionExecution,
-  options: CleanupOptions,
+  update: CleanupUpdateFacts,
 ): Promise<CleanupResult> {
   const api = new OctokitGitHubApi(
     execution.client,
@@ -36,14 +37,15 @@ export async function cleanupUpdateBranches(
     execution.inputs.token,
     execution.context.serverUrl,
   );
-  return cleanupWithApi(api, execution, options);
+  return cleanupWithApi(api, execution, update);
 }
 
 export async function cleanupWithApi(
   api: GitHubApi,
   execution: Pick<ActionExecution, "context" | "inputs">,
-  options: CleanupOptions,
+  update: CleanupUpdateFacts,
 ): Promise<CleanupResult> {
+  const push = execution.context.eventName === "push";
   const result = {
     closedPullRequests: [] as number[],
     deletedBranches: [] as string[],
@@ -58,53 +60,37 @@ export async function cleanupWithApi(
     policy.repository,
     policy.branchPrefix,
   );
-  if (options.keepBranch !== undefined) {
-    protectedBranches.add(options.keepBranch);
+  const unverifiedPull = update.unverifiedCreatedPullRequestNumber;
+  if (unverifiedPull !== undefined) {
+    protectedBranches.add(policy.updateBranch);
   }
   const queued = new Map<string, BranchDeletion>();
-  const latest = options.keepLatestOpenPullRequest
-    ? Math.max(...workflowNumbers, Number.NEGATIVE_INFINITY)
-    : undefined;
+  const retainedPull = push
+    ? undefined
+    : (update.publishedPullRequestNumber ??
+      Math.max(...workflowNumbers, Number.NEGATIVE_INFINITY));
 
   for (const pull of workflowOpen) {
     const number = pullNumber(pull);
-    if (
-      await closeObsolete(
-        api,
-        pull,
-        policy,
-        options.closeObsoletePullRequests,
-        result,
-        protectedBranches,
-      )
-    )
-      continue;
-    await handleStale(
-      api,
-      pull,
-      number === options.keepPullRequestNumber || number === latest,
-      options.closeStalePullRequests,
-      policy,
-      result,
-      protectedBranches,
-    );
+    if (push) {
+      await closeObsolete(api, pull, policy, result, protectedBranches);
+    } else if (number === retainedPull || number === unverifiedPull) {
+      protectedBranches.add(headRef(pull));
+    } else {
+      await closeStale(api, pull, policy, result, protectedBranches);
+    }
   }
 
-  if (options.deleteStaleBranches || options.deleteMergedBranches) {
-    for (const pull of (await api.listPulls("closed")).filter((item) =>
-      isWorkflowPull(item, policy),
-    )) {
-      const stale = pull.merged_at === null || pull.merged_at === undefined;
-      if (!(stale ? options.deleteStaleBranches : options.deleteMergedBranches))
-        continue;
-      const candidate = closedDeletionIdentity(pull);
-      const sha = await matchingBranchHeadSha(api, pull, policy.repository);
-      if (candidate !== undefined && sha !== undefined) {
-        queueDeletion(queued, protectedBranches, headRef(pull), {
-          expectedSha: sha,
-          candidates: [candidate],
-        });
-      }
+  for (const pull of (await api.listPulls("closed")).filter((item) =>
+    isWorkflowPull(item, policy),
+  )) {
+    const candidate = closedDeletionIdentity(pull);
+    const sha = await matchingBranchHeadSha(api, pull, policy.repository);
+    if (candidate !== undefined && sha !== undefined) {
+      queueDeletion(queued, protectedBranches, headRef(pull), {
+        expectedSha: sha,
+        candidates: [candidate],
+      });
     }
   }
   await deleteQueued(api, queued, protectedBranches, result, policy);
@@ -129,21 +115,15 @@ function collectProtectedBranches(
   return result;
 }
 
-async function handleStale(
+async function closeStale(
   api: GitHubApi,
   pull: Payload,
-  keep: boolean,
-  enabled: boolean,
   policy: OwnershipPolicy,
   result: { closedPullRequests: number[] },
   protectedBranches: Set<string>,
 ): Promise<void> {
   const number = pullNumber(pull);
   const branch = headRef(pull);
-  if (keep || !enabled) {
-    protectedBranches.add(branch);
-    return;
-  }
   if (!isWorkflowPull(await api.getPull(number), policy)) {
     protectedBranches.add(branch);
     return;
@@ -262,22 +242,24 @@ async function closeObsolete(
   api: GitHubApi,
   pull: Payload,
   policy: OwnershipPolicy,
-  enabled: boolean,
   result: { closedPullRequests: number[] },
   protectedBranches: Set<string>,
-): Promise<boolean> {
-  const snapshot = enabled ? await obsoleteSnapshot(api, pull) : undefined;
-  if (snapshot === undefined) return false;
+): Promise<void> {
+  const snapshot = await obsoleteSnapshot(api, pull);
+  if (snapshot === undefined) {
+    protectedBranches.add(headRef(pull));
+    return;
+  }
   const number = pullNumber(pull);
   if (!isWorkflowPull(await api.getPull(number), policy)) {
     protectedBranches.add(snapshot.headRef);
-    return true;
+    return;
   }
   const closed = await api.closePull(number);
   const identity = closeIdentity(closed);
   if (identity === undefined) {
     protectedBranches.add(snapshot.headRef);
-    return true;
+    return;
   }
   if (!isWorkflowPull(closed, policy)) {
     await reopenAndProtect(
@@ -288,7 +270,7 @@ async function closeObsolete(
       result,
       policy,
     );
-    return true;
+    return;
   }
   try {
     const snapshotMatches = await pullMatchesSnapshot(
@@ -309,7 +291,7 @@ async function closeObsolete(
         result,
         policy,
       );
-      return true;
+      return;
     }
   } catch (error: unknown) {
     try {
@@ -332,7 +314,6 @@ async function closeObsolete(
   }
   result.closedPullRequests.push(number);
   protectedBranches.add(snapshot.headRef);
-  return true;
 }
 
 async function reopenAndProtect(

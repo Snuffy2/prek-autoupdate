@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { cleanupWithApi } from "../../src/cleanup/index.js";
-import type { ActionExecution, CleanupOptions } from "../../src/contracts.js";
+import type { ActionExecution } from "../../src/contracts.js";
 import type { Payload } from "../../src/github.js";
 import { InMemoryGitHub } from "../support/in-memory-github.js";
 
@@ -37,6 +37,17 @@ function closed(overrides: Partial<TestPull> = {}): TestPull {
   });
 }
 
+function pullOnBranch(number: number, suffix: string): TestPull {
+  return pull({
+    number,
+    head: {
+      ref: `${branch}-${suffix}`,
+      sha: suffix,
+      repo: { full_name: repository },
+    },
+  });
+}
+
 const execution: Pick<ActionExecution, "context" | "inputs"> = {
   context: {
     eventName: "schedule",
@@ -65,19 +76,10 @@ const execution: Pick<ActionExecution, "context" | "inputs"> = {
   },
 };
 
-const defaults: CleanupOptions = {
-  keepLatestOpenPullRequest: false,
-  closeStalePullRequests: true,
-  closeObsoletePullRequests: false,
-  deleteStaleBranches: true,
-  deleteMergedBranches: true,
-};
-
 const headRef = `heads/${branch}`;
-const obsolete = {
-  ...defaults,
-  closeObsoletePullRequests: true,
-  closeStalePullRequests: false,
+const push = {
+  ...execution,
+  context: { ...execution.context, eventName: "push" as const },
 };
 const unchanged = { closedPullRequests: [], deletedBranches: [] };
 
@@ -104,33 +106,79 @@ function compare(
 }
 
 describe("cleanupUpdateBranches safety behavior", () => {
-  it("keeps an explicitly protected branch even when its closed pull is eligible for deletion", async () => {
-    const github = seed(closed());
+  it("protects an unverified creation and the configured update branch while retaining the latest owned pull", async () => {
+    const github = seed(
+      closed({ number: 4 }),
+      pullOnBranch(1, "stale"),
+      pullOnBranch(2, "unverified"),
+      pullOnBranch(3, "latest"),
+    );
+    for (const suffix of ["stale", "unverified", "latest"]) {
+      github.refs.set(`heads/${branch}-${suffix}`, suffix);
+    }
 
     await expect(
-      cleanupWithApi(github, execution, { ...defaults, keepBranch: branch }),
-    ).resolves.toEqual(unchanged);
+      cleanupWithApi(github, execution, {
+        unverifiedCreatedPullRequestNumber: 2,
+      }),
+    ).resolves.toEqual({ closedPullRequests: [1], deletedBranches: [] });
+    expect(github.pulls.get(1)?.state).toBe("closed");
+    expect(github.pulls.get(2)?.state).toBe("open");
+    expect(github.pulls.get(3)?.state).toBe("open");
     expect(github.refs.get(headRef)).toBe("head");
+    expect(github.refs.get(`heads/${branch}-unverified`)).toBe("unverified");
+    expect(github.refs.get(`heads/${branch}-latest`)).toBe("latest");
   });
 
-  it("closes a stale owned pull and retains its ref", async () => {
-    const github = seed(pull());
+  it("retains the published pull over a higher-numbered owned pull and preserves the newly closed ref", async () => {
+    const staleBranch = "prek-autoupdate-stale";
+    const github = seed(pull(), pullOnBranch(2, "stale"));
+    github.refs.set(`heads/${staleBranch}`, "stale");
 
-    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual({
+    await expect(
+      cleanupWithApi(github, execution, { publishedPullRequestNumber: 1 }),
+    ).resolves.toEqual({
+      closedPullRequests: [2],
+      deletedBranches: [],
+    });
+    expect(github.pulls.get(1)?.state).toBe("open");
+    expect(github.pulls.get(2)?.state).toBe("closed");
+    expect(github.refs.get(headRef)).toBe("head");
+    expect(github.refs.get(`heads/${staleBranch}`)).toBe("stale");
+  });
+
+  it("retains the highest-numbered open owned pull on manual dispatch without a publication", async () => {
+    const github = seed(pullOnBranch(2, "latest"), pull(), {
+      ...pullOnBranch(3, "human"),
+      labels: [],
+      user: { login: "human" },
+    });
+    github.refs.set(`heads/${branch}-latest`, "latest");
+    const dispatch = {
+      ...execution,
+      context: {
+        ...execution.context,
+        eventName: "workflow_dispatch" as const,
+      },
+    };
+
+    await expect(cleanupWithApi(github, dispatch, {})).resolves.toEqual({
       closedPullRequests: [1],
       deletedBranches: [],
     });
     expect(github.pulls.get(1)?.state).toBe("closed");
-    expect(github.refs.get(headRef)).toBe("head");
+    expect(github.pulls.get(2)?.state).toBe("open");
+    expect(github.pulls.get(3)?.state).toBe("open");
+    expect(github.refs.get(`heads/${branch}-latest`)).toBe("latest");
   });
 
   it("preserves an open pull that loses its label after listing", async () => {
-    const github = seed(pull());
+    const github = seed(pull(), pullOnBranch(2, "latest"));
     github.transitions.afterListPulls = (state) => {
       if (state === "open") github.patchPull(1, { labels: [] });
     };
 
-    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
+    await expect(cleanupWithApi(github, execution, {})).resolves.toEqual(
       unchanged,
     );
     expect(github.pulls.get(1)).toMatchObject({ state: "open", labels: [] });
@@ -158,13 +206,16 @@ describe("cleanupUpdateBranches safety behavior", () => {
     "preserves open and closed pull requests and refs with %s",
     async (_reason, overrides, headBranch) => {
       for (const candidate of [pull(overrides), closed(overrides)]) {
-        const github = new InMemoryGitHub([candidate]);
+        const github = new InMemoryGitHub([
+          candidate,
+          pullOnBranch(2, "latest"),
+        ]);
         const ref = `heads/${headBranch}`;
         github.refs.set(ref, "head");
 
-        await expect(
-          cleanupWithApi(github, execution, defaults),
-        ).resolves.toEqual(unchanged);
+        await expect(cleanupWithApi(github, execution, {})).resolves.toEqual(
+          unchanged,
+        );
         expect(github.pulls.get(1)).toEqual(candidate);
         expect(github.refs.get(ref)).toBe("head");
       }
@@ -175,7 +226,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
     const github = seed(closed());
     github.refs.set(headRef, "moved");
 
-    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
+    await expect(cleanupWithApi(github, execution, {})).resolves.toEqual(
       unchanged,
     );
     expect(github.refs.get(headRef)).toBe("moved");
@@ -185,7 +236,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
     const open = pull({ number: 9, labels: [], user: { login: "human" } });
     const github = seed(closed(), open);
 
-    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
+    await expect(cleanupWithApi(github, execution, {})).resolves.toEqual(
       unchanged,
     );
     expect(github.pulls.get(9)).toEqual(open);
@@ -209,7 +260,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
             ...execution,
             inputs: { ...execution.inputs, branchPrefix: "automation/" },
           },
-          defaults,
+          {},
         ),
       ).resolves.toEqual({
         closedPullRequests: [],
@@ -239,22 +290,35 @@ describe("cleanupUpdateBranches safety behavior", () => {
         }
       };
 
-      await expect(
-        cleanupWithApi(github, execution, defaults),
-      ).resolves.toEqual(unchanged);
+      await expect(cleanupWithApi(github, execution, {})).resolves.toEqual(
+        unchanged,
+      );
       expect(github.refs.get(headRef)).toBe(finalRevision);
     },
   );
 
-  it("closes a zero-change obsolete pull with a stable snapshot", async () => {
-    const github = zeroChange();
+  it("on push closes the newest obsolete pull and preserves the still-needed pull and both refs", async () => {
+    const obsoleteBranch = "prek-autoupdate-obsolete";
+    const github = seed(pull(), {
+      ...pullOnBranch(2, "obsolete"),
+      changed_files: 0,
+    });
+    github.refs.set(`heads/${obsoleteBranch}`, "obsolete");
+    compare(
+      github,
+      [{ filename: "a" }],
+      new Map([["a", "proposed"]]),
+      new Map([["a", "current"]]),
+    );
 
-    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual({
-      closedPullRequests: [1],
+    await expect(cleanupWithApi(github, push, {})).resolves.toEqual({
+      closedPullRequests: [2],
       deletedBranches: [],
     });
-    expect(github.pulls.get(1)?.state).toBe("closed");
+    expect(github.pulls.get(1)?.state).toBe("open");
+    expect(github.pulls.get(2)?.state).toBe("closed");
     expect(github.refs.get(headRef)).toBe("head");
+    expect(github.refs.get(`heads/${obsoleteBranch}`)).toBe("obsolete");
   });
 
   it("reopens the exact close when the branch revision no longer matches", async () => {
@@ -263,9 +327,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
       github.refs.set(headRef, "moved");
     };
 
-    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
-      unchanged,
-    );
+    await expect(cleanupWithApi(github, push, {})).resolves.toEqual(unchanged);
     expect(github.pulls.get(1)).toMatchObject({
       state: "open",
       closed_at: null,
@@ -282,9 +344,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
       new Map([["a", "100644\0blob\0different"]]),
     );
 
-    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
-      unchanged,
-    );
+    await expect(cleanupWithApi(github, push, {})).resolves.toEqual(unchanged);
     expect(github.pulls.get(1)?.state).toBe("open");
   });
 
@@ -297,9 +357,9 @@ describe("cleanupUpdateBranches safety behavior", () => {
       const github = seed(pull({ changed_files: count }));
       github.comparisons.set("base...head", files);
 
-      await expect(
-        cleanupWithApi(github, execution, obsolete),
-      ).resolves.toEqual(unchanged);
+      await expect(cleanupWithApi(github, push, {})).resolves.toEqual(
+        unchanged,
+      );
       expect(github.pulls.get(1)?.state).toBe("open");
     },
   );
@@ -311,9 +371,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
       Array.from({ length: 300 }, (_, index) => ({ filename: `${index}` })),
     );
 
-    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
-      unchanged,
-    );
+    await expect(cleanupWithApi(github, push, {})).resolves.toEqual(unchanged);
     expect(github.pulls.get(1)?.state).toBe("open");
   });
 
@@ -337,9 +395,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
         ]),
       );
 
-      await expect(
-        cleanupWithApi(github, execution, obsolete),
-      ).resolves.toEqual({
+      await expect(cleanupWithApi(github, push, {})).resolves.toEqual({
         closedPullRequests,
         deletedBranches: [],
       });
@@ -355,9 +411,9 @@ describe("cleanupUpdateBranches safety behavior", () => {
       compare(github, [{ filename: "a" }], tree, tree);
       github.trees.set(revision, undefined);
 
-      await expect(
-        cleanupWithApi(github, execution, obsolete),
-      ).resolves.toEqual(unchanged);
+      await expect(cleanupWithApi(github, push, {})).resolves.toEqual(
+        unchanged,
+      );
       expect(github.pulls.get(1)?.state).toBe("open");
     },
   );
@@ -382,9 +438,9 @@ describe("cleanupUpdateBranches safety behavior", () => {
         }
       };
 
-      await expect(
-        cleanupWithApi(github, execution, obsolete),
-      ).resolves.toEqual(unchanged);
+      await expect(cleanupWithApi(github, push, {})).resolves.toEqual(
+        unchanged,
+      );
       expect(github.pulls.get(1)?.state).toBe("open");
       expect(github.refs.get(side === "base" ? "heads/main" : headRef)).toBe(
         "moved",
@@ -398,9 +454,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
       github.refs.set("heads/main", "moved");
     };
 
-    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
-      unchanged,
-    );
+    await expect(cleanupWithApi(github, push, {})).resolves.toEqual(unchanged);
     expect(github.pulls.get(1)?.state).toBe("open");
     expect(github.refs.get("heads/main")).toBe("moved");
   });
@@ -414,9 +468,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
       });
     };
 
-    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
-      unchanged,
-    );
+    await expect(cleanupWithApi(github, push, {})).resolves.toEqual(unchanged);
     expect(github.pulls.get(1)).toMatchObject({
       state: "open",
       head: { sha: "new" },
@@ -436,9 +488,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
       github.patchPull(1, override);
     };
 
-    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
-      unchanged,
-    );
+    await expect(cleanupWithApi(github, push, {})).resolves.toEqual(unchanged);
     expect(github.pulls.get(1)).toMatchObject({ state: "closed", ...override });
     expect(github.refs.get(headRef)).toBe("moved");
   });
@@ -458,7 +508,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
   it("propagates invalid snapshot evidence after reopening the exact close", async () => {
     const github = invalidSnapshot();
 
-    await expect(cleanupWithApi(github, execution, obsolete)).rejects.toThrow(
+    await expect(cleanupWithApi(github, push, {})).rejects.toThrow(
       "valid changed file count",
     );
     expect(github.pulls.get(1)?.state).toBe("open");
@@ -471,9 +521,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
       throw compensation;
     };
 
-    await expect(
-      cleanupWithApi(github, execution, obsolete),
-    ).rejects.toMatchObject({
+    await expect(cleanupWithApi(github, push, {})).rejects.toMatchObject({
       errors: [
         expect.objectContaining({
           message: expect.stringContaining("valid changed file count"),
@@ -493,9 +541,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
       };
     };
 
-    await expect(cleanupWithApi(github, execution, obsolete)).resolves.toEqual(
-      unchanged,
-    );
+    await expect(cleanupWithApi(github, push, {})).resolves.toEqual(unchanged);
     expect(github.pulls.has(1)).toBe(false);
     expect(github.refs.get(headRef)).toBe("moved");
   });
@@ -514,9 +560,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
       };
     };
 
-    await expect(
-      cleanupWithApi(github, execution, obsolete),
-    ).rejects.toMatchObject({
+    await expect(cleanupWithApi(github, push, {})).rejects.toMatchObject({
       errors: [timeout, timeout],
     });
     expect(github.pulls.get(1)?.state).toBe("closed");
@@ -534,9 +578,9 @@ describe("cleanupUpdateBranches safety behavior", () => {
         else github.refs.set(ref, revision);
       };
 
-      await expect(
-        cleanupWithApi(github, execution, defaults),
-      ).resolves.toEqual(unchanged);
+      await expect(cleanupWithApi(github, execution, {})).resolves.toEqual(
+        unchanged,
+      );
       expect(github.refs.get(headRef)).toBe(revision);
     },
   );
@@ -552,7 +596,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
       deleted = true;
     };
 
-    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
+    await expect(cleanupWithApi(github, execution, {})).resolves.toEqual(
       unchanged,
     );
     expect(github.refs.get(headRef)).toBe("head");
@@ -571,7 +615,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
   it("restores the leased revision when a pull opens after deletion", async () => {
     const github = openAfterDeletion();
 
-    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
+    await expect(cleanupWithApi(github, execution, {})).resolves.toEqual(
       unchanged,
     );
     expect(github.refs.get(headRef)).toBe("head");
@@ -584,7 +628,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
       github.refs.set(ref, "concurrent");
     };
 
-    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
+    await expect(cleanupWithApi(github, execution, {})).resolves.toEqual(
       unchanged,
     );
     expect(github.refs.get(headRef)).toBe("concurrent");
@@ -602,9 +646,7 @@ describe("cleanupUpdateBranches safety behavior", () => {
       throw firstRestore;
     };
 
-    await expect(
-      cleanupWithApi(github, execution, defaults),
-    ).rejects.toMatchObject({
+    await expect(cleanupWithApi(github, execution, {})).rejects.toMatchObject({
       errors: [firstRestore, retryRestore],
     });
     expect(github.refs.has(headRef)).toBe(false);
@@ -621,31 +663,36 @@ describe("cleanupUpdateBranches safety behavior", () => {
       if (state === "closed") github.patchPull(1, override);
     };
 
-    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual(
+    await expect(cleanupWithApi(github, execution, {})).resolves.toEqual(
       unchanged,
     );
     expect(github.pulls.get(1)).toMatchObject({ state: "closed", ...override });
     expect(github.refs.get(headRef)).toBe("head");
   });
 
-  it("deletes both merged and stale owned branches when enabled", async () => {
-    const merged = closed({
-      number: 2,
-      merged_at: "2026-01-01T00:01:00Z",
-      head: {
-        ref: "prek-autoupdate-2",
-        sha: "head2",
-        repo: { full_name: repository },
-      },
-    });
-    const github = seed(closed(), merged);
-    github.refs.set("heads/prek-autoupdate-2", "head2");
+  it.each([execution, push])(
+    "deletes merged and unmerged owned branches on $context.eventName",
+    async (eventExecution) => {
+      const merged = closed({
+        number: 2,
+        merged_at: "2026-01-01T00:01:00Z",
+        head: {
+          ref: "prek-autoupdate-2",
+          sha: "head2",
+          repo: { full_name: repository },
+        },
+      });
+      const github = seed(closed(), merged);
+      github.refs.set("heads/prek-autoupdate-2", "head2");
 
-    await expect(cleanupWithApi(github, execution, defaults)).resolves.toEqual({
-      closedPullRequests: [],
-      deletedBranches: [branch, "prek-autoupdate-2"],
-    });
-    expect([...github.refs]).toEqual([["heads/main", "base"]]);
-    expect(github.pulls.get(2)).toEqual(merged);
-  });
+      await expect(cleanupWithApi(github, eventExecution, {})).resolves.toEqual(
+        {
+          closedPullRequests: [],
+          deletedBranches: [branch, "prek-autoupdate-2"],
+        },
+      );
+      expect([...github.refs]).toEqual([["heads/main", "base"]]);
+      expect(github.pulls.get(2)).toEqual(merged);
+    },
+  );
 });

@@ -85,16 +85,6 @@ export class PublishedUpdateError extends Error {
   }
 }
 
-export interface CleanupOptions {
-  readonly keepPullRequestNumber?: number;
-  readonly keepBranch?: string;
-  readonly keepLatestOpenPullRequest: boolean;
-  readonly closeStalePullRequests: boolean;
-  readonly closeObsoletePullRequests: boolean;
-  readonly deleteStaleBranches: boolean;
-  readonly deleteMergedBranches: boolean;
-}
-
 export interface CleanupResult {
   readonly closedPullRequests: readonly number[];
   readonly deletedBranches: readonly string[];

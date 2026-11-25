@@ -63,16 +63,8 @@ export async function runAction(now: Date = new Date()): Promise<void> {
   } finally {
     try {
       cleanupResult = await cleanupUpdateBranches(execution, {
-        keepPullRequestNumber:
-          unverifiedCreatedPull ?? updateResult.pullRequestNumber,
-        ...(unverifiedCreatedPull === undefined
-          ? {}
-          : { keepBranch: inputs.updateBranch }),
-        keepLatestOpenPullRequest: updateResult.pullRequestNumber === undefined,
-        closeStalePullRequests: context.eventName !== "push",
-        closeObsoletePullRequests: context.eventName === "push",
-        deleteStaleBranches: true,
-        deleteMergedBranches: true,
+        publishedPullRequestNumber: updateResult.pullRequestNumber,
+        unverifiedCreatedPullRequestNumber: unverifiedCreatedPull,
       });
     } catch (error: unknown) {
       failures.push({ phase: "cleanup", error });
