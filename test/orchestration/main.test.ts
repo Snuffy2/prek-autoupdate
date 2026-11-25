@@ -102,22 +102,13 @@ describe("runAction", () => {
     expect(core.info).toHaveBeenCalledBefore(vi.mocked(parseInputs));
   });
 
-  it("keeps the updated pull request during scheduled cleanup", async () => {
+  it("reports a confirmed publication on a scheduled run", async () => {
     await runAction(new Date("2026-07-27T02:00:00Z"));
 
-    expect(cleanupUpdateBranches).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        keepPullRequestNumber: 42,
-        keepLatestOpenPullRequest: false,
-        closeStalePullRequests: true,
-        closeObsoletePullRequests: false,
-      }),
-    );
     expect(core.setOutput).toHaveBeenCalledWith("pull-request-number", "42");
   });
 
-  it("protects an unverified creation during cleanup without reporting it as published", async () => {
+  it("reports an unverified creation as a failure and leaves the output empty", async () => {
     const ownershipError = new CreatedPullOwnershipError(
       42,
       new Error("PR changed"),
@@ -132,16 +123,12 @@ describe("runAction", () => {
 
     await runAction();
 
-    expect(cleanupUpdateBranches).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        keepPullRequestNumber: 42,
-        keepBranch: inputs.updateBranch,
-        keepLatestOpenPullRequest: true,
-      }),
-    );
     expect(core.setOutput).toHaveBeenCalledWith("pull-request-number", "");
-    expect(core.setFailed).toHaveBeenCalled();
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Could not verify ownership of created pull request #42",
+      ),
+    );
   });
 
   it("runs push reconciliation without updating", async () => {
@@ -153,14 +140,8 @@ describe("runAction", () => {
     await runAction();
 
     expect(runUpdate).not.toHaveBeenCalled();
-    expect(cleanupUpdateBranches).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        keepLatestOpenPullRequest: true,
-        closeStalePullRequests: false,
-        closeObsoletePullRequests: true,
-      }),
-    );
+    expect(cleanupUpdateBranches).toHaveBeenCalledOnce();
+    expect(core.setOutput).toHaveBeenCalledWith("pull-request-number", "");
   });
 
   it("reports pull and branch cleanup performed by the update phase", async () => {
@@ -174,6 +155,7 @@ describe("runAction", () => {
 
     await runAction();
 
+    expect(core.setOutput).toHaveBeenCalledWith("pull-request-number", "");
     expect(core.info).toHaveBeenCalledWith("Closed PRs: 41");
     expect(core.info).toHaveBeenCalledWith(
       "Deleted branches: chore/prek-updates",
@@ -194,7 +176,7 @@ describe("runAction", () => {
     );
   });
 
-  it("protects a published pull when a post-publication step fails", async () => {
+  it("reports the published pull when a post-publication step fails", async () => {
     vi.mocked(runUpdate).mockRejectedValue(
       new PublishedPullRequestError(
         "created",
@@ -205,13 +187,6 @@ describe("runAction", () => {
 
     await runAction();
 
-    expect(cleanupUpdateBranches).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        keepPullRequestNumber: 41,
-        keepLatestOpenPullRequest: false,
-      }),
-    );
     expect(core.setOutput).toHaveBeenCalledWith("pull-request-number", "41");
     expect(core.setFailed).toHaveBeenCalledWith(
       expect.stringContaining("Pull request #41"),
@@ -241,13 +216,6 @@ describe("runAction", () => {
 
     await runAction();
 
-    expect(cleanupUpdateBranches).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        keepPullRequestNumber: 41,
-        keepLatestOpenPullRequest: false,
-      }),
-    );
     expect(core.setOutput).toHaveBeenCalledWith("pull-request-number", "41");
     expect(core.setFailed).toHaveBeenCalledWith(
       expect.stringContaining("auto-merge failed"),

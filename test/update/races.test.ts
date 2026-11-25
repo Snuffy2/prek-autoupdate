@@ -535,12 +535,8 @@ describe("update publication races", () => {
       });
       await expect(
         cleanupWithApi(harness.api, harness.execution, {
-          keepPullRequestNumber: error.publishedPullRequest.pullRequestNumber,
-          keepLatestOpenPullRequest: false,
-          closeStalePullRequests: true,
-          closeObsoletePullRequests: false,
-          deleteStaleBranches: true,
-          deleteMergedBranches: true,
+          publishedPullRequestNumber:
+            error.publishedPullRequest.pullRequestNumber,
         }),
       ).resolves.toEqual({ closedPullRequests: [43], deletedBranches: [] });
 
@@ -1255,13 +1251,9 @@ it("preserves a cleanup ref and discards credentials from a rejected push error"
   process.env.TEST_GIT_FAIL_PUSH = "1";
   process.env.TEST_GIT_FAILURE_OUTPUT = token;
 
-  const error = await cleanupWithApi(harness.api, harness.execution, {
-    keepLatestOpenPullRequest: false,
-    closeStalePullRequests: false,
-    closeObsoletePullRequests: false,
-    deleteStaleBranches: true,
-    deleteMergedBranches: false,
-  }).catch((caught: unknown) => caught);
+  const error = await cleanupWithApi(harness.api, harness.execution, {}).catch(
+    (caught: unknown) => caught,
+  );
 
   expect(error).toMatchObject({
     message: expect.stringContaining("Lease-protected branch deletion failed"),
