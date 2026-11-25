@@ -4,6 +4,8 @@ This repository maintains the `prek` autoupdate JavaScript action. Keep changes
 small, tested, and safe for downstream repositories that grant the action write
 permissions.
 
+Read [CODING_STANDARDS.md](CODING_STANDARDS.md) when writing or reviewing code.
+
 ## Repository Shape
 
 - `action.yml` is the public action metadata and input/output contract.
@@ -108,7 +110,7 @@ npm run check:dist
 
 ### Issue tracker
 
-Issues live in GitHub Issues for `Snuffy2/prek-autoupdate` (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
+For local Markdown issues and specs under `.scratch/`, read `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
