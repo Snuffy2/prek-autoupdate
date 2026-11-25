@@ -4,6 +4,8 @@ This repository maintains the `prek` autoupdate JavaScript action. Keep changes
 small, tested, and safe for downstream repositories that grant the action write
 permissions.
 
+Read [CODING_STANDARDS.md](CODING_STANDARDS.md) when writing or reviewing code.
+
 ## Repository Shape
 
 - `action.yml` is the public action metadata and input/output contract.
