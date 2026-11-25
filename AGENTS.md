@@ -108,7 +108,7 @@ npm run check:dist
 
 ### Issue tracker
 
-Issues live in GitHub Issues for `Snuffy2/prek-autoupdate` (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
+For local Markdown issues and specs under `.scratch/`, read `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
